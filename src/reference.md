@@ -10,3 +10,9 @@
 %B   raw body
 %P   parent hashes
 %T   tree hash
+
+
+$GIT_DIR //ie the /.git
+    /ma-cache
+        /<commit-hash>
+            /<files from that hash>

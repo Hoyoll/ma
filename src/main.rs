@@ -1,12 +1,16 @@
-use std::fmt::Display;
+use std::process::Command;
 
-use tokio::process::Command;
-use tower_lsp_server::{Client, LspService, jsonrpc, ls_types::{self, GotoDefinitionResponse, }};
+use lsp_server::{Connection, Message, RequestId, Response};
+use lsp_types::{
+    DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams, GotoDefinitionParams, Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, MarkupContent, OneOf, ServerCapabilities, lsp_request, notification::{DidOpenTextDocument, Notification}, request::{FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, Request}
+};
+use serde::{Deserialize, Serialize};
 
+#[derive(Deserialize, Serialize)]
 enum GitView {
     Padding,
     BranchHeader,
-    BranchMember(usize), 
+    BranchMember(usize),
     CommitHeader,
     CommitMember(usize),
 }
@@ -22,124 +26,218 @@ enum Accordion {
 // git commands, for remote branch = git branch -r --format='%(refname:short)'
 // gt commands, for log = git log -n 10 --format='%h'
 // git commands, for show = git show --no-patch <hash>
-
-struct Lsp {
-    client: Client,
-    git_client: GitClient,
-    git_view: Vec<GitView>
-}
-
+// git commands, for $current_git = git rev-parse --show-toplevel
+// / git -C <dir_path> rev-parse --show-toplevel
+#[derive(Default)]
 struct GitClient {
-    branch: (usize, String, Accordion),
+    branch: (usize, String),
     branch_member: Vec<String>,
-    commit: (usize, Accordion),
     commits: Vec<String>,
     format: String,
-    view: Vec<GitView>
+    view: Vec<GitView>,
 }
 
-impl GitClient { 
-    pub async fn get_branches(&mut self) { 
-        let output = Command::new("git")
-            .args(&["branch", "-;l", "--format=%(refname:short)"])
-            .output().await.unwrap();
-        self.branch_member = String::from_utf8(output.stdout).unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect(); 
-    }
+trait Lsp {
+    fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams);
 
-    pub async fn view(&mut self) {
-        self.view.clear();
-        self.view.push(GitView::Padding);
-        self.view.push(GitView::BranchHeader);
-        if self.branch.2 == Accordion::Expand {
-            let mut i: usize = 0;
-            for _ in &self.branch_member {
-                self.view.push(GitView::BranchMember(i));
-                i += 1
+    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams);
+    fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
+    fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
+    fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams); 
+    fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) { 
+       match request.method.as_str() {
+            Initialize::METHOD => {
+                serde_json::from_value(request.params).map(|params: InitializeParams| {
+                    self.initialize(conn, request.id, params);
+                });
+            }
+
+            HoverRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: HoverParams| {
+                    self.hover(conn, request.id, params);
+                });
+            }
+            GotoDefinition::METHOD => {
+                serde_json::from_value(request.params).map(|params: GotoDefinitionParams | {
+                    self.goto_definition(conn, request.id, params);
+                });
+            }
+            FoldingRangeRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: FoldingRangeParams| {
+                    self.folding(conn, request.id, params);
+                });   
+            }
+            _ => {
+                send_err(
+                    conn,
+                    request.id,
+                    lsp_server::ErrorCode::MethodNotFound,
+                    "unhandled method",
+                );
             }
         }
     }
+    
+    fn handle_notification(&mut self, conn: &Connection, notification: lsp_server::Notification) {
+        match notification.method.as_str() {
+            DidOpenTextDocument::METHOD => {
+                serde_json::from_value(notification.params).map(|params: DidOpenTextDocumentParams| { 
+                    self.did_open(conn, params);
+                });
+            }
+            _ => () 
+        }
+    }
+}
 
-    pub async fn format(&mut self) {
+impl GitClient {
+    pub async fn get_branches(&mut self) {
+        let output = Command::new("git")
+            .args(&["branch", "-l", "--format=%(refname:short)"])
+            .output()
+            .unwrap();
+        self.branch_member = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    }
+
+    pub fn view(&mut self) {
+        self.view.clear();
+        self.view.push(GitView::Padding);
+        self.view.push(GitView::BranchHeader);
+        let mut i: usize = 0;
+        for _ in &self.branch_member {
+            self.view.push(GitView::BranchMember(i));
+            i += 1
+        }
+    }
+
+    pub fn format(&mut self) {
         self.format.clear();
         // # Branch: <branch>
         self.format.push_str("# Branch: ");
         self.format.push_str(&self.branch.1);
         self.format.push_str("\n");
-        if self.branch.2 == Accordion::Expand {
-            for member in &self.branch_member {
-                self.format.push_str("- ");
-                self.format.push_str(member);
-                self.format.push_str("\n");
-            }
+        for member in &self.branch_member {
+            self.format.push_str("- ");
+            self.format.push_str(member);
+            self.format.push_str("\n");
         }
         // Padding
         self.format.push_str("\n");
-        
+
         // # Commit
         self.format.push_str("# Commit\n");
-        if self.commit.1 == Accordion::Expand {
-            for member in &self.commits {
-                self.format.push_str("- ");
-                self.format.push_str(member);
-                self.format.push_str("\n");
-            }
+        for member in &self.commits {
+            self.format.push_str("- ");
+            self.format.push_str(member);
+            self.format.push_str("\n");
         }
     }
 
-    pub async fn get_commits() {
+    pub fn git_show(&self, hash: &str) -> String {
+        let output = Command::new("git").args(&["show", hash]).output().unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    pub fn get_commits() {
         let output = Command::new("git")
             .args(&["branch", "--format=%(refname:short)"])
-            .output().await.unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap()
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout)
+            .unwrap()
             .lines()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        for brances in stdout {    
+        for brances in stdout {
             println!("{}", brances);
         }
     }
 }
 
+fn send_ok<T: serde::Serialize>(conn: &Connection, id: RequestId, result: &T) {
+    let resp = Response {
+        id,
+        response_result: Ok(serde_json::to_value(result).unwrap()),
+    };
+    conn.sender.send(Message::Response(resp));
+}
 
-impl tower_lsp_server::LanguageServer for Lsp {
-    async fn initialize(&self,params: tower_lsp_server::ls_types::InitializeParams) -> tower_lsp_server::jsonrpc::Result<tower_lsp_server::ls_types::InitializeResult> {
-        let mut ls = ls_types::InitializeResult::default(); 
-        //println!("on!");
-        //dbg!(params.workspace_folders);
-        Ok(ls)
+fn send_err(conn: &Connection, id: RequestId, code: lsp_server::ErrorCode, msg: &str) {
+    let resp = Response {
+        id,
+        response_result: Err(lsp_server::ResponseError {
+            code: code as i32,
+            message: msg.into(),
+            data: None,
+        }),
+    };
+    conn.sender.send(Message::Response(resp));
+}
+
+impl Lsp for GitClient {
+    fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams) {
+        //conn.sender.send(Message::Response(()))
+        if let Some(workspace) = params.workspace_folders {
+            for w in workspace {
+            
+            }
+        }
     }
 
-    async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
-        //println!("shutdown!");
-        jsonrpc::Result::Ok(())
+    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams) {
+        let idx = params.text_document_position_params.position.line as usize;
+        //params.text_document_position_params.text_document.uri
+        match self.view[idx] {
+            GitView::BranchMember(member) => {
+            }
+            _ => ()
+        }
     }
 
-    async fn hover(&self,params: ls_types::HoverParams) -> jsonrpc::Result<Option<ls_types::Hover>> {
-       self.client.show_document(params) 
+    fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams) {
+        let idx = params.text_document_position_params.position.line as usize;
+        match self.view[idx] {
+            GitView::BranchMember(member) => {
+
+            }
+            _ => ()
+        }
     }
 
-    async fn folding_range(&self,params: ls_types::FoldingRangeParams) -> impl ::std::future::Future<Output = jsonrpc::Result<Option<Vec<ls_types::FoldingRange>>> > +Send {
+    fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams) {
         
     }
 
-    async fn goto_definition(&self,params: ls_types::GotoDefinitionParams) -> jsonrpc::Result<Option<ls_types::GotoDefinitionResponse>> {
-        let index = params.text_document_position_params.position.line as usize;
-        //GotoDefinitionResponse::Scalar(Location::new(Uri::from_file_path(path), range))
-    }
-    
-}
+    fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams) {
 
-#[tokio::main]
-async fn main() {
-    //println!("hello!");
-    GitClient::get_branches().await;
-    //println!("world!");
-    return;
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Lsp {client});
-    tower_lsp_server::Server::new(stdin, stdout, socket).serve(service).await;
+    }
+}
+fn main() {
+    let (conn, io_t) = Connection::stdio();
+    let caps = ServerCapabilities {
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        ..Default::default()
+    };
+
+    let init = serde_json::json!({
+        "capabilities": caps,
+        "encoding": ["utf-8"]
+    });
+
+    let init_params = conn.initialize(init).unwrap();
+    let mut client = GitClient::default();
+    for msg in &conn.receiver {
+            match msg {
+                Message::Request(request) => client.handle_request(&conn, request),
+                Message::Response(response) => todo!(),
+                Message::Notification(notification) =>client.handle_notification(&conn, notification),
+            }
+        }
+    //client.main_loop(conn, init_params);
+    io_t.join();
 }
