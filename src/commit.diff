@@ -1,0 +1,16 @@
+Normal commit view: if parent <= 1;
+Normal diff looking, git show ish out put
+# <Hash>
+Author: <Author>
+Date: <Date>
+Message: <Message>
+
+<Diff here>
+
+Merge view: // if parent > 1;
+
+# <Hash>
+Message: <Message>
+Parents:
+  ▸ 918273  [main] // clickable
+  ▸ abc789  [feature/auth]

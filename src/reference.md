@@ -15,4 +15,6 @@
 $GIT_DIR //ie the /.git
     /ma-cache
         /<commit-hash>
-            /<files from that hash>
+            /
+            root.diff
+            <files from that hash>
