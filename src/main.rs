@@ -1,17 +1,21 @@
 use std::{
     collections::HashMap,
+    fs,
     path::{Component, Path, PathBuf, Prefix},
     process::Command,
     str::FromStr,
 };
 
-use git2::{BranchType, Commit, Oid, Repository, Sort};
+use git2::{BranchType, Commit, DiffFormat, Oid, Repository, Sort};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, Location, MarkupContent, OneOf, Range, ServerCapabilities, Uri, lsp_request,
-    notification::{DidOpenTextDocument, Notification},
+    ApplyWorkspaceEditParams, DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, Location, LogMessageParams,
+    MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
+    WorkspaceEdit, lsp_request,
+    notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage},
     request::{FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, Request},
 };
 use serde::{Deserialize, Serialize};
@@ -23,27 +27,34 @@ const CACHE_DIR: &str = "ma-cache";
 type RepoId = usize;
 
 struct Client {
-    work_group: HashMap<Uri, WorkGroup>,
-    repo: Vec<Repository>,
+    work_group: HashMap<Uri, (WorkGroup, OfficeId)>,
+    //repo: Vec<Repository>,
+    office: Vec<Office>,
+    caps: ServerCapabilities,
 }
 
 impl Client {
-    fn new() -> Self {
+    fn new(caps: ServerCapabilities) -> Self {
         Self {
             work_group: HashMap::default(),
-            repo: Vec::default(),
+            //repo: Vec::default(),
+            office: Vec::default(),
+            caps,
         }
     }
 }
 
 type Root = usize;
-
+type OfficeId = usize;
 enum WorkGroup {
     RootView(RootView),
     DiffView(Diff),
     FileView(FileView),
 }
-
+struct Office {
+    repo: Repository,
+    cache: PathBuf,
+}
 struct FileView {
     //branch: String,
     commit: Oid,
@@ -59,12 +70,12 @@ enum MergeView {
 enum NormalView {
     Padding,
     ParentCommit,
-    Hunk { from_hunk: usize, change_on: usize },
+    Hunk { from_hunk: usize, change_on: u32 },
 }
 
 struct Hunk {
     path: PathBuf,
-    changes: Vec<LineCol>,
+    changes: Vec<u32>,
 }
 
 struct LineCol {
@@ -102,8 +113,15 @@ enum DiffView {
 impl DiffView {
     fn new(commit: &Commit) -> Self {
         match commit.parent_count() {
-            0 => Self::Root { hunk: Vec::new(), view: Vec::new() },
-            1 => Self::Normal { hunk: Vec::new(), view: Vec::new(), parent: commit.parent(0).unwrap().id() },
+            0 => Self::Root {
+                hunk: Vec::new(),
+                view: Vec::new(),
+            },
+            1 => Self::Normal {
+                hunk: Vec::new(),
+                view: Vec::new(),
+                parent: commit.parent(0).unwrap().id(),
+            },
             _ => {
                 let parents = {
                     let mut p = Vec::new();
@@ -112,62 +130,45 @@ impl DiffView {
                     }
                     p
                 };
-                Self::Merge { view: Vec::new(), parents }
+                Self::Merge {
+                    view: Vec::new(),
+                    parents,
+                }
             }
         }
     }
-}
 
-struct Diff {
-    author: String,
-    date: String,
-    hash: Oid,
-    message: String,
-    format: String,
-    diff_vew: DiffView,
-    repo_id: RepoId,
-}
-
-impl Diff {
-
-    fn fill(&mut self, repo: &mut Repository) {
-
-    }
-    fn rebuild_view_and_format(&mut self, repo: &mut Repository) {
-        match &mut self.diff_vew {
-            DiffView::Merge {
-                view,
-                parents,
-                //hash,
-                //format,
-            } => {
+    fn format_header(commit: &Commit, format: &mut String) {}
+    fn fill(&mut self, commit: &Commit, repo: &Repository, format: &mut String) {
+        format.clear();
+        match self {
+            DiffView::Merge { view, parents } => {
                 view.clear();
                 view.push(MergeView::Padding);
-                let format = &mut self.format;
-                //let commit = repo.find_commit(*hash).unwrap();
                 format.push_str("# ");
-                format.push_str(&self.hash.to_string());
+                format.push_str(&commit.id().to_string());
                 format.push('\n');
-
                 view.push(MergeView::Padding);
 
                 format.push_str("Author: ");
-                //let author = commit.author();
-                format.push_str(&self.author);
+                let author = commit.author();
+                format.push_str(&author.name().unwrap_or_default());
+                format.push_str(" ");
+                format.push_str(author.email().unwrap_or_default());
                 format.push('\n');
 
                 view.push(MergeView::Padding);
 
                 format.push_str("Date: ");
                 // TO-DO: Date!
-                format.push_str(&self.date);
+                //format.push_str(&self.date);
                 format.push('\n');
                 view.push(MergeView::Padding);
 
                 format.push('\n');
                 view.push(MergeView::Padding);
 
-                format.push_str(&self.message);
+                format.push_str(&commit.message().unwrap_or_default());
                 format.push('\n');
                 view.push(MergeView::Padding);
 
@@ -178,76 +179,218 @@ impl Diff {
                 format.push('\n');
                 view.push(MergeView::Padding);
 
+                //for p in parents {
                 for (i, p) in parents.iter().enumerate() {
                     format.push_str("- ");
                     format.push_str(&p.to_string());
                     format.push('\n');
+                    //parents.push(*p);
                     view.push(MergeView::Commit(i));
                 }
+                //}
             }
             DiffView::Normal {
-                hunk,
+                hunk: hunk_col,
                 view,
-                //hash,
                 parent,
-                //format,
             } => {
                 view.clear();
                 view.push(NormalView::Padding);
-                let format = &mut self.format;
-                format.push_str("# Old: ");
-                format.push_str(&parent.to_string());
-                format.push('\n');
 
                 format.push_str("# ");
-                format.push_str(&self.hash.to_string());
+                format.push_str(&commit.id().to_string());
                 format.push('\n');
-
                 view.push(NormalView::Padding);
 
                 format.push_str("Author: ");
-                //let author = commit.author();
-                format.push_str(&self.author);
+                let author = commit.author();
+                format.push_str(&author.name().unwrap_or_default());
+                format.push_str(" ");
+                format.push_str(author.email().unwrap_or_default());
                 format.push('\n');
 
                 view.push(NormalView::Padding);
 
                 format.push_str("Date: ");
                 // TO-DO: Date!
+                //format.push_str(&self.date);
                 format.push('\n');
                 view.push(NormalView::Padding);
 
                 format.push('\n');
                 view.push(NormalView::Padding);
 
-                format.push_str(&self.message);
+                format.push_str(&commit.message().unwrap_or_default());
                 format.push('\n');
                 view.push(NormalView::Padding);
 
                 format.push('\n');
                 view.push(NormalView::Padding);
-                let commit = repo.find_commit(self.hash).ok().unwrap();
+
                 let tree = commit.tree().ok();
                 let parent = commit.parent(0).unwrap().tree().ok();
                 let diff = repo.diff_tree_to_tree(parent.as_ref(), tree.as_ref(), None);
- 
-                for (i, hunk) in hunk.iter().enumerate() {                    
+
+                if let Ok(diff) = diff {
+                    let mut anchor_id = Oid::ZERO_SHA1;
+                    let mut hunk_current_line = 0;
+                    let mut line_count = view.len() - 1;
+                    let mut current_hunk = 0;
+                    view.push(NormalView::Padding);
+                    diff.print(DiffFormat::Patch, |delta, hunk, line| {
+                        line_count += 1;
+                        let file = delta.new_file();
+                        if file.id() != anchor_id {
+                            hunk_col.push(Hunk {
+                                path: PathBuf::from(file.path().unwrap()),
+                                changes: Vec::new(),
+                            });
+                            current_hunk = hunk_col.len() - 1;
+                            anchor_id = file.id();
+                            hunk_current_line = 0;
+                        }
+                        match hunk {
+                            Some(hunk) if hunk_current_line != hunk.new_start() => {
+                                format.push_str("@@ -");
+                                format.push_str(&hunk.old_start().to_string());
+                                format.push(',');
+                                format.push_str(&hunk.old_lines().to_string());
+
+                                format.push_str(" +");
+                                format.push_str(&hunk.new_start().to_string());
+                                format.push(',');
+                                format.push_str(&hunk.new_lines().to_string());
+
+                                format.push_str(" @@");
+
+                                format.push('\n');
+                                hunk_col[current_hunk].changes.push(line_count as u32);
+
+                                hunk_current_line = hunk.new_start();
+                                view.push(NormalView::Hunk {
+                                    from_hunk: current_hunk,
+                                    change_on: hunk.new_start(),
+                                });
+                            }
+                            Some(_) => {
+                                format.push(line.origin());
+                                format.push(' ');
+                                format.push_str(&String::from_utf8_lossy(line.content()));
+
+                                view.push(NormalView::Padding);
+                            }
+                            _ => (),
+                        }
+
+                        true
+                    });
                 }
             }
             DiffView::Root {
-                hunk,
+                hunk: hunk_col,
                 view,
-                //hash,
-                //format,
             } => {
                 view.clear();
                 view.push(NormalView::Padding);
-                let commit = repo.find_commit(self.hash).ok().unwrap();
+
+                format.push_str("# ");
+                format.push_str(&commit.id().to_string());
+                format.push('\n');
+                view.push(NormalView::Padding);
+
+                format.push_str("Author: ");
+                let author = commit.author();
+                format.push_str(&author.name().unwrap_or_default());
+                format.push_str(" ");
+                format.push_str(author.email().unwrap_or_default());
+                format.push('\n');
+
+                view.push(NormalView::Padding);
+
+                format.push_str("Date: ");
+                // TO-DO: Date!
+                //format.push_str(&self.date);
+                format.push('\n');
+                view.push(NormalView::Padding);
+
+                format.push('\n');
+                view.push(NormalView::Padding);
+
+                format.push_str(&commit.message().unwrap_or_default());
+                format.push('\n');
+                view.push(NormalView::Padding);
+
+                format.push('\n');
+                view.push(NormalView::Padding);
+
                 let tree = commit.tree().ok();
+                //let parent = commit.parent(0).unwrap().tree().ok();
                 let diff = repo.diff_tree_to_tree(None, tree.as_ref(), None);
+
+                if let Ok(diff) = diff {
+                    let mut anchor_id = Oid::ZERO_SHA1;
+                    let mut hunk_current_line = 0;
+                    let mut line_count = view.len() - 1;
+                    let mut current_hunk = 0;
+                    view.push(NormalView::Padding);
+                    diff.print(DiffFormat::Patch, |delta, hunk, line| {
+                        line_count += 1;
+                        let file = delta.new_file();
+                        if file.id() != anchor_id {
+                            hunk_col.push(Hunk {
+                                path: PathBuf::from(file.path().unwrap()),
+                                changes: Vec::new(),
+                            });
+                            current_hunk = hunk_col.len() - 1;
+                            anchor_id = file.id();
+                            hunk_current_line = 0;
+                        }
+                        match hunk {
+                            Some(hunk) if hunk_current_line != hunk.new_start() => {
+                                format.push_str("@@ -");
+                                format.push_str(&hunk.old_start().to_string());
+                                format.push(',');
+                                format.push_str(&hunk.old_lines().to_string());
+
+                                format.push_str(" +");
+                                format.push_str(&hunk.new_start().to_string());
+                                format.push(',');
+                                format.push_str(&hunk.new_lines().to_string());
+
+                                format.push_str(" @@");
+
+                                format.push('\n');
+                                hunk_col[current_hunk].changes.push(line_count as u32);
+
+                                hunk_current_line = hunk.new_start();
+                                view.push(NormalView::Hunk {
+                                    from_hunk: current_hunk,
+                                    change_on: hunk.new_start(),
+                                });
+                            }
+                            Some(_) => {
+                                format.push(line.origin());
+                                format.push(' ');
+                                format.push_str(&String::from_utf8_lossy(line.content()));
+
+                                view.push(NormalView::Padding);
+                            }
+                            _ => (),
+                        }
+
+                        true
+                    });
+                }
             }
         }
     }
+}
+
+struct Diff {
+    hash: Oid,
+    format: String,
+    diff_view: DiffView,
+    //repo_id: RepoId,
 }
 
 struct Branch {
@@ -272,8 +415,8 @@ struct RootView {
     //commits: Vec<(Uri, Oid)>,
     format: String,
     view: Vec<GitView>,
-    repo_id: RepoId,
-    cache: PathBuf,
+    //repo_id: RepoId,
+    //cache: PathBuf,
 }
 
 impl RootView {
@@ -325,8 +468,35 @@ trait Lsp {
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams);
     fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) {
+        let l_params = LogMessageParams {
+            typ: MessageType::INFO,
+            message: "HELLO FROM MY INIT METHOD".into(),
+        };
+
+        conn.sender
+            .send(lsp_server::Message::Notification(
+                lsp_server::Notification {
+                    method: LogMessage::METHOD.to_string(),
+                    params: serde_json::to_value(l_params).unwrap(),
+                },
+            ))
+            .unwrap();
+
         match request.method.as_str() {
             Initialize::METHOD => {
+                let l_params = LogMessageParams {
+                    typ: MessageType::INFO,
+                    message: "HELLO FROM MY INIT METHOD".into(),
+                };
+
+                conn.sender
+                    .send(lsp_server::Message::Notification(
+                        lsp_server::Notification {
+                            method: LogMessage::METHOD.to_string(),
+                            params: serde_json::to_value(l_params).unwrap(),
+                        },
+                    ))
+                    .unwrap();
                 serde_json::from_value(request.params).map(|params: InitializeParams| {
                     self.initialize(conn, request.id, params);
                 });
@@ -359,6 +529,8 @@ trait Lsp {
     }
 
     fn handle_notification(&mut self, conn: &Connection, notification: lsp_server::Notification) {
+        //eprintln!("NOTIFICATION: {}", notification.method);
+
         match notification.method.as_str() {
             DidOpenTextDocument::METHOD => {
                 serde_json::from_value(notification.params).map(
@@ -395,9 +567,6 @@ fn send_err(conn: &Connection, id: RequestId, code: lsp_server::ErrorCode, msg: 
 impl Lsp for Client {
     fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams) {
         //conn.sender.send(Message::Response(()))
-        if let Some(workspace) = params.workspace_folders {
-            for w in workspace {}
-        }
     }
 
     fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams) {
@@ -409,10 +578,11 @@ impl Lsp for Client {
         let idx = params.text_document_position_params.position.line as usize;
         match self
             .work_group
-            .get_mut(&params.text_document_position_params.text_document.uri)
+            .get(&params.text_document_position_params.text_document.uri)
         {
             None => (),
-            Some(WorkGroup::RootView(root)) => {
+//                log("None actually", conn);
+            Some((WorkGroup::RootView(root),office_id)) => {
                 match &root.view[idx] {
                     GitView::CommitMember {
                         from_branch,
@@ -429,20 +599,65 @@ impl Lsp for Client {
                                     ))),
                                 );
                             }
-                            (oid, None) => {
-                                let mut path = root.cache.clone();
-                                let repo = &mut self.repo[root.repo_id];
-                                //self.repo[root.repo_id].find_commit(*oid);
-                                // do the bullshit here
-                                //path.push(oid.to_string());
-                                //path.push("patch.diff"); 
+                            (oid, uri) if *uri == None => {
+                                let office = &self.office[*office_id];
+                                let path = office.cache.clone().join(oid.to_string());
+                                let repo = &office.repo;
+                                match repo.find_commit(*oid) {
+                                    Ok(commit) => {
+                                        let mut format = String::new();
+                                        let mut diff_view = DiffView::new(&commit);
+                                        diff_view.fill(&commit, repo, &mut format);
+                                        //let path = path.strip_prefix("/").unwrap();
+                                        if let Err(_) = fs::create_dir_all(&path) {
+                                            log("create_dir_all failed", conn);
+                                        }
+                                        let path = path.join(DIFF_NAME);
+                                        if let Err(e) = fs::write(&path, format.as_bytes()) {
+                                            log(e.to_string(), conn);
+                                            log(path.to_str().unwrap(), conn);
+                                            return;
+                                        }
+                                        let uri = name_to_url(&path).unwrap();
+                                        self.work_group.insert(
+                                            uri.clone(),
+                                            (WorkGroup::DiffView(Diff {
+                                                hash: *oid,
+                                                format,
+                                                diff_view,
+                                            }), *office_id),
+                                        );
+                                        send_ok(
+                                            conn,
+                                            id,
+                                            &Some(GotoDefinitionResponse::Scalar(Location::new(
+                                                uri,
+                                                Range::default(),
+                                            ))),
+                                        );
+                                    }
+                                    Err(_) => (),
+                                }
                             }
+                            _ => (),
                         }
                     }
                     _ => (),
                 }
             }
-            Some(WorkGroup::DiffView(diff)) => {}
+            Some((WorkGroup::DiffView(diff), office_id)) => {
+                match &diff.diff_view {
+                    DiffView::Merge { view, parents } => {
+                        let idx = params.text_document_position_params.position.line as usize;
+                        if let MergeView::Commit(c) = &view[idx] {
+                            //if let Some(d) = self.open_diff(&parents[*c], *office_id) { 
+                            //}
+                        }
+                    }
+                    DiffView::Normal { hunk, view, parent } => todo!(),
+                    DiffView::Root { hunk, view } => todo!(),
+                }
+            }
             _ => (),
         }
     }
@@ -452,164 +667,197 @@ impl Lsp for Client {
     fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams) {
         match self.work_group.get_mut(&params.text_document.uri) {
             Some(_) => (),
-            None => self.new_workgroup(conn, params.text_document.uri),
+            None => {
+                if let Some(mut wg) = self.new_workgroup(&params.text_document.uri) {
+                    wg.rebuild_view();
+                    wg.rebuild_format();
+                    let format = wg.format.clone();
+                    self.work_group
+                        .insert(params.text_document.uri.clone(), (WorkGroup::RootView(wg), self.office.len() - 1));
+                    let mut wf = HashMap::new();
+                    wf.insert(
+                        params.text_document.uri.clone(),
+                        vec![TextEdit {
+                            new_text: format,
+                            range: Range {
+                                start: Position::new(1, 1),
+                                end: Position::new(1, 1),
+                            },
+                        }],
+                    );
+                    let we = ApplyWorkspaceEditParams {
+                        label: None,
+                        edit: WorkspaceEdit {
+                            changes: Some(wf),
+                            ..Default::default()
+                        },
+                    };
+                    conn.sender.send(Message::Request(lsp_server::Request::new(
+                        RequestId::from(19),
+                        "workspace/applyEdit".into(),
+                        &we,
+                    )));
+                    //send_ok(conn, RequestId::from(1), &Some(TextEdit::new(Range { start: Position::new(1, 1), end: Position::new(1, 1) }, format)));
+                }
+            }
         }
     }
 }
 
 impl Client {
-    fn new_workgroup(&mut self, conn: &Connection, uri: lsp_types::Uri) {
+    fn new_workgroup(&mut self, uri: &lsp_types::Uri) -> Option<RootView> {
         let path = uri.path();
-        let mut p = std::path::PathBuf::from(path.as_str());
-        p.file_name().map(|s| match s.to_str() {
-            Some(ROOT_NAME) => match Repository::open(p.parent().unwrap()) {
-                Err(_) => (),
-                Ok(repo) => {
-                    let branch = {
-                        let mut vec = Vec::default();
-                        match repo.branches(None) {
-                            Err(_) => (),
-                            Ok(brances) => {
-                                for branch in brances {
-                                    branch.map(|branch| {
-                                        let commits = {
-                                            let mut c = Vec::default();
-                                            branch.0.get().peel_to_commit().map(|commit| {
-                                                let mut revwalk = repo.revwalk().unwrap();
-
-                                                revwalk.push(commit.id());
-                                                revwalk.set_sorting(Sort::TIME);
-                                                for res in revwalk {
-                                                    res.map(|id| {
-                                                        c.push((id, None));
-                                                    });
-                                                }
-                                            });
-                                            c
-                                        };
-                                        vec.push(Branch {
-                                            name: branch.0.name().unwrap().unwrap().to_string(),
-                                            commits,
-                                        });
-                                    });
-                                }
-                            }
+        let p = std::path::PathBuf::from(path.as_str());
+        //log("HERE!", conn);
+        match p.file_name() {
+            Some(s) => match s.to_str() {
+                Some(ROOT_NAME) => {
+                    let parent = PathBuf::from(p.parent().unwrap());
+                    let p = parent.strip_prefix("/").unwrap();
+                    match Repository::open(&p) {
+                        Err(_) => {
+                            //log("It's Err actually", conn);
+                            //log(format!("with name like {:?}", s), conn);
+                            //log(format!("with repo pointing to: {}",p.display()), conn);
+                            None
                         }
-                        vec
-                    };
-                    let mut cache = PathBuf::from(repo.path());
-                    cache.push(CACHE_DIR);
-                    self.repo.push(repo);
-                    let rootview = RootView {
-                        branch,
-                        format: String::default(),
-                        view: Vec::default(),
-                        repo_id: {self.repo.len() - 1},
-                        cache,
-                    };
-                    self.work_group.insert(uri, WorkGroup::RootView(rootview));
+                        Ok(repo) => {
+                            //log(s.to_str().unwrap(), conn);
+                            let branch = {
+                                let mut vec = Vec::default();
+                                match repo.branches(None) {
+                                    Err(_) => (),
+                                    Ok(brances) => {
+                                        for branch in brances {
+                                            branch.map(|branch| {
+                                                let commits = {
+                                                    let mut c = Vec::default();
+                                                    branch.0.get().peel_to_commit().map(|commit| {
+                                                        let mut revwalk = repo.revwalk().unwrap();
+
+                                                        revwalk.push(commit.id());
+                                                        revwalk.set_sorting(Sort::TIME);
+                                                        for res in revwalk {
+                                                            res.map(|id| {
+                                                                c.push((id, None));
+                                                            });
+                                                        }
+                                                    });
+                                                    c
+                                                };
+                                                vec.push(Branch {
+                                                    name: branch
+                                                        .0
+                                                        .name()
+                                                        .unwrap()
+                                                        .unwrap()
+                                                        .to_string(),
+                                                    commits,
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                                vec
+                            };
+                            let mut cache = PathBuf::from(repo.path());
+                            cache.push(CACHE_DIR);
+                            self.office.push(Office { repo, cache });
+                            //self.repo.push(repo);
+                            Some(RootView {
+                                branch,
+                                format: String::default(),
+                                view: Vec::default(),
+       //                         cache,
+                            })
+                            //self.work_group
+                            //    .insert(uri.clone(), WorkGroup::RootView(rootview));
+                        }
+                    }
                 }
+                _ => None,
             },
-            _ => (),
-        });
-    }
-}
-
-fn main() {
-    let repo = Repository::open(".").unwrap();
-    let br = repo.branches(None).unwrap();
-    for b in br {
-        let branch = b.unwrap();
-        let name = branch.0.name().unwrap().unwrap_or_default();
-        println!("{}", name);
-        let branch = repo.find_branch(name, BranchType::Local).unwrap();
-
-        let commit = branch.get().peel_to_commit().unwrap();
-        let mut revwalk = repo.revwalk().unwrap();
-
-        revwalk.push(commit.id());
-        revwalk.set_sorting(Sort::TIME);
-
-        for oid in revwalk {
-            let oid = oid.unwrap();
-            let commit = repo.find_commit(oid).unwrap();
-            let tree = commit.tree().unwrap();
-
-            for i in 0..commit.parent_count() {
-                let parent_tree = commit.parent(i).unwrap().tree().ok();
-                let diff = repo
-                    .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
-                    .unwrap();
-                let mut patch = String::new();
-                //diff.print(format, cb)
-                diff.foreach(
-                    &mut |delta, _progress| {
-                        println!("FILE: {:?}", delta.new_file().path());
-                        patch.push_str(delta.new_file().path().unwrap().to_str().unwrap());
-                        true
-                    },
-                    None,
-                    Some(&mut |delta, hunk| {
-                        patch.push_str("here!");
-                        println!(
-                            "HUNK: -{},{} +{},{}",
-                            hunk.old_start(),
-                            hunk.old_lines(),
-                            hunk.new_start(),
-                            hunk.new_lines(),
-                        );
-
-                        true
-                    }),
-                    Some(&mut |delta, hunk, line| {
-                        print!(
-                            "{}{}",
-                            line.origin(),
-                            String::from_utf8_lossy(line.content())
-                        );
-
-                        true
-                    }),
-                );
-            } //let mut patch = Vec::new();
-
-            //diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-            //    println!("{}",delta.new_file().path().unwrap().to_str().unwrap());
-            //    hunk.map(|hunk| {
-            //        println!("{}", String::from_utf8_lossy(hunk.header()));
-            //    });
-            //    //println!("{}", String::from_utf8_lossy(hunk.unwrap().header()));
-            //    println!("{}", String::from_utf8_lossy(line.content()));
-            //    //patch.extend_from_slice(line.content());
-            //    true
-            //})
-            //.unwrap();
-
-            //println!("{} {}", commit.id(), commit.summary().unwrap().unwrap());
+            None => None,
         }
     }
 
-    //repo.find_branch(name, branch_type)
+    fn open_diff(&mut self,oid: &Oid, office_id: OfficeId) -> Option<(Diff, Uri)> {
+        let office = &mut self.office[office_id];
+        match office.repo.find_commit(*oid) {
+            Ok(commit) => {
+                let mut format = String::new();
+                let mut diff_view = DiffView::new(&commit);
+                diff_view.fill(&commit, &office.repo, &mut format);
+                //let path = path.strip_prefix("/").unwrap();
+                let path = office.cache.join(oid.to_string());
+                if let Err(_) = fs::create_dir_all(&path) {
+                    //log("create_dir_all failed", conn);
+                    return None
+                }
+                let path = path.join(DIFF_NAME);
+                if let Err(_) = fs::write(&path, format.as_bytes()) {
+                    //log(e.to_string(), conn);
+                    //log(path.to_str().unwrap(), conn);
+                    return None;
+                }
+                let uri = name_to_url(&path).unwrap();
+                Some((Diff {
+                        hash: *oid,
+                        format,
+                        diff_view
+                    }, uri))
+            }
+            Err(_) => None,
+        }
+    }
+}
 
-    return;
+fn log(message: impl Into<String>, conn: &Connection) {
+    let l_params = LogMessageParams {
+        typ: MessageType::INFO,
+        message: message.into(),
+    };
+
+    conn.sender
+        .send(lsp_server::Message::Notification(
+            lsp_server::Notification {
+                method: LogMessage::METHOD.to_string(),
+                params: serde_json::to_value(l_params).unwrap(),
+            },
+        ))
+        .unwrap();
+}
+
+fn main() {
     let (conn, io_t) = Connection::stdio();
     let caps = ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     };
 
     let init = serde_json::json!({
-        "capabilities": caps,
-        "encoding": ["utf-8"]
+        "capabilities": caps
     });
-
-    let init_params = conn.initialize(init).unwrap();
-    let mut client = Client::new();
+    //println!("{init}");
+    //return;
+    let init_params = conn
+        .initialize(serde_json::to_value(&caps).unwrap())
+        .unwrap();
+    //println!("{init_params}");
+    //return;
+    let mut client = Client::new(caps);
     for msg in &conn.receiver {
         match msg {
             Message::Request(request) => client.handle_request(&conn, request),
-            Message::Response(response) => todo!(),
+            Message::Response(response) => (),
             Message::Notification(notification) => client.handle_notification(&conn, notification),
         }
     }

@@ -164,7 +164,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ma-git"
+name = "ma"
 version = "0.1.0"
 dependencies = [
  "git2",
