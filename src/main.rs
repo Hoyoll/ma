@@ -39,6 +39,7 @@ impl Client {
             work_group: HashMap::default(),
             //repo: Vec::default(),
             office: Vec::default(),
+            //manifest: HashMap::default(),
             caps,
         }
     }
@@ -54,6 +55,7 @@ enum WorkGroup {
 struct Office {
     repo: Repository,
     cache: PathBuf,
+    manifest: HashMap<Oid, Uri>,
 }
 struct FileView {
     //branch: String,
@@ -395,7 +397,7 @@ struct Diff {
 
 struct Branch {
     name: String,
-    commits: Vec<(Oid, Option<Uri>)>,
+    commits: Vec<Oid>,
 }
 
 enum GitView {
@@ -450,7 +452,7 @@ impl RootView {
                     from_branch,
                     from_commit,
                 } => {
-                    let (commit, _) = &self.branch[*from_branch].commits[*from_commit];
+                    let commit = &self.branch[*from_branch].commits[*from_commit];
                     self.format.push_str("- ");
                     self.format.push_str(&commit.to_string());
                     self.format.push('\n');
@@ -576,20 +578,20 @@ impl Lsp for Client {
 
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams) {
         let idx = params.text_document_position_params.position.line as usize;
-        match self
+        if let Some((wg, office_id)) = self
             .work_group
             .get(&params.text_document_position_params.text_document.uri)
         {
-            None => (),
-//                log("None actually", conn);
-            Some((WorkGroup::RootView(root),office_id)) => {
-                match &root.view[idx] {
+            let office = &mut self.office[*office_id];
+            match wg {
+                WorkGroup::RootView(root) => match &root.view[idx] {
                     GitView::CommitMember {
                         from_branch,
                         from_commit,
                     } => {
-                        match &root.branch[*from_branch].commits[*from_commit] {
-                            (_, Some(uri)) => {
+                        let oid = root.branch[*from_branch].commits[*from_commit];
+                        match office.manifest.get(&oid) {
+                            Some(uri) => {
                                 send_ok(
                                     conn,
                                     id,
@@ -599,66 +601,57 @@ impl Lsp for Client {
                                     ))),
                                 );
                             }
-                            (oid, uri) if *uri == None => {
-                                let office = &self.office[*office_id];
-                                let path = office.cache.clone().join(oid.to_string());
-                                let repo = &office.repo;
-                                match repo.find_commit(*oid) {
-                                    Ok(commit) => {
-                                        let mut format = String::new();
-                                        let mut diff_view = DiffView::new(&commit);
-                                        diff_view.fill(&commit, repo, &mut format);
-                                        //let path = path.strip_prefix("/").unwrap();
-                                        if let Err(_) = fs::create_dir_all(&path) {
-                                            log("create_dir_all failed", conn);
-                                        }
-                                        let path = path.join(DIFF_NAME);
-                                        if let Err(e) = fs::write(&path, format.as_bytes()) {
-                                            log(e.to_string(), conn);
-                                            log(path.to_str().unwrap(), conn);
-                                            return;
-                                        }
-                                        let uri = name_to_url(&path).unwrap();
-                                        self.work_group.insert(
-                                            uri.clone(),
-                                            (WorkGroup::DiffView(Diff {
-                                                hash: *oid,
-                                                format,
-                                                diff_view,
-                                            }), *office_id),
-                                        );
-                                        send_ok(
-                                            conn,
-                                            id,
-                                            &Some(GotoDefinitionResponse::Scalar(Location::new(
-                                                uri,
-                                                Range::default(),
-                                            ))),
-                                        );
-                                    }
-                                    Err(_) => (),
+                            None => {
+                                if let Some((diff, uri)) = Self::open_diff(&oid, office) {
+                                    self.work_group.insert(
+                                        uri.clone(),
+                                        (WorkGroup::DiffView(diff), *office_id),
+                                    );
+                                    office.manifest.insert(oid, uri.clone());
+                                    send_ok(
+                                        conn,
+                                        id,
+                                        &Some(GotoDefinitionResponse::Scalar(Location::new(
+                                            uri,
+                                            Range::default(),
+                                        ))),
+                                    );
                                 }
                             }
                             _ => (),
                         }
                     }
                     _ => (),
-                }
-            }
-            Some((WorkGroup::DiffView(diff), office_id)) => {
-                match &diff.diff_view {
-                    DiffView::Merge { view, parents } => {
-                        let idx = params.text_document_position_params.position.line as usize;
-                        if let MergeView::Commit(c) = &view[idx] {
-                            //if let Some(d) = self.open_diff(&parents[*c], *office_id) { 
-                            //}
+                },
+                WorkGroup::DiffView(diff) => {
+                    match &diff.diff_view {
+                        DiffView::Merge { view, parents } => {
+                                        //let office = &mut self.office[*office_id];
+                            if let MergeView::Commit(c) = &view[idx] {
+                                let oid = parents[*c];
+                                if let Some((diff, uri)) = Self::open_diff(&oid, office) {
+                                    self.work_group.insert(
+                                        uri.clone(),
+                                        (WorkGroup::DiffView(diff), *office_id),
+                                    );
+                                    office.manifest.insert(oid, uri.clone());
+                                    send_ok(
+                                        conn,
+                                        id,
+                                        &Some(GotoDefinitionResponse::Scalar(Location::new(
+                                            uri,
+                                            Range::default(),
+                                        ))),
+                                    );
+                                }
+                            }
                         }
+                        DiffView::Normal { hunk, view, parent } => todo!(),
+                        DiffView::Root { hunk, view } => todo!(),
                     }
-                    DiffView::Normal { hunk, view, parent } => todo!(),
-                    DiffView::Root { hunk, view } => todo!(),
                 }
+                WorkGroup::FileView(file_view) => todo!(),
             }
-            _ => (),
         }
     }
 
@@ -672,8 +665,10 @@ impl Lsp for Client {
                     wg.rebuild_view();
                     wg.rebuild_format();
                     let format = wg.format.clone();
-                    self.work_group
-                        .insert(params.text_document.uri.clone(), (WorkGroup::RootView(wg), self.office.len() - 1));
+                    self.work_group.insert(
+                        params.text_document.uri.clone(),
+                        (WorkGroup::RootView(wg), self.office.len() - 1),
+                    );
                     let mut wf = HashMap::new();
                     wf.insert(
                         params.text_document.uri.clone(),
@@ -708,19 +703,13 @@ impl Client {
     fn new_workgroup(&mut self, uri: &lsp_types::Uri) -> Option<RootView> {
         let path = uri.path();
         let p = std::path::PathBuf::from(path.as_str());
-        //log("HERE!", conn);
         match p.file_name() {
             Some(s) => match s.to_str() {
                 Some(ROOT_NAME) => {
                     let parent = PathBuf::from(p.parent().unwrap());
                     let p = parent.strip_prefix("/").unwrap();
                     match Repository::open(&p) {
-                        Err(_) => {
-                            //log("It's Err actually", conn);
-                            //log(format!("with name like {:?}", s), conn);
-                            //log(format!("with repo pointing to: {}",p.display()), conn);
-                            None
-                        }
+                        Err(_) => None,
                         Ok(repo) => {
                             //log(s.to_str().unwrap(), conn);
                             let branch = {
@@ -739,7 +728,7 @@ impl Client {
                                                         revwalk.set_sorting(Sort::TIME);
                                                         for res in revwalk {
                                                             res.map(|id| {
-                                                                c.push((id, None));
+                                                                c.push(id);
                                                             });
                                                         }
                                                     });
@@ -762,13 +751,17 @@ impl Client {
                             };
                             let mut cache = PathBuf::from(repo.path());
                             cache.push(CACHE_DIR);
-                            self.office.push(Office { repo, cache });
+                            self.office.push(Office {
+                                repo,
+                                cache,
+                                manifest: HashMap::new(),
+                            });
                             //self.repo.push(repo);
                             Some(RootView {
                                 branch,
                                 format: String::default(),
                                 view: Vec::default(),
-       //                         cache,
+                                //                         cache,
                             })
                             //self.work_group
                             //    .insert(uri.clone(), WorkGroup::RootView(rootview));
@@ -781,8 +774,8 @@ impl Client {
         }
     }
 
-    fn open_diff(&mut self,oid: &Oid, office_id: OfficeId) -> Option<(Diff, Uri)> {
-        let office = &mut self.office[office_id];
+    fn open_diff(oid: &Oid, office: &mut Office) -> Option<(Diff, Uri)> {
+        //let office = &mut self.office[office_id];
         match office.repo.find_commit(*oid) {
             Ok(commit) => {
                 let mut format = String::new();
@@ -792,7 +785,7 @@ impl Client {
                 let path = office.cache.join(oid.to_string());
                 if let Err(_) = fs::create_dir_all(&path) {
                     //log("create_dir_all failed", conn);
-                    return None
+                    return None;
                 }
                 let path = path.join(DIFF_NAME);
                 if let Err(_) = fs::write(&path, format.as_bytes()) {
@@ -801,11 +794,14 @@ impl Client {
                     return None;
                 }
                 let uri = name_to_url(&path).unwrap();
-                Some((Diff {
+                Some((
+                    Diff {
                         hash: *oid,
                         format,
-                        diff_view
-                    }, uri))
+                        diff_view,
+                    },
+                    uri,
+                ))
             }
             Err(_) => None,
         }
