@@ -1,12 +1,100 @@
+trait Lsp {
+    fn log(message: impl Into<String>, conn: &Connection) {
+        let l_params = LogMessageParams {
+            typ: MessageType::INFO,
+            message: message.into(),
+        };
+
+        conn.sender
+            .send(lsp_server::Message::Notification(
+                lsp_server::Notification {
+                    method: LogMessage::METHOD.to_string(),
+                    params: serde_json::to_value(l_params).unwrap(),
+                },
+            ))
+            .unwrap();
+    }
+    fn ok<T: serde::Serialize>(conn: &Connection, id: RequestId, result: &T) {
+        let resp = Response {
+            id,
+            response_result: Ok(serde_json::to_value(result).unwrap()),
+        };
+        conn.sender.send(Message::Response(resp));
+    }
+
+    fn err(conn: &Connection, id: RequestId, code: lsp_server::ErrorCode, msg: &str) {
+        let resp = Response {
+            id,
+            response_result: Err(lsp_server::ResponseError {
+                code: code as i32,
+                message: msg.into(),
+                data: None,
+            }),
+        };
+        conn.sender.send(Message::Response(resp));
+    }
+
+    fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams);
+
+    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams);
+    fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
+    fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
+    fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams);
+    fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) { 
+        match request.method.as_str() {
+            Initialize::METHOD => { 
+                serde_json::from_value(request.params).map(|params: InitializeParams| {
+                    self.initialize(conn, request.id, params);
+                });
+            }
+
+            HoverRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: HoverParams| {
+                    self.hover(conn, request.id, params);
+                });
+            }
+            GotoDefinition::METHOD => {
+                serde_json::from_value(request.params).map(|params: GotoDefinitionParams| {
+                    self.goto_definition(conn, request.id, params);
+                });
+            }
+            FoldingRangeRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: FoldingRangeParams| {
+                    self.folding(conn, request.id, params);
+                });
+            }
+            _ => {
+                Self::err(
+                    conn,
+                    request.id,
+                    lsp_server::ErrorCode::MethodNotFound,
+                    "unhandled method",
+                );
+            }
+        }
+    }
+
+    fn handle_notification(&mut self, conn: &Connection, notification: lsp_server::Notification) {
+        //eprintln!("NOTIFICATION: {}", notification.method);
+
+        match notification.method.as_str() {
+            DidOpenTextDocument::METHOD => {
+                serde_json::from_value(notification.params).map(
+                    |params: DidOpenTextDocumentParams| {
+                        self.did_open(conn, params);
+                    },
+                );
+            }
+            _ => (),
+        }
+    }
+}
+
 use std::{
-    collections::HashMap,
-    fs,
-    path::{Component, Path, PathBuf, Prefix},
-    process::Command,
-    str::FromStr,
+    collections::HashMap, fs, hash::Hash, path::{Component, Path, PathBuf, Prefix}, process::Command, str::FromStr
 };
 
-use git2::{BranchType, Commit, DiffFormat, Oid, Repository, Sort};
+use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
     ApplyWorkspaceEditParams, DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams,
@@ -16,51 +104,58 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
     WorkspaceEdit, lsp_request,
     notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage},
-    request::{FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, Request},
+    request::{
+        ApplyWorkspaceEdit, FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, Request,
+    },
 };
 use serde::{Deserialize, Serialize};
 
 const ROOT_NAME: &str = "ma.md";
 const DIFF_NAME: &str = "ma.diff";
-const GIT_DIR: &str = ".git";
 const CACHE_DIR: &str = "ma-cache";
-type RepoId = usize;
-
 struct Client {
     work_group: HashMap<Uri, (WorkGroup, OfficeId)>,
     //repo: Vec<Repository>,
     office: Vec<Office>,
-    caps: ServerCapabilities,
+    //caps: ServerCapabilities,
 }
 
 impl Client {
-    fn new(caps: ServerCapabilities) -> Self {
+    fn new() -> Self {
         Self {
             work_group: HashMap::default(),
             //repo: Vec::default(),
             office: Vec::default(),
             //manifest: HashMap::default(),
-            caps,
+            //caps,
         }
     }
 }
 
-type Root = usize;
 type OfficeId = usize;
 enum WorkGroup {
     RootView(RootView),
     DiffView(Diff),
-    FileView(FileView),
+    FileView,
 }
 struct Office {
     repo: Repository,
     cache: PathBuf,
     manifest: HashMap<Oid, Uri>,
+    file_cache: HashMap<PathBuf, Uri>
 }
+
+#[derive(Hash, PartialEq, Eq)]
+enum Hand<Left: Hash, Right: Hash> {
+    Left(Left),
+    Right(Right),
+}
+
 struct FileView {
     //branch: String,
     commit: Oid,
-    name: String,
+    blob: Oid,
+    name: PathBuf,
 }
 
 enum MergeView {
@@ -199,6 +294,11 @@ impl DiffView {
                 view.clear();
                 view.push(NormalView::Padding);
 
+                format.push_str("# ");
+                format.push_str(&parent.to_string());
+                format.push('\n');
+                view.push(NormalView::ParentCommit);
+                
                 format.push_str("# ");
                 format.push_str(&commit.id().to_string());
                 format.push('\n');
@@ -389,7 +489,7 @@ impl DiffView {
 }
 
 struct Diff {
-    hash: Oid,
+    oid: Oid,
     format: String,
     diff_view: DiffView,
     //repo_id: RepoId,
@@ -454,116 +554,12 @@ impl RootView {
                 } => {
                     let commit = &self.branch[*from_branch].commits[*from_commit];
                     self.format.push_str("- ");
-                    self.format.push_str(&commit.to_string());
+                    self.format.push_str(&commit.to_string()[..8]);
                     self.format.push('\n');
                 }
             }
         }
     }
-}
-
-trait Lsp {
-    fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams);
-
-    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams);
-    fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
-    fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
-    fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams);
-    fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) {
-        let l_params = LogMessageParams {
-            typ: MessageType::INFO,
-            message: "HELLO FROM MY INIT METHOD".into(),
-        };
-
-        conn.sender
-            .send(lsp_server::Message::Notification(
-                lsp_server::Notification {
-                    method: LogMessage::METHOD.to_string(),
-                    params: serde_json::to_value(l_params).unwrap(),
-                },
-            ))
-            .unwrap();
-
-        match request.method.as_str() {
-            Initialize::METHOD => {
-                let l_params = LogMessageParams {
-                    typ: MessageType::INFO,
-                    message: "HELLO FROM MY INIT METHOD".into(),
-                };
-
-                conn.sender
-                    .send(lsp_server::Message::Notification(
-                        lsp_server::Notification {
-                            method: LogMessage::METHOD.to_string(),
-                            params: serde_json::to_value(l_params).unwrap(),
-                        },
-                    ))
-                    .unwrap();
-                serde_json::from_value(request.params).map(|params: InitializeParams| {
-                    self.initialize(conn, request.id, params);
-                });
-            }
-
-            HoverRequest::METHOD => {
-                serde_json::from_value(request.params).map(|params: HoverParams| {
-                    self.hover(conn, request.id, params);
-                });
-            }
-            GotoDefinition::METHOD => {
-                serde_json::from_value(request.params).map(|params: GotoDefinitionParams| {
-                    self.goto_definition(conn, request.id, params);
-                });
-            }
-            FoldingRangeRequest::METHOD => {
-                serde_json::from_value(request.params).map(|params: FoldingRangeParams| {
-                    self.folding(conn, request.id, params);
-                });
-            }
-            _ => {
-                send_err(
-                    conn,
-                    request.id,
-                    lsp_server::ErrorCode::MethodNotFound,
-                    "unhandled method",
-                );
-            }
-        }
-    }
-
-    fn handle_notification(&mut self, conn: &Connection, notification: lsp_server::Notification) {
-        //eprintln!("NOTIFICATION: {}", notification.method);
-
-        match notification.method.as_str() {
-            DidOpenTextDocument::METHOD => {
-                serde_json::from_value(notification.params).map(
-                    |params: DidOpenTextDocumentParams| {
-                        self.did_open(conn, params);
-                    },
-                );
-            }
-            _ => (),
-        }
-    }
-}
-
-fn send_ok<T: serde::Serialize>(conn: &Connection, id: RequestId, result: &T) {
-    let resp = Response {
-        id,
-        response_result: Ok(serde_json::to_value(result).unwrap()),
-    };
-    conn.sender.send(Message::Response(resp));
-}
-
-fn send_err(conn: &Connection, id: RequestId, code: lsp_server::ErrorCode, msg: &str) {
-    let resp = Response {
-        id,
-        response_result: Err(lsp_server::ResponseError {
-            code: code as i32,
-            message: msg.into(),
-            data: None,
-        }),
-    };
-    conn.sender.send(Message::Response(resp));
 }
 
 impl Lsp for Client {
@@ -578,80 +574,18 @@ impl Lsp for Client {
 
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams) {
         let idx = params.text_document_position_params.position.line as usize;
-        if let Some((wg, office_id)) = self
-            .work_group
-            .get(&params.text_document_position_params.text_document.uri)
-        {
-            let office = &mut self.office[*office_id];
-            match wg {
-                WorkGroup::RootView(root) => match &root.view[idx] {
-                    GitView::CommitMember {
-                        from_branch,
-                        from_commit,
-                    } => {
-                        let oid = root.branch[*from_branch].commits[*from_commit];
-                        match office.manifest.get(&oid) {
-                            Some(uri) => {
-                                send_ok(
-                                    conn,
-                                    id,
-                                    &Some(GotoDefinitionResponse::Scalar(Location::new(
-                                        uri.clone(),
-                                        Range::default(),
-                                    ))),
-                                );
-                            }
-                            None => {
-                                if let Some((diff, uri)) = Self::open_diff(&oid, office) {
-                                    self.work_group.insert(
-                                        uri.clone(),
-                                        (WorkGroup::DiffView(diff), *office_id),
-                                    );
-                                    office.manifest.insert(oid, uri.clone());
-                                    send_ok(
-                                        conn,
-                                        id,
-                                        &Some(GotoDefinitionResponse::Scalar(Location::new(
-                                            uri,
-                                            Range::default(),
-                                        ))),
-                                    );
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
-                    _ => (),
-                },
-                WorkGroup::DiffView(diff) => {
-                    match &diff.diff_view {
-                        DiffView::Merge { view, parents } => {
-                                        //let office = &mut self.office[*office_id];
-                            if let MergeView::Commit(c) = &view[idx] {
-                                let oid = parents[*c];
-                                if let Some((diff, uri)) = Self::open_diff(&oid, office) {
-                                    self.work_group.insert(
-                                        uri.clone(),
-                                        (WorkGroup::DiffView(diff), *office_id),
-                                    );
-                                    office.manifest.insert(oid, uri.clone());
-                                    send_ok(
-                                        conn,
-                                        id,
-                                        &Some(GotoDefinitionResponse::Scalar(Location::new(
-                                            uri,
-                                            Range::default(),
-                                        ))),
-                                    );
-                                }
-                            }
-                        }
-                        DiffView::Normal { hunk, view, parent } => todo!(),
-                        DiffView::Root { hunk, view } => todo!(),
-                    }
-                }
-                WorkGroup::FileView(file_view) => todo!(),
+        let url = &params.text_document_position_params.text_document.uri;
+        let mut off_id: usize = 0;
+        let (result, new_work_group) = match self.work_group.get(url) {
+            Some((wg, office_id)) => {
+                off_id = *office_id;
+                Self::work_group_meeting(wg, &mut self.office[*office_id], idx)
             }
+            None => (None, None),
+        };
+        Self::ok(conn, id, &result);
+        if let Some((uri, wg)) = new_work_group {
+            self.work_group.insert(uri, (wg, off_id));
         }
     }
 
@@ -661,9 +595,10 @@ impl Lsp for Client {
         match self.work_group.get_mut(&params.text_document.uri) {
             Some(_) => (),
             None => {
-                if let Some(mut wg) = self.new_workgroup(&params.text_document.uri) {
+                if let Some(mut wg) = self.new_rootview(&params.text_document.uri) {
                     wg.rebuild_view();
                     wg.rebuild_format();
+                    let end = wg.view.len();
                     let format = wg.format.clone();
                     self.work_group.insert(
                         params.text_document.uri.clone(),
@@ -676,7 +611,7 @@ impl Lsp for Client {
                             new_text: format,
                             range: Range {
                                 start: Position::new(1, 1),
-                                end: Position::new(1, 1),
+                                end: Position::new(end as u32, 1),
                             },
                         }],
                     );
@@ -688,8 +623,8 @@ impl Lsp for Client {
                         },
                     };
                     conn.sender.send(Message::Request(lsp_server::Request::new(
-                        RequestId::from(19),
-                        "workspace/applyEdit".into(),
+                        RequestId::from(1),
+                        ApplyWorkspaceEdit::METHOD.into(),
                         &we,
                     )));
                     //send_ok(conn, RequestId::from(1), &Some(TextEdit::new(Range { start: Position::new(1, 1), end: Position::new(1, 1) }, format)));
@@ -700,7 +635,174 @@ impl Lsp for Client {
 }
 
 impl Client {
-    fn new_workgroup(&mut self, uri: &lsp_types::Uri) -> Option<RootView> {
+    fn work_group_meeting(
+        wg: &WorkGroup,
+        office: &mut Office,
+        idx: usize,
+    ) -> (Option<impl Serialize + use<>>, Option<(Uri, WorkGroup)>) {
+        match wg {
+            WorkGroup::RootView(root) => match &root.view[idx] {
+                GitView::CommitMember {
+                    from_branch,
+                    from_commit,
+                } => {
+                    let oid = root.branch[*from_branch].commits[*from_commit];
+                    match office.manifest.get(&oid) {
+                        Some(uri) => (
+                            Some(GotoDefinitionResponse::Scalar(Location::new(
+                                uri.clone(),
+                                Range::default(),
+                            ))),
+                            None,
+                        ),
+                        None => {
+                            if let Some((diff, uri)) = Self::open_diff(oid, office) {
+                                office.manifest.insert(oid, uri.clone());
+                                return (
+                                    Some(GotoDefinitionResponse::Scalar(Location::new(
+                                        uri.clone(),
+                                        Range::default(),
+                                    ))),
+                                    Some((uri, WorkGroup::DiffView(diff))),
+                                );
+                            }
+                            return (None, None);
+                        }
+                    }
+                }
+                _ => (None, None),
+            },
+            WorkGroup::DiffView(diff) => match &diff.diff_view {
+                DiffView::Merge { view, parents } => {
+                    if let MergeView::Commit(c) = &view[idx] {
+                        let oid = parents[*c];
+                        if let Some(uri) = office.manifest.get(&oid) {
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range::default(),
+                                ))),
+                                None,
+                            );
+                        }
+                        if let Some((diff, uri)) = Self::open_diff(oid, office) {
+                            office.manifest.insert(oid, uri.clone());
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range::default(),
+                                ))),
+                                Some((uri, WorkGroup::DiffView(diff))),
+                            );
+                        }
+                    }
+                    return (None, None);
+                }
+                DiffView::Normal { hunk, view, parent } => match &view[idx] {
+                    NormalView::Padding => (None, None),
+                    NormalView::ParentCommit => {
+                        if let Some(uri) = office.manifest.get(&parent) {
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range::default(),
+                                ))),
+                                None,
+                            );
+                        }
+                        if let Some((diff, uri)) = Self::open_diff(*parent, office) {
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range::default(),
+                                ))),
+                                Some((uri, WorkGroup::DiffView(diff))),
+                            );
+                        }
+                        (None, None)
+                    }
+                    NormalView::Hunk {
+                        from_hunk,
+                        change_on,
+                    } => {
+                        let h = &hunk[*from_hunk];
+                        if let Some(uri) = Self::open_file(office, diff.oid, &h.path) {
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range {
+                                        start: Position::new(*change_on, 1),
+                                        ..Default::default()
+                                    },
+                                ))),
+                                Some((uri, WorkGroup::FileView)),
+                            );
+                        }
+                        return (None, None);
+                    }
+                },
+                DiffView::Root { hunk, view } => {
+                    if let NormalView::Hunk { from_hunk, change_on } = &view[idx] { 
+                        let h = &hunk[*from_hunk];
+                        if let Some(uri) = office.file_cache.get(&h.path) {
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range {
+                                        start: Position::new(*change_on, 1),
+                                        ..Default::default()
+                                    },
+                                ))),
+                                None,
+                            );
+                        }
+                        if let Some(uri) = Self::open_file(office, diff.oid, &h.path) {
+                            return (
+                                Some(GotoDefinitionResponse::Scalar(Location::new(
+                                    uri.clone(),
+                                    Range {
+                                        start: Position::new(*change_on, 1),
+                                        ..Default::default()
+                                    },
+                                ))),
+                                Some((uri, WorkGroup::FileView)),
+                            );
+                        }
+                    }
+                    return (None, None);
+                },
+            },
+            WorkGroup::FileView => (None, None),
+        }
+    }
+
+    fn open_file(office: &mut Office, oid: Oid, path: &Path) -> Option<Uri> {
+        if let Ok(commit) = office.repo.find_commit(oid) {
+            let tree = commit.tree().unwrap();
+            if let Ok(entry) = tree.get_path(path) {
+                if entry.kind() != Some(ObjectType::Blob) {
+                    return None;
+                }
+                if let Ok(blob) = office.repo.find_blob(entry.id()) {
+                    let p = office.cache.join(oid.to_string()).join(path);
+                    if let Err(_) = fs::create_dir_all(p.parent().unwrap()) {
+                        return None;
+                    }
+
+                    if let Err(_) = fs::write(&p, blob.content()) {
+                        return None;
+                    }
+                    let uri = name_to_url(&p).unwrap();
+                    office.file_cache.insert(p, uri.clone());
+                    return Some(uri);
+                    //return (So);
+                }
+            }
+        }
+        None
+    }
+
+    fn new_rootview(&mut self, uri: &lsp_types::Uri) -> Option<RootView> {
         let path = uri.path();
         let p = std::path::PathBuf::from(path.as_str());
         match p.file_name() {
@@ -755,6 +857,7 @@ impl Client {
                                 repo,
                                 cache,
                                 manifest: HashMap::new(),
+                                file_cache: HashMap::new()
                             });
                             //self.repo.push(repo);
                             Some(RootView {
@@ -774,9 +877,9 @@ impl Client {
         }
     }
 
-    fn open_diff(oid: &Oid, office: &mut Office) -> Option<(Diff, Uri)> {
+    fn open_diff(oid: Oid, office: &mut Office) -> Option<(Diff, Uri)> {
         //let office = &mut self.office[office_id];
-        match office.repo.find_commit(*oid) {
+        match office.repo.find_commit(oid) {
             Ok(commit) => {
                 let mut format = String::new();
                 let mut diff_view = DiffView::new(&commit);
@@ -789,14 +892,12 @@ impl Client {
                 }
                 let path = path.join(DIFF_NAME);
                 if let Err(_) = fs::write(&path, format.as_bytes()) {
-                    //log(e.to_string(), conn);
-                    //log(path.to_str().unwrap(), conn);
                     return None;
                 }
                 let uri = name_to_url(&path).unwrap();
                 Some((
                     Diff {
-                        hash: *oid,
+                        oid,
                         format,
                         diff_view,
                     },
@@ -806,22 +907,6 @@ impl Client {
             Err(_) => None,
         }
     }
-}
-
-fn log(message: impl Into<String>, conn: &Connection) {
-    let l_params = LogMessageParams {
-        typ: MessageType::INFO,
-        message: message.into(),
-    };
-
-    conn.sender
-        .send(lsp_server::Message::Notification(
-            lsp_server::Notification {
-                method: LogMessage::METHOD.to_string(),
-                params: serde_json::to_value(l_params).unwrap(),
-            },
-        ))
-        .unwrap();
 }
 
 fn main() {
@@ -849,7 +934,7 @@ fn main() {
         .unwrap();
     //println!("{init_params}");
     //return;
-    let mut client = Client::new(caps);
+    let mut client = Client::new();
     for msg in &conn.receiver {
         match msg {
             Message::Request(request) => client.handle_request(&conn, request),
@@ -874,11 +959,6 @@ pub fn name_to_url(path: &Path) -> Option<Uri> {
                 raw.push_str(&component.as_os_str().to_string_lossy());
             }
             Component::Prefix(prefix) => match prefix.kind() {
-                // A real drive renders with a bare colon (`file:///C:/…`) — the
-                // form LSP clients emit and the only one that round-trips back
-                // through `Path::is_absolute` on Windows. Other prefix kinds
-                // (UNC, device namespaces) have no such convention, so keep the
-                // safe percent-encoded form.
                 Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
                     raw.push('/');
                     raw.push(letter as char);
