@@ -1,5 +1,6 @@
-# Branch: <current branch> // use folding line
-- branches // foldable
+# Branch: <current branch> // using action will give you a list of branch to switch to and crucially refresh the document
 	
 # Commit // use folding line
-- hashes // foldable // on hover it show patches	
+- <hash> // foldable // on hover it show header .diff
+- <hash>
+- ... // pressing goto will edit this line and add more commit

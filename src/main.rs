@@ -14,7 +14,8 @@ trait Lsp {
             ))
             .unwrap();
     }
-    fn ok<T: serde::Serialize>(conn: &Connection, id: RequestId, result: &T) {
+
+    fn ok(conn: &Connection, id: RequestId, result: &impl Serialize) {
         let resp = Response {
             id,
             response_result: Ok(serde_json::to_value(result).unwrap()),
@@ -40,9 +41,10 @@ trait Lsp {
     fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams);
-    fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) { 
+    fn code_action(&mut self, conn: &Connection, id: RequestId, params: CodeActionParams);
+    fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) {
         match request.method.as_str() {
-            Initialize::METHOD => { 
+            Initialize::METHOD => {
                 serde_json::from_value(request.params).map(|params: InitializeParams| {
                     self.initialize(conn, request.id, params);
                 });
@@ -63,6 +65,11 @@ trait Lsp {
                     self.folding(conn, request.id, params);
                 });
             }
+            CodeActionRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: CodeActionParams| {
+                    self.code_action(conn, request.id, params);
+                });
+            }
             _ => {
                 Self::err(
                     conn,
@@ -75,8 +82,6 @@ trait Lsp {
     }
 
     fn handle_notification(&mut self, conn: &Connection, notification: lsp_server::Notification) {
-        //eprintln!("NOTIFICATION: {}", notification.method);
-
         match notification.method.as_str() {
             DidOpenTextDocument::METHOD => {
                 serde_json::from_value(notification.params).map(
@@ -91,22 +96,22 @@ trait Lsp {
 }
 
 use std::{
-    collections::HashMap, fs, hash::Hash, path::{Component, Path, PathBuf, Prefix}, process::Command, str::FromStr
+    collections::HashMap,
+    fs,
+    hash::Hash,
+    path::{Component, Path, PathBuf, Prefix},
+    process::Command,
+    str::FromStr,
 };
 
-use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort};
+use chrono::{DateTime, FixedOffset};
+use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Time};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ApplyWorkspaceEditParams, DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, Location, LogMessageParams,
-    MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
-    WorkspaceEdit, lsp_request,
-    notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage},
-    request::{
-        ApplyWorkspaceEdit, FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, Request,
-    },
+    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse, DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit, lsp_request, notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage}, request::{
+        ApplyWorkspaceEdit, CodeActionRequest, FoldingRangeRequest, GotoDefinition, HoverRequest,
+        Initialize, Request,
+    }
 };
 use serde::{Deserialize, Serialize};
 
@@ -142,20 +147,7 @@ struct Office {
     repo: Repository,
     cache: PathBuf,
     manifest: HashMap<Oid, Uri>,
-    file_cache: HashMap<PathBuf, Uri>
-}
-
-#[derive(Hash, PartialEq, Eq)]
-enum Hand<Left: Hash, Right: Hash> {
-    Left(Left),
-    Right(Right),
-}
-
-struct FileView {
-    //branch: String,
-    commit: Oid,
-    blob: Oid,
-    name: PathBuf,
+    file_cache: HashMap<PathBuf, Uri>,
 }
 
 enum MergeView {
@@ -235,14 +227,16 @@ impl DiffView {
         }
     }
 
-    fn format_header(commit: &Commit, format: &mut String) {}
+    fn format_header(commit: &Commit, format: &mut String, view: &mut Vec<NormalView>) {}
     fn fill(&mut self, commit: &Commit, repo: &Repository, format: &mut String) {
         format.clear();
         match self {
             DiffView::Merge { view, parents } => {
                 view.clear();
+                //view.push(MergeView::Padding);
                 view.push(MergeView::Padding);
-                format.push_str("# ");
+
+                format.push_str("+ ");
                 format.push_str(&commit.id().to_string());
                 format.push('\n');
                 view.push(MergeView::Padding);
@@ -253,11 +247,11 @@ impl DiffView {
                 format.push_str(" ");
                 format.push_str(author.email().unwrap_or_default());
                 format.push('\n');
-
                 view.push(MergeView::Padding);
 
                 format.push_str("Date: ");
                 // TO-DO: Date!
+                format.push_str(&format_git_time(author.when()).unwrap_or_default());
                 //format.push_str(&self.date);
                 format.push('\n');
                 view.push(MergeView::Padding);
@@ -274,6 +268,7 @@ impl DiffView {
 
                 format.push_str("# Parents:");
                 format.push('\n');
+                view.push(MergeView::Padding);
                 view.push(MergeView::Padding);
 
                 //for p in parents {
@@ -292,100 +287,19 @@ impl DiffView {
                 parent,
             } => {
                 view.clear();
-                view.push(NormalView::Padding);
-
-                format.push_str("# ");
+                //view.push(NormalView::Padding);
+                format.push_str("- ");
                 format.push_str(&parent.to_string());
                 format.push('\n');
                 view.push(NormalView::ParentCommit);
-                
-                format.push_str("# ");
-                format.push_str(&commit.id().to_string());
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push_str("Author: ");
-                let author = commit.author();
-                format.push_str(&author.name().unwrap_or_default());
-                format.push_str(" ");
-                format.push_str(author.email().unwrap_or_default());
-                format.push('\n');
-
-                view.push(NormalView::Padding);
-
-                format.push_str("Date: ");
-                // TO-DO: Date!
-                //format.push_str(&self.date);
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push_str(&commit.message().unwrap_or_default());
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push('\n');
-                view.push(NormalView::Padding);
+                Self::fill_format(format, view, commit);
 
                 let tree = commit.tree().ok();
                 let parent = commit.parent(0).unwrap().tree().ok();
                 let diff = repo.diff_tree_to_tree(parent.as_ref(), tree.as_ref(), None);
 
                 if let Ok(diff) = diff {
-                    let mut anchor_id = Oid::ZERO_SHA1;
-                    let mut hunk_current_line = 0;
-                    let mut line_count = view.len() - 1;
-                    let mut current_hunk = 0;
-                    view.push(NormalView::Padding);
-                    diff.print(DiffFormat::Patch, |delta, hunk, line| {
-                        line_count += 1;
-                        let file = delta.new_file();
-                        if file.id() != anchor_id {
-                            hunk_col.push(Hunk {
-                                path: PathBuf::from(file.path().unwrap()),
-                                changes: Vec::new(),
-                            });
-                            current_hunk = hunk_col.len() - 1;
-                            anchor_id = file.id();
-                            hunk_current_line = 0;
-                        }
-                        match hunk {
-                            Some(hunk) if hunk_current_line != hunk.new_start() => {
-                                format.push_str("@@ -");
-                                format.push_str(&hunk.old_start().to_string());
-                                format.push(',');
-                                format.push_str(&hunk.old_lines().to_string());
-
-                                format.push_str(" +");
-                                format.push_str(&hunk.new_start().to_string());
-                                format.push(',');
-                                format.push_str(&hunk.new_lines().to_string());
-
-                                format.push_str(" @@");
-
-                                format.push('\n');
-                                hunk_col[current_hunk].changes.push(line_count as u32);
-
-                                hunk_current_line = hunk.new_start();
-                                view.push(NormalView::Hunk {
-                                    from_hunk: current_hunk,
-                                    change_on: hunk.new_start(),
-                                });
-                            }
-                            Some(_) => {
-                                format.push(line.origin());
-                                format.push(' ');
-                                format.push_str(&String::from_utf8_lossy(line.content()));
-
-                                view.push(NormalView::Padding);
-                            }
-                            _ => (),
-                        }
-
-                        true
-                    });
+                    Self::fill_view(diff, format, view, hunk_col);
                 }
             }
             DiffView::Root {
@@ -394,97 +308,112 @@ impl DiffView {
             } => {
                 view.clear();
                 view.push(NormalView::Padding);
-
-                format.push_str("# ");
-                format.push_str(&commit.id().to_string());
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push_str("Author: ");
-                let author = commit.author();
-                format.push_str(&author.name().unwrap_or_default());
-                format.push_str(" ");
-                format.push_str(author.email().unwrap_or_default());
-                format.push('\n');
-
-                view.push(NormalView::Padding);
-
-                format.push_str("Date: ");
-                // TO-DO: Date!
-                //format.push_str(&self.date);
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push_str(&commit.message().unwrap_or_default());
-                format.push('\n');
-                view.push(NormalView::Padding);
-
-                format.push('\n');
-                view.push(NormalView::Padding);
-
+                Self::fill_format(format, view, commit);
                 let tree = commit.tree().ok();
                 //let parent = commit.parent(0).unwrap().tree().ok();
                 let diff = repo.diff_tree_to_tree(None, tree.as_ref(), None);
 
                 if let Ok(diff) = diff {
-                    let mut anchor_id = Oid::ZERO_SHA1;
-                    let mut hunk_current_line = 0;
-                    let mut line_count = view.len() - 1;
-                    let mut current_hunk = 0;
-                    view.push(NormalView::Padding);
-                    diff.print(DiffFormat::Patch, |delta, hunk, line| {
-                        line_count += 1;
-                        let file = delta.new_file();
-                        if file.id() != anchor_id {
-                            hunk_col.push(Hunk {
-                                path: PathBuf::from(file.path().unwrap()),
-                                changes: Vec::new(),
-                            });
-                            current_hunk = hunk_col.len() - 1;
-                            anchor_id = file.id();
-                            hunk_current_line = 0;
-                        }
-                        match hunk {
-                            Some(hunk) if hunk_current_line != hunk.new_start() => {
-                                format.push_str("@@ -");
-                                format.push_str(&hunk.old_start().to_string());
-                                format.push(',');
-                                format.push_str(&hunk.old_lines().to_string());
-
-                                format.push_str(" +");
-                                format.push_str(&hunk.new_start().to_string());
-                                format.push(',');
-                                format.push_str(&hunk.new_lines().to_string());
-
-                                format.push_str(" @@");
-
-                                format.push('\n');
-                                hunk_col[current_hunk].changes.push(line_count as u32);
-
-                                hunk_current_line = hunk.new_start();
-                                view.push(NormalView::Hunk {
-                                    from_hunk: current_hunk,
-                                    change_on: hunk.new_start(),
-                                });
-                            }
-                            Some(_) => {
-                                format.push(line.origin());
-                                format.push(' ');
-                                format.push_str(&String::from_utf8_lossy(line.content()));
-
-                                view.push(NormalView::Padding);
-                            }
-                            _ => (),
-                        }
-
-                        true
-                    });
+                    Self::fill_view(diff, format, view, hunk_col);
                 }
             }
         }
+    }
+
+    fn fill_format(format: &mut String, view: &mut Vec<NormalView>, commit: &Commit) {
+        format.push_str("+ ");
+        format.push_str(&commit.id().to_string());
+        format.push('\n');
+        view.push(NormalView::Padding);
+
+        format.push_str("Author: ");
+        let author = commit.author();
+        format.push_str(&author.name().unwrap_or_default());
+        format.push_str(" ");
+        format.push_str(author.email().unwrap_or_default());
+        format.push('\n');
+
+        view.push(NormalView::Padding);
+
+        format.push_str("Date: ");
+        // TO-DO: Date!
+        //format.push_str(&self.date);
+        format.push_str(&format_git_time(author.when()).unwrap_or_default());
+        format.push('\n');
+        view.push(NormalView::Padding);
+
+        format.push('\n');
+        view.push(NormalView::Padding);
+
+        format.push_str(&commit.message().unwrap_or_default());
+        format.push('\n');
+        view.push(NormalView::Padding);
+
+        format.push('\n');
+        view.push(NormalView::Padding);
+    }
+    fn fill_view(
+        diff: git2::Diff,
+        format: &mut String,
+        view: &mut Vec<NormalView>,
+        hunk_col: &mut Vec<Hunk>,
+    ) {
+        let mut anchor_id = Oid::ZERO_SHA1;
+        let mut hunk_current_line = 0;
+        let mut line_count = view.len() - 1;
+        let mut current_hunk = 0;
+        view.push(NormalView::Padding);
+        diff.print(DiffFormat::Patch, |delta, hunk, line| {
+            line_count += 1;
+            let file = delta.new_file();
+            if file.id() != anchor_id {
+                hunk_col.push(Hunk {
+                    path: PathBuf::from(file.path().unwrap()),
+                    changes: Vec::new(),
+                });
+                current_hunk = hunk_col.len() - 1;
+                anchor_id = file.id();
+                hunk_current_line = 0;
+
+                format.push_str(&file.path().unwrap().to_string_lossy());
+                format.push('\n');
+                view.push(NormalView::Padding);
+            }
+            match hunk {
+                Some(hunk) if hunk_current_line != hunk.new_start() => {
+                    format.push_str("@@ -");
+                    format.push_str(&hunk.old_start().to_string());
+                    format.push(',');
+                    format.push_str(&hunk.old_lines().to_string());
+
+                    format.push_str(" +");
+                    format.push_str(&hunk.new_start().to_string());
+                    format.push(',');
+                    format.push_str(&hunk.new_lines().to_string());
+
+                    format.push_str(" @@");
+
+                    format.push('\n');
+                    hunk_col[current_hunk].changes.push(line_count as u32);
+
+                    hunk_current_line = hunk.new_start();
+                    view.push(NormalView::Hunk {
+                        from_hunk: current_hunk,
+                        change_on: hunk.new_start(),
+                    });
+                }
+                Some(_) => {
+                    format.push(line.origin());
+                    format.push(' ');
+                    format.push_str(&String::from_utf8_lossy(line.content()));
+
+                    view.push(NormalView::Padding);
+                }
+                _ => (),
+            }
+
+            true
+        });
     }
 }
 
@@ -500,19 +429,25 @@ struct Branch {
     commits: Vec<Oid>,
 }
 
+#[derive(Clone, Copy, Debug)]
 enum GitView {
     Padding,
     NewLine,
-    BranchHeader(usize),
+    BranchHeader,
+    BranchMember(usize),
+    CommitHeader,
     CommitMember {
         from_branch: usize,
         from_commit: usize,
     },
+    ViewMore,
 }
 
 //#[derive(Default)]
 struct RootView {
     branch: Vec<Branch>,
+    active_branch: usize,
+    limit_view: usize,
     //branch_member: Vec<Oid>,
     //commits: Vec<(Uri, Oid)>,
     format: String,
@@ -525,15 +460,21 @@ impl RootView {
     fn rebuild_view(&mut self) {
         self.view.clear();
         self.view.push(GitView::Padding);
-        for (from_branch, branch) in self.branch.iter().enumerate() {
-            self.view.push(GitView::BranchHeader(from_branch));
-            for (from_commit, _) in branch.commits.iter().enumerate() {
+        self.view.push(GitView::BranchHeader);
+        for (from_branch, _) in self.branch.iter().enumerate() {
+            self.view.push(GitView::BranchMember(from_branch));
+            //self.view.push(GitView::NewLine);
+        }
+        self.view.push(GitView::NewLine);
+        self.view.push(GitView::CommitHeader);
+        if let Some(branch) = self.branch.get(self.active_branch) {
+            for (from_commit, _) in branch.commits.iter().take(self.limit_view).enumerate() {
                 self.view.push(GitView::CommitMember {
-                    from_branch,
+                    from_branch: self.active_branch,
                     from_commit,
                 });
+                //self.view.push(GitView::ViewMore);
             }
-            self.view.push(GitView::NewLine);
         }
     }
 
@@ -543,9 +484,18 @@ impl RootView {
             match view {
                 GitView::Padding => (),
                 GitView::NewLine => self.format.push('\n'),
-                GitView::BranchHeader(i) => {
-                    self.format.push_str("# ");
+                GitView::BranchHeader => {
+                    self.format.push_str("# Branch:");
+                    //self.format.push_str(&self.branch[*i].name);
+                    self.format.push('\n');
+                }
+                GitView::BranchMember(i) => {
+                    self.format.push_str("- ");
                     self.format.push_str(&self.branch[*i].name);
+                    self.format.push('\n');
+                }
+                GitView::CommitHeader => {
+                    self.format.push_str("# Commit:");
                     self.format.push('\n');
                 }
                 GitView::CommitMember {
@@ -556,6 +506,9 @@ impl RootView {
                     self.format.push_str("- ");
                     self.format.push_str(&commit.to_string()[..8]);
                     self.format.push('\n');
+                }
+                GitView::ViewMore => {
+                    self.format.push_str("...");
                 }
             }
         }
@@ -589,6 +542,16 @@ impl Lsp for Client {
         }
     }
 
+    fn code_action(&mut self, conn: &Connection, id: RequestId, params: CodeActionParams) {
+        if let Some((wg, office_id)) = self.work_group.get_mut(&params.text_document.uri) {
+            let office = &mut self.office[*office_id];
+            let idx = params.range.start.line as usize;
+            let uri = params.text_document.uri;
+            if let Some(result) = Self::work_group_action(wg, office, idx, &uri) {
+                Self::ok(conn, id, &result);
+            }
+        }
+    }
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams) {}
 
     fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams) {
@@ -635,17 +598,60 @@ impl Lsp for Client {
 }
 
 impl Client {
+    fn work_group_action(
+        wg: &mut WorkGroup,
+        office: &mut Office,
+        idx: usize,
+        uri: &lsp_types::Uri,
+    ) -> Option<impl Serialize + use<>> {
+        match wg {
+            WorkGroup::RootView(root_view) => {
+                match root_view.view[idx] {
+                    GitView::BranchMember(i) => {
+                        root_view.active_branch = i;
+                        root_view.rebuild_view();
+                        root_view.rebuild_format();
+                        let mut vec = CodeActionResponse::new();
+                        vec.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: format!("Switch to {}", &root_view.branch[i].name),
+                            kind: Some(CodeActionKind::REFACTOR),
+                            edit: {
+                                let mut edit = HashMap::new();
+                                edit.insert(uri.clone(), vec![
+                                    //let mut edit = Vec::new();
+                                    TextEdit {
+                                        range: Range::new(
+                                            Position::new(1, 1),
+                                            Position::new(root_view.view.len() as u32, 2),
+                                        ),
+                                        new_text: root_view.format.clone(),
+                                    }
+                                ]);  //edit 
+                                Some(WorkspaceEdit::new(edit))
+                            },
+                            ..Default::default()
+                        }));
+                        Some(vec)
+                        //Some(ApplyWorkspaceEdit)
+                    }
+                    GitView::ViewMore => None,
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
     fn work_group_meeting(
         wg: &WorkGroup,
         office: &mut Office,
         idx: usize,
     ) -> (Option<impl Serialize + use<>>, Option<(Uri, WorkGroup)>) {
         match wg {
-            WorkGroup::RootView(root) => match &root.view[idx] {
-                GitView::CommitMember {
+            WorkGroup::RootView(root) => match &root.view.get(idx) {
+                Some(GitView::CommitMember {
                     from_branch,
                     from_commit,
-                } => {
+                }) => {
                     let oid = root.branch[*from_branch].commits[*from_commit];
                     match office.manifest.get(&oid) {
                         Some(uri) => (
@@ -742,7 +748,11 @@ impl Client {
                     }
                 },
                 DiffView::Root { hunk, view } => {
-                    if let NormalView::Hunk { from_hunk, change_on } = &view[idx] { 
+                    if let NormalView::Hunk {
+                        from_hunk,
+                        change_on,
+                    } = &view[idx]
+                    {
                         let h = &hunk[*from_hunk];
                         if let Some(uri) = office.file_cache.get(&h.path) {
                             return (
@@ -770,7 +780,7 @@ impl Client {
                         }
                     }
                     return (None, None);
-                },
+                }
             },
             WorkGroup::FileView => (None, None),
         }
@@ -857,11 +867,13 @@ impl Client {
                                 repo,
                                 cache,
                                 manifest: HashMap::new(),
-                                file_cache: HashMap::new()
+                                file_cache: HashMap::new(),
                             });
                             //self.repo.push(repo);
                             Some(RootView {
                                 branch,
+                                active_branch: 0,
+                                limit_view: 10,
                                 format: String::default(),
                                 view: Vec::default(),
                                 //                         cache,
@@ -921,6 +933,7 @@ fn main() {
                 ..Default::default()
             },
         )),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     };
 
@@ -973,4 +986,13 @@ pub fn name_to_url(path: &Path) -> Option<Uri> {
         }
     }
     raw.parse().ok()
+}
+
+fn format_git_time(time: Time) -> Option<String> {
+    if let Some(offset) = FixedOffset::east_opt(time.offset_minutes() * 60) {
+        if let Some(dt) = DateTime::from_timestamp(time.seconds(), 0) {
+            return Some(dt.format("%Y-%m-%d %H:%M:%S %:z").to_string());
+        }
+    }
+    None
 }
