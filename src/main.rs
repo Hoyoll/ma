@@ -37,11 +37,11 @@ trait Lsp {
 
     fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams);
 
-    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams);
-    fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
+    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams); 
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams);
     fn code_action(&mut self, conn: &Connection, id: RequestId, params: CodeActionParams);
+    fn inlay_hint(&mut self, conn: &Connection, id: RequestId, params: InlayHintParams);
     fn handle_request(&mut self, conn: &Connection, request: lsp_server::Request) {
         match request.method.as_str() {
             Initialize::METHOD => {
@@ -70,7 +70,12 @@ trait Lsp {
                     self.code_action(conn, request.id, params);
                 });
             }
-            InlayHintRequest::METHOD => {}
+            InlayHintRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: InlayHintParams| {
+                    self.inlay_hint(conn, request.id, params);
+                });
+ 
+            }
             _ => {
                 Self::err(
                     conn,
@@ -91,9 +96,14 @@ trait Lsp {
                     },
                 );
             }
+            DidChangeTextDocument::METHOD => {
+
+            }
             _ => (),
         }
     }
+    fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
+    fn did_change(&mut self, conn: &Connection, params: DidChangeTextDocumentParams); 
 }
 
 use std::{
@@ -109,18 +119,10 @@ use chrono::{DateTime, FixedOffset, TimeZone};
 use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Time};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions,
-    DidOpenTextDocumentParams, FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextEdit, Uri, WorkspaceEdit, lsp_request,
-    notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage},
-    request::{
+    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions, DidChangeTextDocumentParams, DidOpenTextDocumentParams, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit, lsp_request, notification::{DidChangeTextDocument, DidOpenTextDocument, LogMessage, Notification, ShowMessage}, request::{
         ApplyWorkspaceEdit, CodeActionRequest, CodeLensRequest, FoldingRangeRequest,
         GotoDefinition, HoverRequest, Initialize, InlayHintRequest, Request,
-    },
+    }
 };
 use serde::{Deserialize, Serialize};
 
@@ -431,22 +433,25 @@ impl DiffView {
 
                     hunk_current_line = hunk.new_start();
                     change_on = hunk.new_start() - 1;
-                    view.push(NormalView::Padding);
-                    //view.push(NormalView::Hunk {
-                    //    from_hunk: current_hunk,
-                    //    change_on,
-                    //});
+                    //view.push(NormalView::Padding);
+                    view.push(NormalView::Hunk {
+                        from_hunk: current_hunk,
+                        change_on,
+                    });
                 }
                 Some(_) => {
                     format.push(line.origin());
                     match line.origin() {
-                       ' ' | '+' => {
-                           view.push(NormalView::HunkLine { from_hunk: current_hunk, change_on }); 
-                           change_on += 1;
-                       }
-                       _ => {
-                           view.push(NormalView::Padding);
-                       }
+                        ' ' | '+' => {
+                            view.push(NormalView::HunkLine {
+                                from_hunk: current_hunk,
+                                change_on,
+                            });
+                            change_on += 1;
+                        }
+                        _ => {
+                            view.push(NormalView::Padding);
+                        }
                     }
                     format.push(' ');
                     format.push_str(&String::from_utf8_lossy(line.content()));
@@ -565,6 +570,19 @@ impl Lsp for Client {
         //conn.sender.send(Message::Response(()))
     }
 
+    fn did_change(&mut self, conn: &Connection, params: DidChangeTextDocumentParams) {
+        
+    }
+    fn inlay_hint(&mut self, conn: &Connection, id: RequestId, params: InlayHintParams) {
+        let uri = params.text_document.uri;
+        let start = params.range.start.line;
+        let end = params.range.end.line;
+
+        for i in start..end {
+            
+        }
+    }
+
     fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams) {
         let idx = params.text_document_position_params.position.line as usize;
         let uri = params.text_document_position_params.text_document.uri;
@@ -624,24 +642,28 @@ impl Lsp for Client {
     }
 
     fn code_action(&mut self, conn: &Connection, id: RequestId, params: CodeActionParams) {
+        return;
         if let Some((wg, office_id)) = self.work_group.get_mut(&params.text_document.uri) {
             let office = &mut self.office[*office_id];
             let idx = params.range.start.line as usize;
             let uri = params.text_document.uri;
-            if let Some(result) = Self::work_group_action(wg, office, idx, &uri) {
-                Self::ok(conn, id, &result);
-            }
+            //if let Some(result) = Self::work_group_action(wg, office, idx, &uri) {
+            //    Self::ok(conn, id, &result);
+            //}
         }
     }
+
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams) {
         let uri = params.text_document.uri;
-        if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-            match wg {
-                WorkGroup::RootView(root_view) => {}
-                //WorkGroup::DiffView(diff) => todo!(),
-                //WorkGroup::FileView => todo!(),
-                _ => (),
+        Self::log("FOLDING INITIATED?", conn);
+        // CURRENT
+        if let Some((wg, _)) = self.work_group.get(&uri) {
+            if let Some(fold) = Self::work_group_folding(wg, &uri) {
+                Self::log("HERE COMES THE FOLD", conn);
+                Self::ok(conn,id, &fold);
+                return;
             }
+            Self::log("NO FOLD AAAH", conn);
         }
     }
 
@@ -664,8 +686,8 @@ impl Lsp for Client {
                         vec![TextEdit {
                             new_text: format,
                             range: Range {
-                                start: Position::new(0, 1),
-                                end: Position::new(end as u32, 2),
+                                start: Position::new(0, 0),
+                                end: Position::new(end as u32, 0),
                             },
                         }],
                     );
@@ -689,6 +711,55 @@ impl Lsp for Client {
 }
 
 impl Client {
+    fn work_group_folding(wg: &WorkGroup, uri: &lsp_types::Uri) -> Option<impl Serialize + use<>> {
+        match wg {
+            WorkGroup::RootView(root_view) => {
+                let mut ret = Vec::new();
+                let mut start = 0;
+                let mut end = 0;
+                for (idx, giv) in root_view.view.iter().enumerate() {
+                    match giv {
+                        GitView::Padding => (),
+                        GitView::NewLine => (),
+                        GitView::BranchHeader => {
+                            start = idx + 1;
+                        },
+                        GitView::BranchMember(_) => {
+                            match root_view.view.get(idx) {
+                                Some(GitView::BranchMember(_)) => (),
+                                _ => {
+                                    ret.push(FoldingRange {
+                                        start_line: start as u32,
+                                        end_line: end as u32,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        },
+                        GitView::CommitHeader => {                            
+                            start = idx; 
+                        },
+                        GitView::CommitMember { .. } => {
+                            match root_view.view.get(idx) {
+                                Some(GitView::CommitMember{..}) => (),
+                                _ => {
+                                    ret.push(FoldingRange {
+                                        start_line: start as u32,
+                                        end_line: end as u32,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        },
+                    }
+                }
+                Some(ret)
+            },
+            WorkGroup::DiffView(diff) => None,
+            _ => None
+            //WorkGroup::FileView => todo!(),
+        }
+    }
     fn work_group_action(
         wg: &mut WorkGroup,
         office: &mut Office,
@@ -714,8 +785,8 @@ impl Client {
                                         //let mut edit = Vec::new();
                                         TextEdit {
                                             range: Range::new(
-                                                Position::new(1, 1),
-                                                Position::new(root_view.view.len() as u32, 2),
+                                                Position::new(0, 1),
+                                                Position::new(root_view.view.len() as u32 + 1, 1),
                                             ),
                                             new_text: root_view.format.clone(),
                                         },
@@ -744,8 +815,8 @@ impl Client {
                                         //let mut edit = Vec::new();
                                         TextEdit {
                                             range: Range::new(
-                                                Position::new(1, 1),
-                                                Position::new(root_view.view.len() as u32, 2),
+                                                Position::new(0, 1),
+                                                Position::new(root_view.view.len() as u32 + 1, 1),
                                             ),
                                             new_text: root_view.format.clone(),
                                         },
@@ -1025,17 +1096,15 @@ fn main() {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
-                change: Some(TextDocumentSyncKind::FULL),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
                 ..Default::default()
             },
         )),
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
         ..Default::default()
     };
-
-    let init = serde_json::json!({
-        "capabilities": caps
-    });
     //println!("{init}");
     //return;
     let init_params = conn

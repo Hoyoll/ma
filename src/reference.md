@@ -11,7 +11,9 @@
 %P   parent hashes
 %T   tree hash
 
-
+# Branch: <code for the lsp to read on change> 
+-> <then after did_change method read this code it delete it again> 
+-> <ofc there's in memory repr over WHAT that code mean>
 $GIT_DIR //ie the /.git
     /ma-cache
         /<commit-hash>
