@@ -70,6 +70,7 @@ trait Lsp {
                     self.code_action(conn, request.id, params);
                 });
             }
+            InlayHintRequest::METHOD => {}
             _ => {
                 Self::err(
                     conn,
@@ -104,14 +105,22 @@ use std::{
     str::FromStr,
 };
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, TimeZone};
 use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Time};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse, DefinitionOptions, DidOpenTextDocumentParams, FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location, LogMessageParams, MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit, lsp_request, notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage}, request::{
-        ApplyWorkspaceEdit, CodeActionRequest, FoldingRangeRequest, GotoDefinition, HoverRequest,
-        Initialize, Request,
-    }
+    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions,
+    DidOpenTextDocumentParams, FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf, Position, Range,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextEdit, Uri, WorkspaceEdit, lsp_request,
+    notification::{DidOpenTextDocument, LogMessage, Notification, ShowMessage},
+    request::{
+        ApplyWorkspaceEdit, CodeActionRequest, CodeLensRequest, FoldingRangeRequest,
+        GotoDefinition, HoverRequest, Initialize, InlayHintRequest, Request,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +169,7 @@ enum NormalView {
     Padding,
     ParentCommit,
     Hunk { from_hunk: usize, change_on: u32 },
+    HunkLine { from_hunk: usize, change_on: u32 },
 }
 
 struct Hunk {
@@ -187,14 +197,7 @@ enum DiffView {
         hunk: Vec<Hunk>,
         view: Vec<NormalView>,
         //hash: Oid,
-        parent: Oid,
-        //format: String,
-    },
-    /// if parent == 0
-    Root {
-        hunk: Vec<Hunk>,
-        view: Vec<NormalView>,
-        //hash: Oid,
+        parent: Option<Oid>,
         //format: String,
     },
 }
@@ -202,14 +205,15 @@ enum DiffView {
 impl DiffView {
     fn new(commit: &Commit) -> Self {
         match commit.parent_count() {
-            0 => Self::Root {
+            0 => Self::Normal {
                 hunk: Vec::new(),
                 view: Vec::new(),
+                parent: None,
             },
             1 => Self::Normal {
                 hunk: Vec::new(),
                 view: Vec::new(),
-                parent: commit.parent(0).unwrap().id(),
+                parent: Some(commit.parent(0).unwrap().id()),
             },
             _ => {
                 let parents = {
@@ -227,7 +231,32 @@ impl DiffView {
         }
     }
 
-    fn format_header(commit: &Commit, format: &mut String, view: &mut Vec<NormalView>) {}
+    fn format_header(commit: &Commit, format: &mut String) {
+        format.push_str("Author: ");
+        let author = commit.author();
+        format.push_str(&author.name().unwrap_or_default());
+        format.push_str(" ");
+        format.push_str(author.email().unwrap_or_default());
+        format.push('\n');
+
+        //view.push(NormalView::Padding);
+
+        format.push_str("Date: ");
+        // TO-DO: Date!
+        //format.push_str(&self.date);
+        format.push_str(&format_git_time(author.when()).unwrap_or_default());
+        format.push('\n');
+        //view.push(NormalView::Padding);
+
+        format.push('\n');
+        //view.push(NormalView::Padding);
+
+        format.push_str(&commit.message().unwrap_or_default());
+        format.push('\n');
+        //view.push(NormalView::Padding);
+
+        format.push('\n');
+    }
     fn fill(&mut self, commit: &Commit, repo: &Repository, format: &mut String) {
         format.clear();
         match self {
@@ -244,12 +273,13 @@ impl DiffView {
                 format.push_str("Author: ");
                 let author = commit.author();
                 format.push_str(&author.name().unwrap_or_default());
-                format.push_str(" ");
+                format.push_str(" <");
                 format.push_str(author.email().unwrap_or_default());
+                format.push_str(">");
                 format.push('\n');
                 view.push(MergeView::Padding);
 
-                format.push_str("Date: ");
+                format.push_str("Date:   ");
                 // TO-DO: Date!
                 format.push_str(&format_git_time(author.when()).unwrap_or_default());
                 //format.push_str(&self.date);
@@ -271,7 +301,6 @@ impl DiffView {
                 view.push(MergeView::Padding);
                 view.push(MergeView::Padding);
 
-                //for p in parents {
                 for (i, p) in parents.iter().enumerate() {
                     format.push_str("- ");
                     format.push_str(&p.to_string());
@@ -279,7 +308,6 @@ impl DiffView {
                     //parents.push(*p);
                     view.push(MergeView::Commit(i));
                 }
-                //}
             }
             DiffView::Normal {
                 hunk: hunk_col,
@@ -289,7 +317,11 @@ impl DiffView {
                 view.clear();
                 //view.push(NormalView::Padding);
                 format.push_str("- ");
-                format.push_str(&parent.to_string());
+                if let Some(parent) = parent {
+                    format.push_str(&parent.to_string());
+                } else {
+                    format.push_str("Root");
+                }
                 format.push('\n');
                 view.push(NormalView::ParentCommit);
                 Self::fill_format(format, view, commit);
@@ -297,21 +329,6 @@ impl DiffView {
                 let tree = commit.tree().ok();
                 let parent = commit.parent(0).unwrap().tree().ok();
                 let diff = repo.diff_tree_to_tree(parent.as_ref(), tree.as_ref(), None);
-
-                if let Ok(diff) = diff {
-                    Self::fill_view(diff, format, view, hunk_col);
-                }
-            }
-            DiffView::Root {
-                hunk: hunk_col,
-                view,
-            } => {
-                view.clear();
-                view.push(NormalView::Padding);
-                Self::fill_format(format, view, commit);
-                let tree = commit.tree().ok();
-                //let parent = commit.parent(0).unwrap().tree().ok();
-                let diff = repo.diff_tree_to_tree(None, tree.as_ref(), None);
 
                 if let Ok(diff) = diff {
                     Self::fill_view(diff, format, view, hunk_col);
@@ -352,6 +369,7 @@ impl DiffView {
         format.push('\n');
         view.push(NormalView::Padding);
     }
+
     fn fill_view(
         diff: git2::Diff,
         format: &mut String,
@@ -362,6 +380,7 @@ impl DiffView {
         let mut hunk_current_line = 0;
         let mut line_count = view.len() - 1;
         let mut current_hunk = 0;
+        let mut change_on = 0;
         view.push(NormalView::Padding);
         diff.print(DiffFormat::Patch, |delta, hunk, line| {
             line_count += 1;
@@ -375,6 +394,20 @@ impl DiffView {
                 anchor_id = file.id();
                 hunk_current_line = 0;
 
+                format.push_str("--- ");
+                match delta.status() {
+                    git2::Delta::Added => {
+                        format.push_str("/dev/null");
+                    }
+                    git2::Delta::Modified => {
+                        format.push_str(&delta.old_file().path().unwrap().to_string_lossy());
+                    }
+                    _ => (),
+                }
+                format.push('\n');
+                view.push(NormalView::Padding);
+                //format.push(line.origin());
+                format.push_str("+++ ");
                 format.push_str(&file.path().unwrap().to_string_lossy());
                 format.push('\n');
                 view.push(NormalView::Padding);
@@ -397,17 +430,28 @@ impl DiffView {
                     hunk_col[current_hunk].changes.push(line_count as u32);
 
                     hunk_current_line = hunk.new_start();
-                    view.push(NormalView::Hunk {
-                        from_hunk: current_hunk,
-                        change_on: hunk.new_start(),
-                    });
+                    change_on = hunk.new_start() - 1;
+                    view.push(NormalView::Padding);
+                    //view.push(NormalView::Hunk {
+                    //    from_hunk: current_hunk,
+                    //    change_on,
+                    //});
                 }
                 Some(_) => {
                     format.push(line.origin());
+                    match line.origin() {
+                       ' ' | '+' => {
+                           view.push(NormalView::HunkLine { from_hunk: current_hunk, change_on }); 
+                           change_on += 1;
+                       }
+                       _ => {
+                           view.push(NormalView::Padding);
+                       }
+                    }
                     format.push(' ');
                     format.push_str(&String::from_utf8_lossy(line.content()));
-
-                    view.push(NormalView::Padding);
+                    //change_on += 1;
+                    //view.push(NormalView::HunkLine { from_hunk: current_hunk, change_on });
                 }
                 _ => (),
             }
@@ -440,7 +484,11 @@ enum GitView {
         from_branch: usize,
         from_commit: usize,
     },
-    ViewMore,
+    //ViewMore,
+}
+
+impl GitView {
+    const LIMIT_VIEW: usize = 10;
 }
 
 //#[derive(Default)]
@@ -459,7 +507,7 @@ struct RootView {
 impl RootView {
     fn rebuild_view(&mut self) {
         self.view.clear();
-        self.view.push(GitView::Padding);
+        //self.view.push(GitView::Padding);
         self.view.push(GitView::BranchHeader);
         for (from_branch, _) in self.branch.iter().enumerate() {
             self.view.push(GitView::BranchMember(from_branch));
@@ -507,9 +555,6 @@ impl RootView {
                     self.format.push_str(&commit.to_string()[..8]);
                     self.format.push('\n');
                 }
-                GitView::ViewMore => {
-                    self.format.push_str("...");
-                }
             }
         }
     }
@@ -522,7 +567,43 @@ impl Lsp for Client {
 
     fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams) {
         let idx = params.text_document_position_params.position.line as usize;
-        //params.text_document_position_params.text_document.uri
+        let uri = params.text_document_position_params.text_document.uri;
+        if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+            let office = &mut self.office[*office_id];
+            match wg {
+                WorkGroup::RootView(root_view) => {
+                    match root_view.view[idx] {
+                        //GitView::BranchHeader => todo!(),
+                        GitView::BranchMember(_) => (),
+                        //GitView::CommitHeader => todo!(),
+                        GitView::CommitMember {
+                            from_branch,
+                            from_commit,
+                        } => {
+                            let commit = root_view.branch[from_branch].commits[from_commit];
+                            if let Ok(commit) = office.repo.find_commit(commit) {
+                                let mut format = String::new();
+                                DiffView::format_header(&commit, &mut format);
+                                Self::ok(
+                                    conn,
+                                    id,
+                                    &Hover {
+                                        contents: HoverContents::Scalar(MarkedString::String(
+                                            format,
+                                        )),
+                                        range: None,
+                                    },
+                                );
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+                //WorkGroup::DiffView(diff) => todo!(),
+                //WorkGroup::FileView => todo!(),
+                _ => (),
+            }
+        }
     }
 
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams) {
@@ -552,7 +633,17 @@ impl Lsp for Client {
             }
         }
     }
-    fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams) {}
+    fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams) {
+        let uri = params.text_document.uri;
+        if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+            match wg {
+                WorkGroup::RootView(root_view) => {}
+                //WorkGroup::DiffView(diff) => todo!(),
+                //WorkGroup::FileView => todo!(),
+                _ => (),
+            }
+        }
+    }
 
     fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams) {
         match self.work_group.get_mut(&params.text_document.uri) {
@@ -573,8 +664,8 @@ impl Lsp for Client {
                         vec![TextEdit {
                             new_text: format,
                             range: Range {
-                                start: Position::new(1, 1),
-                                end: Position::new(end as u32, 1),
+                                start: Position::new(0, 1),
+                                end: Position::new(end as u32, 2),
                             },
                         }],
                     );
@@ -617,16 +708,19 @@ impl Client {
                             kind: Some(CodeActionKind::REFACTOR),
                             edit: {
                                 let mut edit = HashMap::new();
-                                edit.insert(uri.clone(), vec![
-                                    //let mut edit = Vec::new();
-                                    TextEdit {
-                                        range: Range::new(
-                                            Position::new(1, 1),
-                                            Position::new(root_view.view.len() as u32, 2),
-                                        ),
-                                        new_text: root_view.format.clone(),
-                                    }
-                                ]);  //edit 
+                                edit.insert(
+                                    uri.clone(),
+                                    vec![
+                                        //let mut edit = Vec::new();
+                                        TextEdit {
+                                            range: Range::new(
+                                                Position::new(1, 1),
+                                                Position::new(root_view.view.len() as u32, 2),
+                                            ),
+                                            new_text: root_view.format.clone(),
+                                        },
+                                    ],
+                                ); //edit 
                                 Some(WorkspaceEdit::new(edit))
                             },
                             ..Default::default()
@@ -634,7 +728,36 @@ impl Client {
                         Some(vec)
                         //Some(ApplyWorkspaceEdit)
                     }
-                    GitView::ViewMore => None,
+                    GitView::CommitHeader => {
+                        root_view.limit_view += GitView::LIMIT_VIEW;
+                        root_view.rebuild_view();
+                        root_view.rebuild_format();
+                        let mut vec = CodeActionResponse::new();
+                        vec.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: "View more?".into(),
+                            kind: Some(CodeActionKind::REFACTOR),
+                            edit: {
+                                let mut edit = HashMap::new();
+                                edit.insert(
+                                    uri.clone(),
+                                    vec![
+                                        //let mut edit = Vec::new();
+                                        TextEdit {
+                                            range: Range::new(
+                                                Position::new(1, 1),
+                                                Position::new(root_view.view.len() as u32, 2),
+                                            ),
+                                            new_text: root_view.format.clone(),
+                                        },
+                                    ],
+                                ); //edit 
+                                Some(WorkspaceEdit::new(edit))
+                            },
+                            ..Default::default()
+                        }));
+                        Some(vec)
+                    }
+                    //GitView::ViewMore => None,
                     _ => None,
                 }
             }
@@ -707,27 +830,34 @@ impl Client {
                 DiffView::Normal { hunk, view, parent } => match &view[idx] {
                     NormalView::Padding => (None, None),
                     NormalView::ParentCommit => {
-                        if let Some(uri) = office.manifest.get(&parent) {
-                            return (
-                                Some(GotoDefinitionResponse::Scalar(Location::new(
-                                    uri.clone(),
-                                    Range::default(),
-                                ))),
-                                None,
-                            );
+                        if let Some(parent) = &parent {
+                            if let Some(uri) = office.manifest.get(&parent) {
+                                return (
+                                    Some(GotoDefinitionResponse::Scalar(Location::new(
+                                        uri.clone(),
+                                        Range::default(),
+                                    ))),
+                                    None,
+                                );
+                            }
+                            if let Some((diff, uri)) = Self::open_diff(*parent, office) {
+                                return (
+                                    Some(GotoDefinitionResponse::Scalar(Location::new(
+                                        uri.clone(),
+                                        Range::default(),
+                                    ))),
+                                    Some((uri, WorkGroup::DiffView(diff))),
+                                );
+                            }
                         }
-                        if let Some((diff, uri)) = Self::open_diff(*parent, office) {
-                            return (
-                                Some(GotoDefinitionResponse::Scalar(Location::new(
-                                    uri.clone(),
-                                    Range::default(),
-                                ))),
-                                Some((uri, WorkGroup::DiffView(diff))),
-                            );
-                        }
+
                         (None, None)
                     }
                     NormalView::Hunk {
+                        from_hunk,
+                        change_on,
+                    }
+                    | NormalView::HunkLine {
                         from_hunk,
                         change_on,
                     } => {
@@ -747,40 +877,6 @@ impl Client {
                         return (None, None);
                     }
                 },
-                DiffView::Root { hunk, view } => {
-                    if let NormalView::Hunk {
-                        from_hunk,
-                        change_on,
-                    } = &view[idx]
-                    {
-                        let h = &hunk[*from_hunk];
-                        if let Some(uri) = office.file_cache.get(&h.path) {
-                            return (
-                                Some(GotoDefinitionResponse::Scalar(Location::new(
-                                    uri.clone(),
-                                    Range {
-                                        start: Position::new(*change_on, 1),
-                                        ..Default::default()
-                                    },
-                                ))),
-                                None,
-                            );
-                        }
-                        if let Some(uri) = Self::open_file(office, diff.oid, &h.path) {
-                            return (
-                                Some(GotoDefinitionResponse::Scalar(Location::new(
-                                    uri.clone(),
-                                    Range {
-                                        start: Position::new(*change_on, 1),
-                                        ..Default::default()
-                                    },
-                                ))),
-                                Some((uri, WorkGroup::FileView)),
-                            );
-                        }
-                    }
-                    return (None, None);
-                }
             },
             WorkGroup::FileView => (None, None),
         }
@@ -873,7 +969,7 @@ impl Client {
                             Some(RootView {
                                 branch,
                                 active_branch: 0,
-                                limit_view: 10,
+                                limit_view: GitView::LIMIT_VIEW,
                                 format: String::default(),
                                 view: Vec::default(),
                                 //                         cache,
@@ -990,8 +1086,8 @@ pub fn name_to_url(path: &Path) -> Option<Uri> {
 
 fn format_git_time(time: Time) -> Option<String> {
     if let Some(offset) = FixedOffset::east_opt(time.offset_minutes() * 60) {
-        if let Some(dt) = DateTime::from_timestamp(time.seconds(), 0) {
-            return Some(dt.format("%Y-%m-%d %H:%M:%S %:z").to_string());
+        if let Some(dt) = offset.timestamp_opt(time.seconds(), 0).single() {
+            return Some(dt.format("%a %b %d %H:%M:%S %Y %z").to_string());
         }
     }
     None
