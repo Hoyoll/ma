@@ -23,6 +23,15 @@ trait Lsp {
         conn.sender.send(Message::Response(resp));
     }
 
+    fn req(conn: &Connection, method: impl Into<String>, id: RequestId, result: &impl Serialize) {
+        //let req = Request {}
+        conn.sender.send(Message::Request(lsp_server::Request::new(
+            id,
+            method.into(),
+            result,
+        )));
+    }
+
     fn err(conn: &Connection, id: RequestId, code: lsp_server::ErrorCode, msg: &str) {
         let resp = Response {
             id,
@@ -37,7 +46,7 @@ trait Lsp {
 
     fn initialize(&mut self, conn: &Connection, id: RequestId, params: InitializeParams);
 
-    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams); 
+    fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams);
     fn goto_definition(&mut self, conn: &Connection, id: RequestId, params: GotoDefinitionParams);
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams);
     fn code_action(&mut self, conn: &Connection, id: RequestId, params: CodeActionParams);
@@ -74,7 +83,6 @@ trait Lsp {
                 serde_json::from_value(request.params).map(|params: InlayHintParams| {
                     self.inlay_hint(conn, request.id, params);
                 });
- 
             }
             _ => {
                 Self::err(
@@ -97,13 +105,17 @@ trait Lsp {
                 );
             }
             DidChangeTextDocument::METHOD => {
-
+                serde_json::from_value(notification.params).map(
+                    |params: DidChangeTextDocumentParams| {
+                        self.did_change(conn, params);
+                    },
+                );
             }
             _ => (),
         }
     }
     fn did_open(&mut self, conn: &Connection, params: DidOpenTextDocumentParams);
-    fn did_change(&mut self, conn: &Connection, params: DidChangeTextDocumentParams); 
+    fn did_change(&mut self, conn: &Connection, params: DidChangeTextDocumentParams);
 }
 
 use std::{
@@ -119,10 +131,21 @@ use chrono::{DateTime, FixedOffset, TimeZone};
 use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Time};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions, DidChangeTextDocumentParams, DidOpenTextDocumentParams, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit, lsp_request, notification::{DidChangeTextDocument, DidOpenTextDocument, LogMessage, Notification, ShowMessage}, request::{
+    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, FoldingRange, FoldingRangeParams,
+    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf,
+    Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit, lsp_request,
+    notification::{
+        DidChangeTextDocument, DidOpenTextDocument, LogMessage, Notification, ShowMessage,
+    },
+    request::{
         ApplyWorkspaceEdit, CodeActionRequest, CodeLensRequest, FoldingRangeRequest,
         GotoDefinition, HoverRequest, Initialize, InlayHintRequest, Request,
-    }
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -163,7 +186,6 @@ struct Office {
 
 enum MergeView {
     Padding,
-    NewLine,
     Commit(usize),
 }
 
@@ -259,6 +281,7 @@ impl DiffView {
 
         format.push('\n');
     }
+
     fn fill(&mut self, commit: &Commit, repo: &Repository, format: &mut String) {
         format.clear();
         match self {
@@ -480,8 +503,9 @@ struct Branch {
 
 #[derive(Clone, Copy, Debug)]
 enum GitView {
-    Padding,
+    //Padding,
     NewLine,
+    Command,
     BranchHeader,
     BranchMember(usize),
     CommitHeader,
@@ -494,6 +518,24 @@ enum GitView {
 
 impl GitView {
     const LIMIT_VIEW: usize = 10;
+    const BRANCH_HEADER: &str = "# Branch:";
+    const COMMIT_HEADER: &str = "# Commit:";
+}
+#[derive(Serialize, Deserialize)]
+enum RootAction {
+    MergeBranch(usize),
+    SwitchBranch(usize),
+    ViewMore,
+}
+
+impl RootAction {
+    fn to_string(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
+    fn from_str(json: &str) -> Option<Self> {
+        serde_json::from_str(json).ok()
+    }
 }
 
 //#[derive(Default)]
@@ -510,9 +552,12 @@ struct RootView {
 }
 
 impl RootView {
+    const ALPHA_REQ: i32 = 1;
+    const BETA_REQ: i32 = 2;
+
     fn rebuild_view(&mut self) {
         self.view.clear();
-        //self.view.push(GitView::Padding);
+        self.view.push(GitView::Command);
         self.view.push(GitView::BranchHeader);
         for (from_branch, _) in self.branch.iter().enumerate() {
             self.view.push(GitView::BranchMember(from_branch));
@@ -529,16 +574,17 @@ impl RootView {
                 //self.view.push(GitView::ViewMore);
             }
         }
+        //self.view.push(GitView::Command);
     }
 
     fn rebuild_format(&mut self) {
         self.format.clear();
         for view in &self.view {
             match view {
-                GitView::Padding => (),
-                GitView::NewLine => self.format.push('\n'),
+                //GitView::Padding => (),
+                GitView::NewLine | GitView::Command => self.format.push('\n'),
                 GitView::BranchHeader => {
-                    self.format.push_str("# Branch:");
+                    self.format.push_str(GitView::BRANCH_HEADER);
                     //self.format.push_str(&self.branch[*i].name);
                     self.format.push('\n');
                 }
@@ -548,7 +594,7 @@ impl RootView {
                     self.format.push('\n');
                 }
                 GitView::CommitHeader => {
-                    self.format.push_str("# Commit:");
+                    self.format.push_str(GitView::COMMIT_HEADER);
                     self.format.push('\n');
                 }
                 GitView::CommitMember {
@@ -571,16 +617,107 @@ impl Lsp for Client {
     }
 
     fn did_change(&mut self, conn: &Connection, params: DidChangeTextDocumentParams) {
-        
+        if let Some((wg, office_id)) = self.work_group.get_mut(&params.text_document.uri) {
+            //Self::log("up here!?", conn);
+
+            match wg {
+                WorkGroup::RootView(root_view) => {
+                    let text = &params.content_changes[0];
+                    //for text in params.content_changes {
+
+                    if let Some(range) = text.range {
+                        //Self::log("i mean it should be here right?", conn);
+                        let idx = range.start.line as usize;
+                        //Self::log(idx.to_string(), conn);
+                        match root_view.view.get(idx) {
+                            Some(GitView::Command) => {
+                                if text.text == "" || text.text == "\n" {
+                                    return;
+                                }
+                                let mut wf = HashMap::new();
+                                wf.insert(
+                                    params.text_document.uri.clone(),
+                                    vec![TextEdit {
+                                        new_text: "".into(),
+                                        range: Range {
+                                            start: Position::new(0, 0),
+                                            end: Position::new(0, text.text.len() as u32),
+                                        },
+                                    }],
+                                );
+                                let we = ApplyWorkspaceEditParams {
+                                    label: None,
+                                    edit: WorkspaceEdit {
+                                        changes: Some(wf.clone()),
+                                        ..Default::default()
+                                    },
+                                };
+                                //Self::ok(conn, id, result);
+                                Self::req(
+                                    conn,
+                                    ApplyWorkspaceEdit::METHOD,
+                                    RequestId::from(RootView::BETA_REQ),
+                                    &we,
+                                );
+                                match RootAction::from_str(&text.text) {
+                                    //RootAction::MergeBranch(_) => todo!(),
+                                    Some(RootAction::SwitchBranch(b)) => {
+                                        root_view.active_branch = b;
+                                        root_view.rebuild_view();
+                                        root_view.rebuild_format();
+                                        wf.insert(
+                                            params.text_document.uri.clone(),
+                                            vec![TextEdit {
+                                                new_text: root_view.format.clone(),
+                                                range: Range {
+                                                    start: Position::new(0, 0),
+                                                    end: Position::new(
+                                                        root_view.view.len() as u32,
+                                                        0,
+                                                    ),
+                                                },
+                                            }],
+                                        );
+
+                                        let refresh = ApplyWorkspaceEditParams {
+                                            label: None,
+                                            edit: WorkspaceEdit {
+                                                changes: Some(wf),
+                                                ..Default::default()
+                                            },
+                                        };
+
+                                        Self::req(
+                                            conn,
+                                            ApplyWorkspaceEdit::METHOD,
+                                            RequestId::from(RootView::ALPHA_REQ),
+                                            &refresh,
+                                        );
+                                    }
+                                    //RootAction::ViewMore => todo!(),
+                                    _ => (),
+                                }
+                            }
+                            _ => {
+                                //Self::log("fallthrough", conn);
+                            }
+                        }
+                    }
+                    //}
+                }
+                //WorkGroup::DiffView(diff) => todo!(),
+                //WorkGroup::FileView => todo!(),
+                _ => (),
+            }
+        }
     }
+
     fn inlay_hint(&mut self, conn: &Connection, id: RequestId, params: InlayHintParams) {
         let uri = params.text_document.uri;
         let start = params.range.start.line;
         let end = params.range.end.line;
 
-        for i in start..end {
-            
-        }
+        for i in start..end {}
     }
 
     fn hover(&mut self, conn: &Connection, id: RequestId, params: HoverParams) {
@@ -642,28 +779,28 @@ impl Lsp for Client {
     }
 
     fn code_action(&mut self, conn: &Connection, id: RequestId, params: CodeActionParams) {
-        return;
+        //return;
         if let Some((wg, office_id)) = self.work_group.get_mut(&params.text_document.uri) {
             let office = &mut self.office[*office_id];
             let idx = params.range.start.line as usize;
             let uri = params.text_document.uri;
-            //if let Some(result) = Self::work_group_action(wg, office, idx, &uri) {
-            //    Self::ok(conn, id, &result);
-            //}
+            if let Some(result) = Self::work_group_action(wg, office, idx, &uri) {
+                Self::ok(conn, id, &result);
+            }
         }
     }
 
     fn folding(&mut self, conn: &Connection, id: RequestId, params: FoldingRangeParams) {
         let uri = params.text_document.uri;
-        Self::log("FOLDING INITIATED?", conn);
+        //Self::log("FOLDING INITIATED?", conn);
         // CURRENT
         if let Some((wg, _)) = self.work_group.get(&uri) {
             if let Some(fold) = Self::work_group_folding(wg, &uri) {
-                Self::log("HERE COMES THE FOLD", conn);
-                Self::ok(conn,id, &fold);
+                //Self::log("HERE COMES THE FOLD", conn);
+                Self::ok(conn, id, &fold);
                 return;
             }
-            Self::log("NO FOLD AAAH", conn);
+            //Self::log("NO FOLD AAAH", conn);
         }
     }
 
@@ -699,7 +836,7 @@ impl Lsp for Client {
                         },
                     };
                     conn.sender.send(Message::Request(lsp_server::Request::new(
-                        RequestId::from(1),
+                        RequestId::from(RootView::ALPHA_REQ),
                         ApplyWorkspaceEdit::METHOD.into(),
                         &we,
                     )));
@@ -719,47 +856,43 @@ impl Client {
                 let mut end = 0;
                 for (idx, giv) in root_view.view.iter().enumerate() {
                     match giv {
-                        GitView::Padding => (),
+                        GitView::Command => (),
                         GitView::NewLine => (),
                         GitView::BranchHeader => {
                             start = idx + 1;
-                        },
-                        GitView::BranchMember(_) => {
-                            match root_view.view.get(idx) {
-                                Some(GitView::BranchMember(_)) => (),
-                                _ => {
-                                    ret.push(FoldingRange {
-                                        start_line: start as u32,
-                                        end_line: end as u32,
-                                        ..Default::default()
-                                    });
-                                }
+                        }
+                        GitView::BranchMember(_) => match root_view.view.get(idx) {
+                            Some(GitView::BranchMember(_)) => (),
+                            _ => {
+                                ret.push(FoldingRange {
+                                    start_line: start as u32,
+                                    end_line: end as u32,
+                                    ..Default::default()
+                                });
                             }
                         },
-                        GitView::CommitHeader => {                            
-                            start = idx; 
-                        },
-                        GitView::CommitMember { .. } => {
-                            match root_view.view.get(idx) {
-                                Some(GitView::CommitMember{..}) => (),
-                                _ => {
-                                    ret.push(FoldingRange {
-                                        start_line: start as u32,
-                                        end_line: end as u32,
-                                        ..Default::default()
-                                    });
-                                }
+                        GitView::CommitHeader => {
+                            start = idx;
+                        }
+                        GitView::CommitMember { .. } => match root_view.view.get(idx) {
+                            Some(GitView::CommitMember { .. }) => (),
+                            _ => {
+                                ret.push(FoldingRange {
+                                    start_line: start as u32,
+                                    end_line: end as u32,
+                                    ..Default::default()
+                                });
                             }
                         },
                     }
                 }
                 Some(ret)
-            },
+            }
             WorkGroup::DiffView(diff) => None,
-            _ => None
-            //WorkGroup::FileView => todo!(),
+            _ => None, //WorkGroup::FileView => todo!(),
         }
     }
+
     fn work_group_action(
         wg: &mut WorkGroup,
         office: &mut Office,
@@ -770,9 +903,9 @@ impl Client {
             WorkGroup::RootView(root_view) => {
                 match root_view.view[idx] {
                     GitView::BranchMember(i) => {
-                        root_view.active_branch = i;
-                        root_view.rebuild_view();
-                        root_view.rebuild_format();
+                        //root_view.active_branch = i;
+                        //root_view.rebuild_view();
+                        //root_view.rebuild_format();
                         let mut vec = CodeActionResponse::new();
                         vec.push(CodeActionOrCommand::CodeAction(CodeAction {
                             title: format!("Switch to {}", &root_view.branch[i].name),
@@ -785,10 +918,10 @@ impl Client {
                                         //let mut edit = Vec::new();
                                         TextEdit {
                                             range: Range::new(
-                                                Position::new(0, 1),
-                                                Position::new(root_view.view.len() as u32 + 1, 1),
+                                                Position::new(0, 0),
+                                                Position::new(0, 0),
                                             ),
-                                            new_text: root_view.format.clone(),
+                                            new_text: RootAction::SwitchBranch(i).to_string(),
                                         },
                                     ],
                                 ); //edit 
@@ -835,6 +968,7 @@ impl Client {
             _ => None,
         }
     }
+
     fn work_group_meeting(
         wg: &WorkGroup,
         office: &mut Office,
