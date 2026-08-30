@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 chrono = "0.4.45"
+crossbeam = "0.8.4"
 git2 = "0.21.0"
 lsp-server = "0.10.0"
 lsp-types = "0.97.0"
