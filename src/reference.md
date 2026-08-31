@@ -11,7 +11,12 @@
 %P   parent hashes
 %T   tree hash
 
-# Branch: <code for the lsp to read on change> 
+<code for the lsp to read on change> 
+# Status:
+<using inlay hint here>
+<Index Status, WorkTree Status> -> <file_names>
+
+# Branch: 
 -> <then after did_change method read this code it delete it again> 
 -> <ofc there's in memory repr over WHAT that code mean>
 $GIT_DIR //ie the /.git
@@ -20,3 +25,5 @@ $GIT_DIR //ie the /.git
             /
             root.diff
             <files from that hash>
+
+

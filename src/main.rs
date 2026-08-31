@@ -65,11 +65,14 @@ use std::{
     path::{Component, Path, PathBuf, Prefix},
     process::Command,
     str::FromStr,
+    usize,
 };
 
 use chrono::{DateTime, FixedOffset, TimeZone};
 use crossbeam::channel::Sender;
-use git2::{BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Time};
+use git2::{
+    BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Status, StatusOptions, Time,
+};
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -77,9 +80,10 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, FoldingRange, FoldingRangeParams,
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf,
-    Position, Range, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextEdit, Uri, WorkspaceEdit, lsp_request,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, LogMessageParams,
+    MarkedString, MarkupContent, MessageType, OneOf, Position, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Uri,
+    WorkspaceEdit, lsp_request,
     notification::{
         DidChangeTextDocument, DidOpenTextDocument, LogMessage, Notification, ShowMessage,
     },
@@ -161,6 +165,19 @@ impl Client {
                                 //caps,
         }
     }
+
+    fn create_hint(line: u32, character: u32, label: impl Into<String>) -> InlayHint {
+        InlayHint {
+            position: Position::new(line, character),
+            label: InlayHintLabel::String(label.into()),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        }
+    }
 }
 
 type OfficeId = usize;
@@ -172,8 +189,45 @@ enum WorkGroup {
 struct Office {
     repo: Repository,
     cache: PathBuf,
+    status: Vec<(PathBuf, Status)>,
     manifest: HashMap<Oid, Uri>,
     file_cache: HashMap<PathBuf, Uri>,
+}
+
+impl Office {
+    pub fn new(path: &Path) -> Option<Office> {
+        match Repository::open(path) {
+            Ok(repo) => {
+                let mut cache = PathBuf::from(repo.path());
+                cache.push(CACHE_DIR);
+                let mut office = Office {
+                    repo,
+                    cache,
+                    status: Vec::new(),
+                    manifest: HashMap::new(),
+                    file_cache: HashMap::new(),
+                };
+                office.re_fill_status();
+                Some(office)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn re_fill_status(&mut self) {
+        self.status.clear();
+        let st = self.repo.statuses(Some(
+            StatusOptions::new()
+                .include_untracked(true)
+                .recurse_untracked_dirs(true),
+        ));
+        st.map(|status| {
+            for entry in status.iter() {
+                self.status
+                    .push((PathBuf::from(entry.path().unwrap()), entry.status()));
+            }
+        });
+    }
 }
 
 enum MergeView {
@@ -193,11 +247,6 @@ struct Hunk {
     changes: Vec<u32>,
 }
 
-struct LineCol {
-    line: u32,
-    col: u32,
-}
-
 /// TO-DO: create a nice model for DiffView. with diff hunk head as "goto_definition" anchor
 /// TO-DO done i suppose...
 enum DiffView {
@@ -205,16 +254,12 @@ enum DiffView {
     Merge {
         view: Vec<MergeView>,
         parents: Vec<Oid>,
-        //hash: Oid,
-        //format: String,
     },
-    /// if parent == 1
+    /// if parent <= 1
     Normal {
         hunk: Vec<Hunk>,
         view: Vec<NormalView>,
-        //hash: Oid,
         parent: Option<Oid>,
-        //format: String,
     },
 }
 
@@ -255,20 +300,13 @@ impl DiffView {
         format.push_str(author.email().unwrap_or_default());
         format.push('\n');
 
-        format.push_str("Date: ");
-        // TO-DO: Date!
-        //format.push_str(&self.date);
+        format.push_str("Date:   ");
+
         format.push_str(&format_git_time(author.when()).unwrap_or_default());
         format.push('\n');
-        //view.push(NormalView::Padding);
-
         format.push('\n');
-        //view.push(NormalView::Padding);
-
         format.push_str(&commit.message().unwrap_or_default());
         format.push('\n');
-        //view.push(NormalView::Padding);
-
         format.push('\n');
     }
 
@@ -295,7 +333,6 @@ impl DiffView {
                 view.push(MergeView::Padding);
 
                 format.push_str("Date:   ");
-                // TO-DO: Date!
                 format.push_str(&format_git_time(author.when()).unwrap_or_default());
                 //format.push_str(&self.date);
                 format.push('\n');
@@ -496,6 +533,10 @@ enum GitView {
     //Padding,
     NewLine,
     Command,
+    StatusHeader,
+    StatusMember {
+        from_file: usize,
+    },
     BranchHeader,
     BranchMember(usize),
     CommitHeader,
@@ -513,6 +554,11 @@ impl GitView {
 }
 #[derive(Serialize, Deserialize)]
 enum RootAction {
+    Reload,
+    StatusReload,
+    StageFile(usize),
+    UnstageFile(usize),
+    //ReplaceFile(usize),
     MergeBranch(usize),
     SwitchBranch(usize),
     ViewMore,
@@ -565,9 +611,71 @@ struct RootView {
 }
 
 impl RootView {
-    fn rebuild_view(&mut self) {
+    fn reload_branch(&mut self, office: &Office) {
+        self.branch.clear();
+        if let Ok(branches) = office.repo.branches(None) {
+            for branch in branches {
+                branch.map(|branch| {
+                    let commits = {
+                        let mut c = Vec::default();
+                        branch.0.get().peel_to_commit().map(|commit| {
+                            let mut revwalk = office.repo.revwalk().unwrap();
+
+                            revwalk.push(commit.id());
+                            revwalk.set_sorting(Sort::TIME);
+                            for res in revwalk {
+                                res.map(|id| {
+                                    c.push(id);
+                                });
+                            }
+                        });
+                        c
+                    };
+                    self.branch.push(Branch {
+                        name: branch.0.name().unwrap().unwrap().to_string(),
+                        commits,
+                    });
+                });
+            }
+        }
+    }
+
+    fn refresh(&mut self, uri: &lsp_types::Uri, office: &Office) -> ApplyWorkspaceEditParams {
+        let old = self.view.len();
+        self.rebuild_view(office);
+        self.rebuild_format(office);
+        let mut wf = HashMap::new();
+        wf.insert(
+            uri.clone(),
+            vec![TextEdit {
+                new_text: self.format.clone(),
+                range: Range {
+                    start: Position::new(0, 0),
+                    end: Position::new(old.max(self.view.len()) as u32, 0),
+                },
+            }],
+        );
+
+        let refresh = ApplyWorkspaceEditParams {
+            label: None,
+            edit: WorkspaceEdit {
+                changes: Some(wf),
+                ..Default::default()
+            },
+        };
+        refresh
+    }
+
+    fn rebuild_view(&mut self, office: &Office) {
         self.view.clear();
         self.view.push(GitView::Command);
+
+        self.view.push(GitView::StatusHeader);
+        for (from_file, _) in office.status.iter().enumerate() {
+            self.view.push(GitView::StatusMember { from_file });
+        }
+
+        self.view.push(GitView::NewLine);
         self.view.push(GitView::BranchHeader);
         for (from_branch, _) in self.branch.iter().enumerate() {
             self.view.push(GitView::BranchMember(from_branch));
@@ -587,19 +695,28 @@ impl RootView {
         //self.view.push(GitView::Command);
     }
 
-    fn rebuild_format(&mut self) {
+    fn rebuild_format(&mut self, office: &Office) {
         self.format.clear();
         for view in &self.view {
             match view {
                 //GitView::Padding => (),
                 GitView::NewLine | GitView::Command => self.format.push('\n'),
+                GitView::StatusHeader => {
+                    self.format.push_str("# Status:");
+                    self.format.push('\n');
+                }
+                GitView::StatusMember { from_file } => {
+                    let (file, _) = &office.status[*from_file];
+                    self.format.push_str(&file.to_string_lossy());
+                    self.format.push('\n');
+                }
                 GitView::BranchHeader => {
                     self.format.push_str(GitView::BRANCH_HEADER);
                     //self.format.push_str(&self.branch[*i].name);
                     self.format.push('\n');
                 }
                 GitView::BranchMember(i) => {
-                    self.format.push_str("- ");
+                    //self.format.push_str("- ");
                     self.format.push_str(&self.branch[*i].name);
                     self.format.push('\n');
                 }
@@ -612,7 +729,7 @@ impl RootView {
                     from_commit,
                 } => {
                     let commit = &self.branch[*from_branch].commits[*from_commit];
-                    self.format.push_str("- ");
+                    //self.format.push_str("- ");
                     self.format.push_str(&commit.to_string()[..8]);
                     self.format.push('\n');
                 }
@@ -624,12 +741,15 @@ impl RootView {
 impl Lsp for Client {
     /// Yes, this is cursed.
     /// LSP has no standardized server-side notification for which
-    /// CodeAction the user selected. We therefore use a zero-width
-    /// WorkspaceEdit as an application-level action transport.
-    /// If LSP ever grows a proper action-selection mechanism,
+    /// CodeAction the user selected. I therefore decided to
+    /// write a serialized data into the top of ma.md and clean it
+    /// immediately and deserialized it here. And that act the "canonical"
+    /// action that the user selected. I hate it too btw
+    /// If LSP ever grows a proper two way action-selection mechanism,
     /// DELETE THIS.
     fn did_change(&mut self, params: DidChangeTextDocumentParams) {
         if let Some((wg, office_id)) = self.work_group.get_mut(&params.text_document.uri) {
+            let office = &mut self.office[*office_id];
             match wg {
                 WorkGroup::RootView(root_view) => {
                     let text = &params.content_changes[0];
@@ -668,10 +788,15 @@ impl Lsp for Client {
                                     Self::work_group_root(
                                         root_view,
                                         root_action,
+                                        office,
                                         &params.text_document.uri,
                                     )
                                     .map(|result| {
-                                        self.conn.req(ApplyWorkspaceEdit::METHOD, RequestId::from(Self::ALPHA_REQ), &result);
+                                        self.conn.req(
+                                            ApplyWorkspaceEdit::METHOD,
+                                            RequestId::from(Self::ALPHA_REQ),
+                                            &result,
+                                        );
                                     });
                                 });
                             }
@@ -688,8 +813,74 @@ impl Lsp for Client {
         let uri = params.text_document.uri;
         let start = params.range.start.line;
         let end = params.range.end.line;
+        self.work_group.get(&uri).map(|(wg, office_id)| {
+            let office = &mut self.office[*office_id];
+            let mut ret = Vec::new();
+            match wg {
+                WorkGroup::RootView(root_view) => {
+                    for i in start..end {
+                        let hint = match root_view.view.get(i as usize) {
+                            //GitView::NewLine => todo!(),
+                            Some(GitView::Command) => Some(Self::create_hint(
+                                i,
+                                0,
+                                office.repo.workdir().unwrap().to_string_lossy(),
+                            )),
+                            //GitView::StatusHeader => todo!(),
+                            Some(GitView::StatusMember { from_file }) => {
+                                let (_, status) = &office.status[*from_file];
+                                let staged = if status.contains(Status::INDEX_NEW) {
+                                    "A"
+                                } else if status.contains(Status::INDEX_MODIFIED) {
+                                    "M"
+                                } else if status.contains(Status::INDEX_DELETED) {
+                                    "D"
+                                } else if status.contains(Status::INDEX_RENAMED) {
+                                    "R"
+                                } else if status.contains(Status::INDEX_TYPECHANGE) {
+                                    "T"
+                                } else {
+                                    " "
+                                };
 
-        for i in start..=end {}
+                                let unstaged = if status.contains(Status::WT_NEW) {
+                                    "?"
+                                } else if status.contains(Status::WT_MODIFIED) {
+                                    "M"
+                                } else if status.contains(Status::WT_DELETED) {
+                                    "D"
+                                } else if status.contains(Status::WT_RENAMED) {
+                                    "R"
+                                } else if status.contains(Status::WT_TYPECHANGE) {
+                                    "T"
+                                } else {
+                                    " "
+                                };
+                                Some(Self::create_hint(
+                                    i,
+                                    0,
+                                    format!("{} | {} -> ", staged, unstaged),
+                                ))
+                            }
+                            Some(GitView::BranchHeader) => Some(Self::create_hint(
+                                i,
+                                GitView::COMMIT_HEADER.len() as u32,
+                                format!(" {}", &root_view.branch[root_view.active_branch].name),
+                            )),
+                            Some(GitView::CommitMember { .. }) | Some(GitView::BranchMember(_)) => {
+                                Some(Self::create_hint(i, 0, "- "))
+                            }
+                            _ => None,
+                        };
+                        if let Some(hint) = hint {
+                            ret.push(hint);
+                        }
+                    }
+                    self.conn.ok(id, &ret);
+                }
+                _ => (),
+            }
+        });
     }
 
     fn hover(&mut self, id: RequestId, params: HoverParams) {
@@ -752,10 +943,10 @@ impl Lsp for Client {
     fn code_action(&mut self, id: RequestId, params: CodeActionParams) {
         //return;
         if let Some((wg, office_id)) = self.work_group.get_mut(&params.text_document.uri) {
-            //let office = &mut self.office[*office_id];
+            let office = &mut self.office[*office_id];
             let idx = params.range.start.line as usize;
             let uri = params.text_document.uri;
-            if let Some(result) = Self::work_group_action(wg, idx, &uri) {
+            if let Some(result) = Self::work_group_action(wg, idx, office, &uri) {
                 self.conn.ok(id, &result);
             }
         }
@@ -776,42 +967,54 @@ impl Lsp for Client {
     }
 
     fn did_open(&mut self, params: DidOpenTextDocumentParams) {
-        match self.work_group.get_mut(&params.text_document.uri) {
+        let uri = params.text_document.uri;
+        match self.work_group.get_mut(&uri) {
             Some(_) => (),
             None => {
-                if let Some(mut wg) = self.new_rootview(&params.text_document.uri) {
-                    wg.rebuild_view();
-                    wg.rebuild_format();
-                    let end = wg.view.len();
-                    let format = wg.format.clone();
-                    self.work_group.insert(
-                        params.text_document.uri.clone(),
-                        (WorkGroup::RootView(wg), self.office.len() - 1),
-                    );
-                    let mut wf = HashMap::new();
-                    wf.insert(
-                        params.text_document.uri.clone(),
-                        vec![TextEdit {
-                            new_text: format,
-                            range: Range {
-                                start: Position::new(0, 0),
-                                end: Position::new(end as u32, 0),
-                            },
-                        }],
-                    );
-                    let we = ApplyWorkspaceEditParams {
-                        label: None,
-                        edit: WorkspaceEdit {
-                            changes: Some(wf),
-                            ..Default::default()
-                        },
-                    };
-                    self.conn.req(
-                        ApplyWorkspaceEdit::METHOD,
-                        RequestId::from(Self::ALPHA_REQ),
-                        &we,
-                    );
-                    //send_ok(conn, RequestId::from(1), &Some(TextEdit::new(Range { start: Position::new(1, 1), end: Position::new(1, 1) }, format)));
+                let path = uri.path();
+                let p = std::path::PathBuf::from(path.as_str());
+                if let Some(s) = p.file_name() {
+                    match s.to_str() {
+                        Some(ROOT_NAME) => {
+                            let parent = PathBuf::from(p.parent().unwrap());
+                            let p = parent.strip_prefix("/").unwrap();
+                            Office::new(p).map(|mut office| {
+                                let mut root_view = Self::new_root(&mut office);
+                                root_view.rebuild_view(&office);
+                                root_view.rebuild_format(&office);
+                                self.office.push(office);
+
+                                let mut wf = HashMap::new();
+                                wf.insert(
+                                    uri.clone(),
+                                    vec![TextEdit {
+                                        new_text: root_view.format.clone(),
+                                        range: Range {
+                                            start: Position::new(0, 0),
+                                            end: Position::new(root_view.view.len() as u32, 0),
+                                        },
+                                    }],
+                                );
+                                let we = ApplyWorkspaceEditParams {
+                                    label: None,
+                                    edit: WorkspaceEdit {
+                                        changes: Some(wf),
+                                        ..Default::default()
+                                    },
+                                };
+                                self.work_group.insert(
+                                    uri,
+                                    (WorkGroup::RootView(root_view), self.office.len() - 1),
+                                );
+                                self.conn.req(
+                                    ApplyWorkspaceEdit::METHOD,
+                                    RequestId::from(Self::ALPHA_REQ),
+                                    &we,
+                                );
+                            });
+                        }
+                        _ => (),
+                    }
                 }
             }
         }
@@ -822,95 +1025,59 @@ impl Client {
     fn work_group_root(
         root_view: &mut RootView,
         root_action: RootAction,
+        office: &mut Office,
         uri: &lsp_types::Uri,
     ) -> Option<impl Serialize + use<>> {
         match root_action {
+            RootAction::Reload => {
+                office.re_fill_status();
+                root_view.reload_branch(office);
+                root_view.limit_view = GitView::LIMIT_VIEW;
+                Some(root_view.refresh(uri, office))
+            }
+            RootAction::StageFile(file_id) => {
+                let (file, _) = &office.status[file_id];
+                office.repo.index().map(|mut index| {
+                    index.add_path(&file);
+                    index.write();
+                });
+                office.re_fill_status();
+                Some(root_view.refresh(uri, office))
+            }
+            RootAction::UnstageFile(file_id) => {
+                let (file, _) = &office.status[file_id];
+                office.repo.index().map(|mut index| {
+                    index.remove_path(&file);
+                    index.write();
+                });
+                office.re_fill_status();
+                Some(root_view.refresh(uri, office))
+            }
+            RootAction::StatusReload => {
+                office.re_fill_status();
+                Some(root_view.refresh(uri, office))
+            }
             RootAction::SwitchBranch(b) => {
-                let mut wf = HashMap::new();
                 root_view.active_branch = b;
-                root_view.rebuild_view();
-                root_view.rebuild_format();
-                wf.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        new_text: root_view.format.clone(),
-                        range: Range {
-                            start: Position::new(0, 0),
-                            end: Position::new(root_view.view.len() as u32, 0),
-                        },
-                    }],
-                );
-
-                let refresh = ApplyWorkspaceEditParams {
-                    label: None,
-                    edit: WorkspaceEdit {
-                        changes: Some(wf),
-                        ..Default::default()
-                    },
-                };
-                Some(refresh)
+                Some(root_view.refresh(uri, office))
             }
             RootAction::MergeBranch(_) => None,
             RootAction::ViewMore => {
-                let mut wf = HashMap::new();
                 root_view.limit_view += GitView::LIMIT_VIEW;
-                root_view.rebuild_view();
-                root_view.rebuild_format();
-                wf.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        new_text: root_view.format.clone(),
-                        range: Range {
-                            start: Position::new(0, 0),
-                            end: Position::new(root_view.view.len() as u32, 0),
-                        },
-                    }],
-                );
-
-                let refresh = ApplyWorkspaceEditParams {
-                    label: None,
-                    edit: WorkspaceEdit {
-                        changes: Some(wf),
-                        ..Default::default()
-                    },
-                };
-                Some(refresh)
+                Some(root_view.refresh(uri, office))
             }
             RootAction::ViewLess => {
-                let old_length = root_view.view.len();
                 if root_view.limit_view < GitView::LIMIT_VIEW {
                     return None;
                 }
-                let mut wf = HashMap::new();
                 root_view.limit_view -= GitView::LIMIT_VIEW;
-                root_view.rebuild_view();
-                root_view.rebuild_format();
-                wf.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        new_text: root_view.format.clone(),
-                        range: Range {
-                            start: Position::new(0, 0),
-                            end: Position::new(old_length as u32, 0),
-                        },
-                    }],
-                );
-
-                let refresh = ApplyWorkspaceEditParams {
-                    label: None,
-                    edit: WorkspaceEdit {
-                        changes: Some(wf),
-                        ..Default::default()
-                    },
-                };
-                Some(refresh)
-
-                //    None
+                Some(root_view.refresh(uri, office))
             }
         }
     }
 
     fn work_group_folding(wg: &WorkGroup, uri: &lsp_types::Uri) -> Option<impl Serialize + use<>> {
+        return None;
         match wg {
             WorkGroup::RootView(root_view) => {
                 let mut ret = Vec::new();
@@ -946,6 +1113,7 @@ impl Client {
                                 });
                             }
                         },
+                        _ => (),
                     }
                 }
                 Some(ret)
@@ -957,13 +1125,49 @@ impl Client {
 
     fn work_group_action(
         wg: &mut WorkGroup,
-        //office: &mut Office,
         idx: usize,
+        office: &Office,
         uri: &lsp_types::Uri,
     ) -> Option<impl Serialize + use<>> {
         match wg {
             WorkGroup::RootView(root_view) => {
                 match root_view.view[idx] {
+                    GitView::Command => Some(RootAction::pack(
+                        uri,
+                        &[(
+                            "Reload?",
+                            RootAction::Reload,
+                            Some(CodeActionKind::REFACTOR),
+                        )],
+                    )),
+                    GitView::StatusHeader => Some(RootAction::pack(
+                        uri,
+                        &[(
+                            "Reload status?",
+                            RootAction::StatusReload,
+                            Some(CodeActionKind::REFACTOR),
+                        )],
+                    )),
+                    GitView::StatusMember { from_file } => {
+                        let (_, status) = &office.status[from_file];
+                        let staged = status.intersects(
+                            Status::INDEX_NEW
+                                | Status::INDEX_MODIFIED
+                                | Status::INDEX_DELETED
+                                | Status::INDEX_RENAMED
+                                | Status::INDEX_TYPECHANGE,
+                        );
+                        if staged {
+                           Some(RootAction::pack(uri, &[
+                                ("Unstage?", RootAction::UnstageFile(from_file), Some(CodeActionKind::QUICKFIX)),
+                                ("Update file?", RootAction::StageFile(from_file), Some(CodeActionKind::QUICKFIX))
+                           ])) 
+                        } else {
+                            Some(RootAction::pack(uri,& [
+                                ("Stage file?", RootAction::StageFile(from_file), Some(CodeActionKind::QUICKFIX))
+                            ]))
+                        }
+                    }
                     GitView::BranchMember(i) => {
                         //let vec = ;
                         Some(RootAction::pack(
@@ -1143,7 +1347,7 @@ impl Client {
         None
     }
 
-    fn new_rootview(&mut self, uri: &lsp_types::Uri) -> Option<RootView> {
+    fn new_rootview(uri: &lsp_types::Uri) -> Option<(RootView, Office)> {
         let path = uri.path();
         let p = std::path::PathBuf::from(path.as_str());
         match p.file_name() {
@@ -1192,23 +1396,44 @@ impl Client {
                                 }
                                 vec
                             };
+                            let status = {
+                                let mut ret = Vec::new();
+                                let st = repo.statuses(Some(
+                                    StatusOptions::new()
+                                        .include_untracked(true)
+                                        .recurse_untracked_dirs(true),
+                                ));
+                                st.map(|status| {
+                                    for entry in status.iter() {
+                                        ret.push((
+                                            PathBuf::from(entry.path().unwrap()),
+                                            entry.status(),
+                                        ));
+                                    }
+                                });
+                                ret
+                            };
                             let mut cache = PathBuf::from(repo.path());
                             cache.push(CACHE_DIR);
-                            self.office.push(Office {
+                            let office = Office {
                                 repo,
                                 cache,
+                                status,
                                 manifest: HashMap::new(),
                                 file_cache: HashMap::new(),
-                            });
+                            };
                             //self.repo.push(repo);
-                            Some(RootView {
-                                branch,
-                                active_branch: 0,
-                                limit_view: GitView::LIMIT_VIEW,
-                                format: String::default(),
-                                view: Vec::default(),
-                                //                         cache,
-                            })
+                            Some((
+                                RootView {
+                                    branch,
+                                    active_branch: 0,
+                                    limit_view: GitView::LIMIT_VIEW,
+                                    format: String::default(),
+                                    view: Vec::default(),
+                                    //                         cache,
+                                },
+                                office,
+                            ))
                             //self.work_group
                             //    .insert(uri.clone(), WorkGroup::RootView(rootview));
                         }
@@ -1218,6 +1443,21 @@ impl Client {
             },
             None => None,
         }
+    }
+
+    fn new_root(office: &mut Office) -> RootView {
+        //let repo = &office.repo;
+        //let branch = {
+        let mut root = RootView {
+            branch: Vec::new(),
+            active_branch: 0,
+            limit_view: GitView::LIMIT_VIEW,
+            format: String::new(),
+            view: Vec::new(),
+        };
+        root.reload_branch(office);
+
+        root
     }
 
     fn open_diff(oid: Oid, office: &mut Office) -> Option<(Diff, Uri)> {
