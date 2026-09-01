@@ -31,6 +31,7 @@ trait Lsp {
                     self.inlay_hint(request.id, params);
                 });
             }
+            SemanticTokensFullRequest::METHOD => {}
             _ => {}
         }
     }
@@ -72,6 +73,7 @@ use chrono::{DateTime, FixedOffset, TimeZone};
 use crossbeam::channel::Sender;
 use git2::{
     BranchType, Commit, DiffFormat, ObjectType, Oid, Repository, Sort, Status, StatusOptions, Time,
+    build::CheckoutBuilder,
 };
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
@@ -88,8 +90,9 @@ use lsp_types::{
         DidChangeTextDocument, DidOpenTextDocument, LogMessage, Notification, ShowMessage,
     },
     request::{
-        ApplyWorkspaceEdit, CodeActionRequest, CodeLensRequest, FoldingRangeRequest,
-        GotoDefinition, HoverRequest, Initialize, InlayHintRequest, Request,
+        ApplyWorkspaceEdit, CodeActionRequest, CodeLensRequest, DocumentHighlightRequest,
+        FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, InlayHintRequest, Request,
+        SemanticTokensFullRequest,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -525,6 +528,7 @@ struct Diff {
 
 struct Branch {
     name: String,
+    b_type: BranchType,
     commits: Vec<Oid>,
 }
 
@@ -560,7 +564,8 @@ enum RootAction {
     UnstageFile(usize),
     //ReplaceFile(usize),
     MergeBranch(usize),
-    SwitchBranch(usize),
+    ViewBranch(usize),
+    CheckoutBranch(usize),
     ViewMore,
     ViewLess,
 }
@@ -604,7 +609,8 @@ impl RootAction {
 //#[derive(Default)]
 struct RootView {
     branch: Vec<Branch>,
-    active_branch: usize,
+    viewed_branch: usize,
+    head_branch: usize,
     limit_view: usize,
     format: String,
     view: Vec<GitView>,
@@ -614,11 +620,15 @@ impl RootView {
     fn reload_branch(&mut self, office: &Office) {
         self.branch.clear();
         if let Ok(branches) = office.repo.branches(None) {
-            for branch in branches {
-                branch.map(|branch| {
+            for (i, branch) in branches.enumerate() {
+                branch.map(|(branch, b_type)| {
+                    if branch.is_head() {
+                        self.head_branch = i;
+                        self.viewed_branch = i;
+                    }
                     let commits = {
                         let mut c = Vec::default();
-                        branch.0.get().peel_to_commit().map(|commit| {
+                        branch.get().peel_to_commit().map(|commit| {
                             let mut revwalk = office.repo.revwalk().unwrap();
 
                             revwalk.push(commit.id());
@@ -632,7 +642,8 @@ impl RootView {
                         c
                     };
                     self.branch.push(Branch {
-                        name: branch.0.name().unwrap().unwrap().to_string(),
+                        name: branch.name().unwrap().unwrap().to_string(),
+                        b_type,
                         commits,
                     });
                 });
@@ -683,10 +694,10 @@ impl RootView {
         }
         self.view.push(GitView::NewLine);
         self.view.push(GitView::CommitHeader);
-        if let Some(branch) = self.branch.get(self.active_branch) {
+        if let Some(branch) = self.branch.get(self.viewed_branch) {
             for (from_commit, _) in branch.commits.iter().take(self.limit_view).enumerate() {
                 self.view.push(GitView::CommitMember {
-                    from_branch: self.active_branch,
+                    from_branch: self.viewed_branch,
                     from_commit,
                 });
                 //self.view.push(GitView::ViewMore);
@@ -865,10 +876,21 @@ impl Lsp for Client {
                             Some(GitView::BranchHeader) => Some(Self::create_hint(
                                 i,
                                 GitView::COMMIT_HEADER.len() as u32,
-                                format!(" {}", &root_view.branch[root_view.active_branch].name),
+                                format!(" {}", &root_view.branch[root_view.viewed_branch].name),
                             )),
-                            Some(GitView::CommitMember { .. }) | Some(GitView::BranchMember(_)) => {
+                            Some(GitView::CommitMember { .. }) => {
                                 Some(Self::create_hint(i, 0, "- "))
+                            }
+                            Some(GitView::BranchMember(on_branch)) => {
+                                let branch = &root_view.branch[*on_branch];
+                                let label =
+                                    match (root_view.head_branch == *on_branch, branch.b_type) {
+                                        (true, BranchType::Local) => "L HEAD -> ",
+                                        (true, BranchType::Remote) => "R HEAD -> ",
+                                        (false, BranchType::Local) => "L      -> ",
+                                        (false, BranchType::Remote) => "R      -> ",
+                                    };
+                                Some(Self::create_hint(i, 0, label))
                             }
                             _ => None,
                         };
@@ -969,7 +991,16 @@ impl Lsp for Client {
     fn did_open(&mut self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         match self.work_group.get_mut(&uri) {
-            Some(_) => (),
+            Some((wg, office_id)) => match wg {
+                WorkGroup::RootView(root_view) => {
+                    self.conn.req(
+                        ApplyWorkspaceEdit::METHOD,
+                        RequestId::from(Self::ALPHA_REQ),
+                        &root_view.refresh(&uri, &self.office[*office_id]),
+                    );
+                }
+                _ => (),
+            },
             None => {
                 let path = uri.path();
                 let p = std::path::PathBuf::from(path.as_str());
@@ -1057,8 +1088,24 @@ impl Client {
                 office.re_fill_status();
                 Some(root_view.refresh(uri, office))
             }
-            RootAction::SwitchBranch(b) => {
-                root_view.active_branch = b;
+            RootAction::ViewBranch(b) => {
+                root_view.viewed_branch = b;
+                Some(root_view.refresh(uri, office))
+            }
+            RootAction::CheckoutBranch(b) => {
+                let branch = office.repo.find_branch(&root_view.branch[b].name, root_view.branch[b].b_type).unwrap();
+                let tree = branch.get().peel_to_tree().unwrap();
+
+                if let Err(_) = office.repo.checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().safe())) {
+                    return None;
+                }
+ 
+                if let Err(_) = office.repo.set_head(branch.get().name().unwrap()) {
+                    return None;
+                }
+
+                root_view.viewed_branch = b;
+                root_view.head_branch = b;
                 Some(root_view.refresh(uri, office))
             }
             RootAction::MergeBranch(_) => None,
@@ -1158,26 +1205,60 @@ impl Client {
                                 | Status::INDEX_TYPECHANGE,
                         );
                         if staged {
-                           Some(RootAction::pack(uri, &[
-                                ("Unstage?", RootAction::UnstageFile(from_file), Some(CodeActionKind::QUICKFIX)),
-                                ("Update file?", RootAction::StageFile(from_file), Some(CodeActionKind::QUICKFIX))
-                           ])) 
+                            Some(RootAction::pack(
+                                uri,
+                                &[
+                                    (
+                                        "Unstage?",
+                                        RootAction::UnstageFile(from_file),
+                                        Some(CodeActionKind::QUICKFIX),
+                                    ),
+                                    (
+                                        "Update file?",
+                                        RootAction::StageFile(from_file),
+                                        Some(CodeActionKind::QUICKFIX),
+                                    ),
+                                ],
+                            ))
                         } else {
-                            Some(RootAction::pack(uri,& [
-                                ("Stage file?", RootAction::StageFile(from_file), Some(CodeActionKind::QUICKFIX))
-                            ]))
+                            Some(RootAction::pack(
+                                uri,
+                                &[(
+                                    "Stage file?",
+                                    RootAction::StageFile(from_file),
+                                    Some(CodeActionKind::QUICKFIX),
+                                )],
+                            ))
                         }
                     }
                     GitView::BranchMember(i) => {
                         //let vec = ;
-                        Some(RootAction::pack(
-                            uri,
-                            &[(
-                                format!("Switch to {}", &root_view.branch[i].name),
-                                RootAction::SwitchBranch(i),
-                                Some(CodeActionKind::REFACTOR),
-                            )],
-                        ))
+                        let branch = &root_view.branch[i];
+                        match branch.b_type {
+                            BranchType::Local => Some(RootAction::pack(
+                                uri,
+                                &[
+                                    (
+                                        format!("View {}?", &root_view.branch[i].name),
+                                        RootAction::ViewBranch(i),
+                                        Some(CodeActionKind::SOURCE),
+                                    ),
+                                    (
+                                        format!("Checkout {}", branch.name),
+                                        RootAction::CheckoutBranch(i),
+                                        Some(CodeActionKind::SOURCE),
+                                    ),
+                                ],
+                            )),
+                            BranchType::Remote => Some(RootAction::pack(
+                                uri,
+                                &[(
+                                    format!("View {}?", &root_view.branch[i].name),
+                                    RootAction::ViewBranch(i),
+                                    Some(CodeActionKind::SOURCE),
+                                )],
+                            )),
+                        }
                         //Some(ApplyWorkspaceEdit)
                     }
                     GitView::CommitHeader => Some(RootAction::pack(
@@ -1347,110 +1428,13 @@ impl Client {
         None
     }
 
-    fn new_rootview(uri: &lsp_types::Uri) -> Option<(RootView, Office)> {
-        let path = uri.path();
-        let p = std::path::PathBuf::from(path.as_str());
-        match p.file_name() {
-            Some(s) => match s.to_str() {
-                Some(ROOT_NAME) => {
-                    let parent = PathBuf::from(p.parent().unwrap());
-                    let p = parent.strip_prefix("/").unwrap();
-                    match Repository::open(&p) {
-                        Err(_) => None,
-                        Ok(repo) => {
-                            //log(s.to_str().unwrap(), conn);
-                            let branch = {
-                                let mut vec = Vec::default();
-                                match repo.branches(None) {
-                                    Err(_) => (),
-                                    Ok(brances) => {
-                                        for branch in brances {
-                                            branch.map(|branch| {
-                                                let commits = {
-                                                    let mut c = Vec::default();
-                                                    branch.0.get().peel_to_commit().map(|commit| {
-                                                        let mut revwalk = repo.revwalk().unwrap();
-
-                                                        revwalk.push(commit.id());
-                                                        revwalk.set_sorting(Sort::TIME);
-                                                        for res in revwalk {
-                                                            res.map(|id| {
-                                                                c.push(id);
-                                                            });
-                                                        }
-                                                    });
-                                                    c
-                                                };
-                                                vec.push(Branch {
-                                                    name: branch
-                                                        .0
-                                                        .name()
-                                                        .unwrap()
-                                                        .unwrap()
-                                                        .to_string(),
-                                                    commits,
-                                                });
-                                            });
-                                        }
-                                    }
-                                }
-                                vec
-                            };
-                            let status = {
-                                let mut ret = Vec::new();
-                                let st = repo.statuses(Some(
-                                    StatusOptions::new()
-                                        .include_untracked(true)
-                                        .recurse_untracked_dirs(true),
-                                ));
-                                st.map(|status| {
-                                    for entry in status.iter() {
-                                        ret.push((
-                                            PathBuf::from(entry.path().unwrap()),
-                                            entry.status(),
-                                        ));
-                                    }
-                                });
-                                ret
-                            };
-                            let mut cache = PathBuf::from(repo.path());
-                            cache.push(CACHE_DIR);
-                            let office = Office {
-                                repo,
-                                cache,
-                                status,
-                                manifest: HashMap::new(),
-                                file_cache: HashMap::new(),
-                            };
-                            //self.repo.push(repo);
-                            Some((
-                                RootView {
-                                    branch,
-                                    active_branch: 0,
-                                    limit_view: GitView::LIMIT_VIEW,
-                                    format: String::default(),
-                                    view: Vec::default(),
-                                    //                         cache,
-                                },
-                                office,
-                            ))
-                            //self.work_group
-                            //    .insert(uri.clone(), WorkGroup::RootView(rootview));
-                        }
-                    }
-                }
-                _ => None,
-            },
-            None => None,
-        }
-    }
-
     fn new_root(office: &mut Office) -> RootView {
         //let repo = &office.repo;
         //let branch = {
         let mut root = RootView {
             branch: Vec::new(),
-            active_branch: 0,
+            viewed_branch: 0,
+            head_branch: 0,
             limit_view: GitView::LIMIT_VIEW,
             format: String::new(),
             view: Vec::new(),

@@ -2,7 +2,7 @@
 it's pronounced "Ma" like, "ma" or "mah". Not "M-A".
 
 # how to configure it
-it's an lsp, the same way you configure lsp in your preferred editor
+it's an lsp, you can configure it the same way you configure lsp in your preferred editor
 
 # how it work
 1. start the lsp
