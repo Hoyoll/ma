@@ -270,6 +270,7 @@ impl InputBuffer {
                     //*wg = Some((uri, WorkGroup::InputBuffer(InputBuffer::AcceptCommit)));
                     conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
                 }
+                *self = Self::AcceptNothing;
             }
         }
     }
