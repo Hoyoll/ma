@@ -1020,9 +1020,13 @@ impl RootView {
                 );
             }
             RootAction::StageFile(file_id) => {
-                let (file, _) = &office.status[file_id];
+                let (file, status) = &office.status[file_id];
                 office.repo.index().map(|mut index| {
-                    index.add_path(&file);
+                    if status.is_wt_deleted() {
+                        index.remove_path(&file);
+                    } else {
+                        index.add_path(&file);
+                    }
                     index.write();
                 });
                 office.re_fill_status();
