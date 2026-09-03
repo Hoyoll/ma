@@ -230,8 +230,8 @@ impl InputBuffer {
                 return;
                 let head = office.repo.head().unwrap();
                 let current = head.peel_to_commit();
-                // The branch we're merging INTO current HEAD 
-                
+                // The branch we're merging INTO current HEAD
+
                 let branch = &office.branch[*b];
                 let b_repo = office
                     .repo
@@ -242,7 +242,7 @@ impl InputBuffer {
 
                 // Ask Git what kind of merge this is.
                 let (analysis, _) = office.repo.merge_analysis(&[&annotated]).unwrap();
-                if analysis.is_none() | analysis.is_unborn() { 
+                if analysis.is_none() | analysis.is_unborn() {
                     let show = ShowDocumentParams {
                         uri: office.ma_root.clone(),
                         external: Some(false),
@@ -540,13 +540,21 @@ impl DiffView {
 
         format.push('\n');
         view.push(NormalView::Padding);
+        let message = &commit.message().unwrap_or_default(); 
+        //format.push_str(&commit.message().unwrap_or_default());
+        //format.push('\n');
+        //view.push(NormalView::Padding);
+        for ms in message.lines() {
+            format.push_str(ms);
+            format.push('\n');
+            view.push(NormalView::Padding);
+        }
+        //view.push(NormalView::Padding);
+        //view.push(NormalView::Padding);
 
-        format.push_str(&commit.message().unwrap_or_default());
-        format.push('\n');
-        view.push(NormalView::Padding);
 
         format.push('\n');
-        view.push(NormalView::Padding);
+        //view.push(NormalView::Padding);
     }
 
     fn fill_view(
@@ -650,6 +658,23 @@ struct Diff {
     //repo_id: RepoId,
 }
 
+impl Diff {
+    fn inlay_hint(&self, i: u32) -> Option<InlayHint> {
+        match &self.diff_view {
+            DiffView::Merge { .. } => None,
+            DiffView::Normal { hunk, view, parent } => {
+                match view.get(i as usize) {
+                    Some(NormalView::Hunk { from_hunk, ..}) => {
+                        let h = &hunk[*from_hunk];
+                        Some(Client::create_hint(i, 0, format!("{} -> ",h.path.to_string_lossy())))
+                    },
+                    _ => None
+                }
+            },
+        }
+    }
+}
+
 struct Branch {
     name: String,
     b_type: BranchType,
@@ -742,6 +767,76 @@ struct RootView {
 }
 
 impl RootView {
+    fn inlay_hint(&self, i: u32, office: &Office) -> Option<InlayHint> {
+        let root_view = self;
+        match root_view.view.get(i as usize) {
+            //GitView::NewLine => todo!(),
+            Some(GitView::Command) => Some(Client::create_hint(
+                i,
+                0,
+                office.repo.workdir().unwrap().to_string_lossy(),
+            )),
+            //GitView::StatusHeader => todo!(),
+            Some(GitView::StatusMember { from_file }) => {
+                let (_, status) = &office.status[*from_file];
+                let staged = if status.contains(Status::INDEX_NEW) {
+                    "A"
+                } else if status.contains(Status::INDEX_MODIFIED) {
+                    "M"
+                } else if status.contains(Status::INDEX_DELETED) {
+                    "D"
+                } else if status.contains(Status::INDEX_RENAMED) {
+                    "R"
+                } else if status.contains(Status::INDEX_TYPECHANGE) {
+                    "T"
+                } else {
+                    " "
+                };
+
+                let unstaged = if status.contains(Status::WT_NEW) {
+                    "?"
+                } else if status.contains(Status::WT_MODIFIED) {
+                    "M"
+                } else if status.contains(Status::WT_DELETED) {
+                    "D"
+                } else if status.contains(Status::WT_RENAMED) {
+                    "R"
+                } else if status.contains(Status::WT_TYPECHANGE) {
+                    "T"
+                } else {
+                    " "
+                };
+                Some(Client::create_hint(
+                    i,
+                    0,
+                    format!("{} | {} -> ", staged, unstaged),
+                ))
+            }
+            Some(GitView::BranchHeader) => match office.branch.is_empty() {
+                true => None,
+                false => Some(Client::create_hint(
+                    i,
+                    GitView::COMMIT_HEADER.len() as u32,
+                    format!(" {}", &office.branch[root_view.viewed_branch].name),
+                )),
+            },
+            Some(GitView::CommitMember { .. }) => Some(Client::create_hint(i, 0, "- ")),
+            Some(GitView::BranchMember(on_branch)) => match office.branch.is_empty() {
+                true => None,
+                false => {
+                    let branch = &office.branch[*on_branch];
+                    let label = match (root_view.head_branch == *on_branch, branch.b_type) {
+                        (true, BranchType::Local) => "L HEAD -> ",
+                        (true, BranchType::Remote) => "R HEAD -> ",
+                        (false, BranchType::Local) => "L      -> ",
+                        (false, BranchType::Remote) => "R      -> ",
+                    };
+                    Some(Client::create_hint(i, 0, label))
+                }
+            },
+            _ => None,
+        }
+    }
     fn reload_branch(&mut self, office: &mut Office) {
         office.branch.clear();
         if let Ok(branches) = office.repo.branches(None) {
@@ -914,6 +1009,7 @@ impl RootView {
                 conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
             }
             RootAction::Reload => {
+                office.manifest.clear();
                 office.re_fill_status();
                 self.reload_branch(office);
                 self.limit_view = GitView::LIMIT_VIEW;
@@ -1115,83 +1211,19 @@ impl Lsp for Client {
             match wg {
                 WorkGroup::RootView(root_view) => {
                     for i in start..end {
-                        let hint = match root_view.view.get(i as usize) {
-                            //GitView::NewLine => todo!(),
-                            Some(GitView::Command) => Some(Self::create_hint(
-                                i,
-                                0,
-                                office.repo.workdir().unwrap().to_string_lossy(),
-                            )),
-                            //GitView::StatusHeader => todo!(),
-                            Some(GitView::StatusMember { from_file }) => {
-                                let (_, status) = &office.status[*from_file];
-                                let staged = if status.contains(Status::INDEX_NEW) {
-                                    "A"
-                                } else if status.contains(Status::INDEX_MODIFIED) {
-                                    "M"
-                                } else if status.contains(Status::INDEX_DELETED) {
-                                    "D"
-                                } else if status.contains(Status::INDEX_RENAMED) {
-                                    "R"
-                                } else if status.contains(Status::INDEX_TYPECHANGE) {
-                                    "T"
-                                } else {
-                                    " "
-                                };
-
-                                let unstaged = if status.contains(Status::WT_NEW) {
-                                    "?"
-                                } else if status.contains(Status::WT_MODIFIED) {
-                                    "M"
-                                } else if status.contains(Status::WT_DELETED) {
-                                    "D"
-                                } else if status.contains(Status::WT_RENAMED) {
-                                    "R"
-                                } else if status.contains(Status::WT_TYPECHANGE) {
-                                    "T"
-                                } else {
-                                    " "
-                                };
-                                Some(Self::create_hint(
-                                    i,
-                                    0,
-                                    format!("{} | {} -> ", staged, unstaged),
-                                ))
-                            }
-                            Some(GitView::BranchHeader) => match office.branch.is_empty() {
-                                true => None,
-                                false => Some(Self::create_hint(
-                                    i,
-                                    GitView::COMMIT_HEADER.len() as u32,
-                                    format!(" {}", &office.branch[root_view.viewed_branch].name),
-                                )),
-                            },
-                            Some(GitView::CommitMember { .. }) => {
-                                Some(Self::create_hint(i, 0, "- "))
-                            }
-                            Some(GitView::BranchMember(on_branch)) => {
-                                match office.branch.is_empty() {
-                                    true => None,
-                                    false => {
-                                        let branch = &office.branch[*on_branch];
-                                        let label = match (
-                                            root_view.head_branch == *on_branch,
-                                            branch.b_type,
-                                        ) {
-                                            (true, BranchType::Local) => "L HEAD -> ",
-                                            (true, BranchType::Remote) => "R HEAD -> ",
-                                            (false, BranchType::Local) => "L      -> ",
-                                            (false, BranchType::Remote) => "R      -> ",
-                                        };
-                                        Some(Self::create_hint(i, 0, label))
-                                    }
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(hint) = hint {
+                        if let Some(hint) = root_view.inlay_hint(i, office) {
                             ret.push(hint);
                         }
+                        //ret.push(root_view.inlay_hint(i, office));
+                    }
+                    self.conn.ok(id, &ret);
+                }
+                WorkGroup::DiffView(diff) => {
+                    for i in start..end {
+                        if let Some(hint) = diff.inlay_hint(i) {
+                            ret.push(hint);
+                        }
+                        //ret.push(root_view.inlay_hint(i, office));
                     }
                     self.conn.ok(id, &ret);
                 }
