@@ -218,13 +218,42 @@ enum WorkGroup {
 enum InputBuffer {
     AcceptNothing,
     AcceptCommit,
+    AcceptMerge(usize),
 }
 
 impl InputBuffer {
     fn commit(&mut self, office: &mut Office, conn: &Conn, message: impl AsRef<str>) {
-        //let office = office[*office_id];
         match self {
             InputBuffer::AcceptNothing => (),
+            InputBuffer::AcceptMerge(b) => {
+                // Current branch / HEAD
+                return;
+                let head = office.repo.head().unwrap();
+                let current = head.peel_to_commit();
+                // The branch we're merging INTO current HEAD 
+                
+                let branch = &office.branch[*b];
+                let b_repo = office
+                    .repo
+                    .find_branch(&branch.name, branch.b_type)
+                    .unwrap();
+                let other = b_repo.get().peel_to_commit().unwrap();
+                let annotated = office.repo.find_annotated_commit(other.id()).unwrap();
+
+                // Ask Git what kind of merge this is.
+                let (analysis, _) = office.repo.merge_analysis(&[&annotated]).unwrap();
+                if analysis.is_none() | analysis.is_unborn() { 
+                    let show = ShowDocumentParams {
+                        uri: office.ma_root.clone(),
+                        external: Some(false),
+                        take_focus: Some(true),
+                        selection: None,
+                    };
+                    //*wg = Some((uri, WorkGroup::InputBuffer(InputBuffer::AcceptCommit)));
+                    conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
+                    return;
+                }
+            }
             InputBuffer::AcceptCommit => {
                 let author = office.repo.author_from_env().unwrap();
                 let committer = office.repo.committer_from_env().unwrap();
@@ -244,31 +273,25 @@ impl InputBuffer {
                             &[&parent],
                         )
                     }
-                    None => {
-                        office.repo.commit(
-                            Some("HEAD"),
-                            &author,
-                            &committer,
-                            message.as_ref(),
-                            &tree,
-                            &[],
-                        )
-                        // HEAD itself couldn't be resolved
-                        // Handle according to your application
-                    }
+                    None => office.repo.commit(
+                        Some("HEAD"),
+                        &author,
+                        &committer,
+                        message.as_ref(),
+                        &tree,
+                        &[],
+                    ),
                 };
                 if let Ok(_) = res {
-                    let path = PathBuf::from(office.repo.workdir().unwrap()).join(ROOT_NAME);
-                    let uri = name_to_url(&path).unwrap();
                     let show = ShowDocumentParams {
-                        uri: uri,
+                        uri: office.ma_root.clone(),
                         external: Some(false),
                         take_focus: Some(true),
                         selection: None,
                     };
-
                     //*wg = Some((uri, WorkGroup::InputBuffer(InputBuffer::AcceptCommit)));
                     conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
+                    //conn.req(ApplyWorkspaceEdit::METHOD, Conn::beta_req(), RootAction::pack(uri, &[""]));
                 }
                 *self = Self::AcceptNothing;
             }
@@ -282,21 +305,28 @@ struct Office {
     status: Vec<(PathBuf, Status)>,
     manifest: HashMap<Oid, Uri>,
     file_cache: HashMap<PathBuf, Uri>,
+    ma_root: Uri,
+    ma_input: Uri,
+    branch: Vec<Branch>,
     //repo_state: RepoState,
 }
 
 impl Office {
-    pub fn new(path: &Path) -> Option<Office> {
+    pub fn new(ma_root: Uri, path: &Path) -> Option<Office> {
         match Repository::open(path) {
             Ok(repo) => {
                 let mut cache = PathBuf::from(repo.path());
                 cache.push(CACHE_DIR);
+                let ma_input = name_to_url(&cache.join(INPUT_MOUTH)).unwrap();
                 let mut office = Office {
                     repo,
                     cache,
                     status: Vec::new(),
                     manifest: HashMap::new(),
                     file_cache: HashMap::new(),
+                    ma_root,
+                    ma_input,
+                    branch: Vec::new(),
                     //repo_state: RepoState::AcceptNothing,
                 };
                 office.re_fill_status();
@@ -703,7 +733,7 @@ impl RootAction {
 
 //#[derive(Default)]
 struct RootView {
-    branch: Vec<Branch>,
+    //branch: Vec<Branch>,
     viewed_branch: usize,
     head_branch: usize,
     limit_view: usize,
@@ -712,8 +742,8 @@ struct RootView {
 }
 
 impl RootView {
-    fn reload_branch(&mut self, office: &Office) {
-        self.branch.clear();
+    fn reload_branch(&mut self, office: &mut Office) {
+        office.branch.clear();
         if let Ok(branches) = office.repo.branches(None) {
             for (i, branch) in branches.enumerate() {
                 branch.map(|(branch, b_type)| {
@@ -736,7 +766,7 @@ impl RootView {
                         });
                         c
                     };
-                    self.branch.push(Branch {
+                    office.branch.push(Branch {
                         name: branch.name().unwrap().unwrap().to_string(),
                         b_type,
                         commits,
@@ -783,13 +813,13 @@ impl RootView {
 
         self.view.push(GitView::NewLine);
         self.view.push(GitView::BranchHeader);
-        for (from_branch, _) in self.branch.iter().enumerate() {
+        for (from_branch, _) in office.branch.iter().enumerate() {
             self.view.push(GitView::BranchMember(from_branch));
             //self.view.push(GitView::NewLine);
         }
         self.view.push(GitView::NewLine);
         self.view.push(GitView::CommitHeader);
-        if let Some(branch) = self.branch.get(self.viewed_branch) {
+        if let Some(branch) = office.branch.get(self.viewed_branch) {
             for (from_commit, _) in branch.commits.iter().take(self.limit_view).enumerate() {
                 self.view.push(GitView::CommitMember {
                     from_branch: self.viewed_branch,
@@ -823,7 +853,7 @@ impl RootView {
                 }
                 GitView::BranchMember(i) => {
                     //self.format.push_str("- ");
-                    self.format.push_str(&self.branch[*i].name);
+                    self.format.push_str(&office.branch[*i].name);
                     self.format.push('\n');
                 }
                 GitView::CommitHeader => {
@@ -834,7 +864,7 @@ impl RootView {
                     from_branch,
                     from_commit,
                 } => {
-                    let commit = &self.branch[*from_branch].commits[*from_commit];
+                    let commit = &office.branch[*from_branch].commits[*from_commit];
                     //self.format.push_str("- ");
                     self.format.push_str(&commit.to_string()[..8]);
                     self.format.push('\n');
@@ -853,21 +883,35 @@ impl RootView {
     ) {
         match root_action {
             RootAction::AttemptCommit => {
-                let path = PathBuf::from(office.cache.join(INPUT_MOUTH));
+                //let path = PathBuf::from(office.cache.join(INPUT_MOUTH));
 
-                let uri = name_to_url(&path).unwrap();
+                //let uri = name_to_url(&path).unwrap();
                 let show = ShowDocumentParams {
-                    uri: uri.clone(),
+                    uri: office.ma_input.clone(),
                     external: Some(false),
                     take_focus: Some(true),
                     selection: None,
                 };
 
-                *wg = Some((uri, WorkGroup::InputBuffer(InputBuffer::AcceptCommit)));
+                *wg = Some((
+                    office.ma_input.clone(),
+                    WorkGroup::InputBuffer(InputBuffer::AcceptCommit),
+                ));
                 conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
-                //office.repo_state = RepoState::AcceptCommit;
+            }
+            RootAction::MergeBranch(b) => {
+                let show = ShowDocumentParams {
+                    uri: office.ma_input.clone(),
+                    external: Some(false),
+                    take_focus: Some(true),
+                    selection: None,
+                };
 
-                //None
+                *wg = Some((
+                    office.ma_input.clone(),
+                    WorkGroup::InputBuffer(InputBuffer::AcceptMerge(b)),
+                ));
+                conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
             }
             RootAction::Reload => {
                 office.re_fill_status();
@@ -928,7 +972,7 @@ impl RootView {
             RootAction::CheckoutBranch(b) => {
                 let branch = office
                     .repo
-                    .find_branch(&self.branch[b].name, self.branch[b].b_type)
+                    .find_branch(&office.branch[b].name, office.branch[b].b_type)
                     .unwrap();
                 let tree = branch.get().peel_to_tree().unwrap();
 
@@ -953,7 +997,6 @@ impl RootView {
                 );
                 //Some(root_view.refresh(uri, office))
             }
-            RootAction::MergeBranch(_) => (),
             RootAction::ViewMore => {
                 self.limit_view += GitView::LIMIT_VIEW;
                 conn.req(
@@ -1115,22 +1158,22 @@ impl Lsp for Client {
                                     format!("{} | {} -> ", staged, unstaged),
                                 ))
                             }
-                            Some(GitView::BranchHeader) => match root_view.branch.is_empty() {
+                            Some(GitView::BranchHeader) => match office.branch.is_empty() {
                                 true => None,
                                 false => Some(Self::create_hint(
                                     i,
                                     GitView::COMMIT_HEADER.len() as u32,
-                                    format!(" {}", &root_view.branch[root_view.viewed_branch].name),
+                                    format!(" {}", &office.branch[root_view.viewed_branch].name),
                                 )),
                             },
                             Some(GitView::CommitMember { .. }) => {
                                 Some(Self::create_hint(i, 0, "- "))
                             }
                             Some(GitView::BranchMember(on_branch)) => {
-                                match root_view.branch.is_empty() {
+                                match office.branch.is_empty() {
                                     true => None,
                                     false => {
-                                        let branch = &root_view.branch[*on_branch];
+                                        let branch = &office.branch[*on_branch];
                                         let label = match (
                                             root_view.head_branch == *on_branch,
                                             branch.b_type,
@@ -1172,7 +1215,7 @@ impl Lsp for Client {
                             from_branch,
                             from_commit,
                         } => {
-                            let commit = root_view.branch[from_branch].commits[from_commit];
+                            let commit = office.branch[from_branch].commits[from_commit];
                             if let Ok(commit) = office.repo.find_commit(commit) {
                                 let mut format = String::new();
                                 DiffView::format_header(&commit, &mut format);
@@ -1248,7 +1291,7 @@ impl Lsp for Client {
                     self.conn.req(
                         ApplyWorkspaceEdit::METHOD,
                         Conn::alpha_req(),
-                        &root_view.refresh(&uri, &self.office[*office_id]),
+                        &root_view.refresh(&uri, &mut self.office[*office_id]),
                     );
                 }
                 _ => (),
@@ -1261,9 +1304,9 @@ impl Lsp for Client {
                         Some(ROOT_NAME) => {
                             let parent = PathBuf::from(p.parent().unwrap());
                             let p = parent.strip_prefix("/").unwrap();
-                            Office::new(p).map(|mut office| {
+                            Office::new(uri.clone(), p).map(|mut office| {
                                 let mut root_view = Self::new_root(&mut office);
-                                root_view.rebuild_view(&office);
+                                root_view.rebuild_view(&mut office);
                                 root_view.rebuild_format(&office);
                                 self.office.push(office);
 
@@ -1436,13 +1479,13 @@ impl Client {
                     }
                     GitView::BranchMember(i) => {
                         //let vec = ;
-                        let branch = &root_view.branch[i];
+                        let branch = &office.branch[i];
                         match branch.b_type {
                             BranchType::Local => Some(RootAction::pack(
                                 uri,
                                 &[
                                     (
-                                        format!("View {}?", &root_view.branch[i].name),
+                                        format!("View {}?", &office.branch[i].name),
                                         RootAction::ViewBranch(i),
                                         Some(CodeActionKind::SOURCE),
                                     ),
@@ -1456,7 +1499,7 @@ impl Client {
                             BranchType::Remote => Some(RootAction::pack(
                                 uri,
                                 &[(
-                                    format!("View {}?", &root_view.branch[i].name),
+                                    format!("View {}?", &office.branch[i].name),
                                     RootAction::ViewBranch(i),
                                     Some(CodeActionKind::SOURCE),
                                 )],
@@ -1498,7 +1541,7 @@ impl Client {
                     from_branch,
                     from_commit,
                 }) => {
-                    let oid = root.branch[*from_branch].commits[*from_commit];
+                    let oid = office.branch[*from_branch].commits[*from_commit];
                     match office.manifest.get(&oid) {
                         Some(uri) => (
                             Some(GotoDefinitionResponse::Scalar(Location::new(
@@ -1661,7 +1704,7 @@ impl Client {
         //let repo = &office.repo;
         //let branch = {
         let mut root = RootView {
-            branch: Vec::new(),
+            //branch: Vec::new(),
             viewed_branch: 0,
             head_branch: 0,
             limit_view: GitView::LIMIT_VIEW,
@@ -1811,8 +1854,10 @@ fn merge_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> {
         )?;
         //let tree = branch.get().peel_to_tree().unwrap();
 
-        repo.checkout_tree(other.tree()?.as_object(),Some(CheckoutBuilder::new().safe()))?;
-        
+        repo.checkout_tree(
+            other.tree()?.as_object(),
+            Some(CheckoutBuilder::new().safe()),
+        )?;
 
         //repo.checkout_head(None)?;
 
@@ -1851,8 +1896,7 @@ fn merge_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> {
     )?;
 
     // Update working tree to match the new commit.
-    repo.checkout_tree(tree.as_object(),Some(CheckoutBuilder::new().safe()))?;
-        
+    repo.checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().safe()))?;
 
     //repo.checkout_head(None)?;
 
