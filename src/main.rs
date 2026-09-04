@@ -88,14 +88,15 @@ use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
-    Location, LogMessageParams, MarkedString, MarkupContent, MessageType, OneOf, Position, Range,
-    SaveOptions, ServerCapabilities, ShowDocumentParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
-    WorkspaceEdit, lsp_request,
+    DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FoldingRange, FoldingRangeParams,
+    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, LogMessageParams,
+    MarkedString, MarkupContent, MarkupKind, MessageType, OneOf, Position, Range, SaveOptions,
+    ServerCapabilities, ShowDocumentParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
+    lsp_request,
     notification::{
         DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage, Notification,
         ShowMessage,
@@ -540,7 +541,7 @@ impl DiffView {
 
         format.push('\n');
         view.push(NormalView::Padding);
-        let message = &commit.message().unwrap_or_default(); 
+        let message = &commit.message().unwrap_or_default();
         //format.push_str(&commit.message().unwrap_or_default());
         //format.push('\n');
         //view.push(NormalView::Padding);
@@ -551,7 +552,6 @@ impl DiffView {
         }
         //view.push(NormalView::Padding);
         //view.push(NormalView::Padding);
-
 
         format.push('\n');
         //view.push(NormalView::Padding);
@@ -658,18 +658,20 @@ struct Diff {
     //repo_id: RepoId,
 }
 
-impl Diff {
+impl Diff {
     fn inlay_hint(&self, i: u32) -> Option<InlayHint> {
         match &self.diff_view {
             DiffView::Merge { .. } => None,
-            DiffView::Normal { hunk, view, parent } => {
-                match view.get(i as usize) {
-                    Some(NormalView::Hunk { from_hunk, ..}) => {
-                        let h = &hunk[*from_hunk];
-                        Some(Client::create_hint(i, 0, format!("{} -> ",h.path.to_string_lossy())))
-                    },
-                    _ => None
+            DiffView::Normal { hunk, view, parent } => match view.get(i as usize) {
+                Some(NormalView::Hunk { from_hunk, .. }) => {
+                    let h = &hunk[*from_hunk];
+                    Some(Client::create_hint(
+                        i,
+                        0,
+                        format!("{} -> ", h.path.to_string_lossy()),
+                    ))
                 }
+                _ => None,
             },
         }
     }
@@ -767,6 +769,70 @@ struct RootView {
 }
 
 impl RootView {
+    fn hover(&mut self, i: usize, office: &Office) -> Option<Hover> {
+        match self.view.get(i) {
+            //GitView::BranchHeader => todo!(),
+            Some(GitView::BranchMember(b)) => {
+                let branch = &office.branch[i];
+                //let target = &office.branch[i].name;
+                match office.repo.find_branch(&branch.name, branch.b_type) {
+                    Ok(b) => {
+                        let head = office.repo.head().unwrap();
+                        let current = head.peel_to_commit().unwrap();
+                        let subject = b.get().peel_to_commit().unwrap();
+                        let index = office.repo.merge_commits(&current, &subject, None).unwrap();
+                        if !index.has_conflicts() {
+                            return Some(Hover {
+                                contents: HoverContents::Scalar(MarkedString::String(
+                                    "Clean branch, no conflict".into(),
+                                )),
+                                range: None,
+                            });
+                        }
+                        let mut value = String::new();
+                        value.push_str("# Potential conflicts detected!\n\n");
+                        //value.push_str("---\n");
+                        /// TO-DO: Finish this formatting for marge diagnostic!
+
+                        for (i, conf) in index.conflicts().unwrap().enumerate() {
+                            conf.map(|conflict| {
+                                conflict.their.map(|their| {
+                                    their.path
+                                });
+                            });
+                        }
+                        Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value,
+                            }),
+                            range: None,
+                        })
+                        // The branch we're merging INTO current HEAD
+                    }
+                    Err(_) => None,
+                }
+            }
+            //GitView::CommitHeader => todo!(),
+            Some(GitView::CommitMember {
+                from_branch,
+                from_commit,
+            }) => {
+                let commit = office.branch[*from_branch].commits[*from_commit];
+                if let Ok(commit) = office.repo.find_commit(commit) {
+                    let mut format = String::new();
+                    DiffView::format_header(&commit, &mut format);
+                    return Some(Hover {
+                        contents: HoverContents::Scalar(MarkedString::String(format)),
+                        range: None,
+                    });
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn inlay_hint(&self, i: u32, office: &Office) -> Option<InlayHint> {
         let root_view = self;
         match root_view.view.get(i as usize) {
@@ -1022,7 +1088,7 @@ impl RootView {
             RootAction::StageFile(file_id) => {
                 let (file, status) = &office.status[file_id];
                 office.repo.index().map(|mut index| {
-                    if status.is_wt_deleted() {
+                    if status.is_wt_deleted() {
                         index.remove_path(&file);
                     } else {
                         index.add_path(&file);
@@ -1243,36 +1309,15 @@ impl Lsp for Client {
             let office = &mut self.office[*office_id];
             match wg {
                 WorkGroup::RootView(root_view) => {
-                    match root_view.view[idx] {
-                        //GitView::BranchHeader => todo!(),
-                        GitView::BranchMember(_) => (),
-                        //GitView::CommitHeader => todo!(),
-                        GitView::CommitMember {
-                            from_branch,
-                            from_commit,
-                        } => {
-                            let commit = office.branch[from_branch].commits[from_commit];
-                            if let Ok(commit) = office.repo.find_commit(commit) {
-                                let mut format = String::new();
-                                DiffView::format_header(&commit, &mut format);
-                                self.conn.ok(
-                                    id,
-                                    &Hover {
-                                        contents: HoverContents::Scalar(MarkedString::String(
-                                            format,
-                                        )),
-                                        range: None,
-                                    },
-                                );
-                            }
-                        }
-                        _ => (),
+                    let res = root_view.hover(idx, office);
+                    if let Some(hover) = res {
+                        self.conn.ok(id, &hover);
                     }
                 }
-                //WorkGroup::DiffView(diff) => todo!(),
-                //WorkGroup::FileView => todo!(),
                 _ => (),
             }
+            //WorkGroup::DiffView(diff) => todo!(),
+            //WorkGroup::FileView => todo!(),
         }
     }
 
@@ -1805,6 +1850,9 @@ fn main() {
                 ..Default::default()
             },
         )),
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+            DiagnosticOptions::default(),
+        )),
         //folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         inlay_hint_provider: Some(OneOf::Left(true)),
@@ -1899,9 +1947,17 @@ fn merge_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> {
 
         return Ok(());
     }
-
+    let i = repo.merge_commits(&current, &other, None).unwrap();
+    i.has_conflicts();
+    for conf in i.conflicts().unwrap() {
+        conf.map(|conflict| {
+            conflict.ancestor; // common ancestor duh
+            conflict.our; // HEAD
+            conflict.their; // commit yang mau merge
+        });
+    }
     // Real three-way merge.
-    repo.merge(&[&annotated], None, None)?;
+    //repo.merge(&[&annotated], None, None)?;
 
     // Check whether Git produced conflicts.
     let mut index = repo.index()?;
