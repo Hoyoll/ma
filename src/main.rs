@@ -72,6 +72,7 @@ use std::{
     collections::HashMap,
     fs,
     hash::Hash,
+    io::BufRead,
     path::{Component, Path, PathBuf, Prefix},
     process::Command,
     str::FromStr,
@@ -789,16 +790,56 @@ impl RootView {
                                 range: None,
                             });
                         }
+                        enum FileMerge {
+                            Our,
+                            Their,
+                            None
+                        }
                         let mut value = String::new();
                         value.push_str("# Potential conflicts detected!\n\n");
                         //value.push_str("---\n");
                         /// TO-DO: Finish this formatting for marge diagnostic!
-
-                        for (i, conf) in index.conflicts().unwrap().enumerate() {
+                        for (i, conf) in index.conflicts().unwrap().enumerate() {
                             conf.map(|conflict| {
-                                conflict.their.map(|their| {
-                                    their.path
-                                });
+                                let res = office
+                                    .repo
+                                    .merge_file_from_index(
+                                        &conflict.ancestor.unwrap(),
+                                        &conflict.our.unwrap(),
+                                        &conflict.their.unwrap(),
+                                        None,
+                                    )
+                                    .unwrap();
+                                let mut their_line = 0;
+                                let mut our_line = 0;
+                                let mut fm = FileMerge::None;
+                                for line in res.content().split(|&s| s == b'\n') {
+                                    match line {
+                                        _ if line.starts_with(b"<<<<<<<") => {
+                                            fm = FileMerge::Our;
+                                        }
+                                        _ if line.starts_with(b"=======") => {
+                                            fm = FileMerge::Their;
+                                        }
+                                        _ if line.starts_with(b">>>>>>>") => {
+                                            fm = FileMerge::None;
+                                        }
+                                        l => {
+                                            match fm {
+                                                FileMerge::Our => {
+                                                    our_line += 1;
+                                                },
+                                                FileMerge::Their => {
+                                                    their_line += 1;
+                                                },
+                                                FileMerge::None => {
+                                                    their_line += 1;
+                                                    our_line += 1;
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
                             });
                         }
                         Some(Hover {
