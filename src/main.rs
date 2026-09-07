@@ -215,6 +215,10 @@ enum WorkGroup {
     DiffView(Diff),
     InputBuffer(InputBuffer),
     FileView,
+    //BranchConflict {
+    //    merge_target: String,
+    //    merge_subject: String,
+    //},
 }
 
 enum InputBuffer {
@@ -716,7 +720,7 @@ enum RootAction {
     StageFile(usize),
     UnstageFile(usize),
     //ReplaceFile(usize),
-    MergeBranch(usize),
+    //MergeBranch(usize),
     ViewBranch(usize),
     CheckoutBranch(usize),
     ViewMore,
@@ -774,14 +778,14 @@ impl RootView {
         match self.view.get(i) {
             //GitView::BranchHeader => todo!(),
             Some(GitView::BranchMember(b)) => {
-                let branch = &office.branch[i];
+                let branch = &office.branch[*b];
                 //let target = &office.branch[i].name;
                 match office.repo.find_branch(&branch.name, branch.b_type) {
                     Ok(b) => {
                         let head = office.repo.head().unwrap();
-                        let current = head.peel_to_commit().unwrap();
-                        let subject = b.get().peel_to_commit().unwrap();
-                        let index = office.repo.merge_commits(&current, &subject, None).unwrap();
+                        let current = head.peel_to_commit().unwrap(); 
+                        let subject = b.get().peel_to_commit().unwrap();  
+                        let index = office.repo.merge_commits(&current, &subject, None).unwrap(); 
                         if !index.has_conflicts() {
                             return Some(Hover {
                                 contents: HoverContents::Scalar(MarkedString::String(
@@ -796,41 +800,57 @@ impl RootView {
                             None
                         }
                         let mut value = String::new();
-                        value.push_str("# Potential conflicts detected!\n\n");
-                        //value.push_str("---\n");
-                        /// TO-DO: Finish this formatting for marge diagnostic!
-                        for (i, conf) in index.conflicts().unwrap().enumerate() {
+                        
+                        value.push_str("# Potential merge conflicts detected on:\n"); 
+                        
+                        for conf in index.conflicts().unwrap() {
                             conf.map(|conflict| {
                                 let res = office
                                     .repo
                                     .merge_file_from_index(
                                         &conflict.ancestor.unwrap(),
-                                        &conflict.our.unwrap(),
-                                        &conflict.their.unwrap(),
+                                        &conflict.our.as_ref().unwrap(),
+                                        &conflict.their.as_ref().unwrap(),
                                         None,
                                     )
                                     .unwrap();
                                 let mut their_line = 0;
                                 let mut our_line = 0;
                                 let mut fm = FileMerge::None;
+                                
+                                value.push('\n');
+                                value.push_str(&format!("< {}: {}\n",head.name().unwrap(), String::from_utf8_lossy(&conflict.our.unwrap().path)));
+                                value.push_str(&format!("> {}: {}\n",&branch.name, String::from_utf8_lossy(&conflict.their.unwrap().path))); 
+                                
                                 for line in res.content().split(|&s| s == b'\n') {
+                                    //value.push_str(&format!("{}\n", String::from_utf8_lossy(line)));
                                     match line {
                                         _ if line.starts_with(b"<<<<<<<") => {
                                             fm = FileMerge::Our;
+                                            value.push_str("<<<<<<<\n");
+                                            
+                                            value.push_str("```\n");
                                         }
                                         _ if line.starts_with(b"=======") => {
                                             fm = FileMerge::Their;
+                                            value.push_str("```\n");
+                                            value.push_str("=======\n");
+                                            value.push_str("```\n");
                                         }
                                         _ if line.starts_with(b">>>>>>>") => {
                                             fm = FileMerge::None;
+                                            value.push_str("```\n");
+                                            value.push_str(">>>>>>>\n");
                                         }
                                         l => {
                                             match fm {
                                                 FileMerge::Our => {
                                                     our_line += 1;
+                                                    value.push_str(&format!("{our_line} {}\n", String::from_utf8_lossy(l)));
                                                 },
                                                 FileMerge::Their => {
                                                     their_line += 1;
+                                                    value.push_str(&format!("{their_line} {}\n", String::from_utf8_lossy(l)));
                                                 },
                                                 FileMerge::None => {
                                                     their_line += 1;
@@ -1100,21 +1120,7 @@ impl RootView {
                     WorkGroup::InputBuffer(InputBuffer::AcceptCommit),
                 ));
                 conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
-            }
-            RootAction::MergeBranch(b) => {
-                let show = ShowDocumentParams {
-                    uri: office.ma_input.clone(),
-                    external: Some(false),
-                    take_focus: Some(true),
-                    selection: None,
-                };
-
-                *wg = Some((
-                    office.ma_input.clone(),
-                    WorkGroup::InputBuffer(InputBuffer::AcceptMerge(b)),
-                ));
-                conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
-            }
+            } 
             RootAction::Reload => {
                 office.manifest.clear();
                 office.re_fill_status();
