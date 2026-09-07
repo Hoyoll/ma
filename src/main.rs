@@ -783,9 +783,9 @@ impl RootView {
                 match office.repo.find_branch(&branch.name, branch.b_type) {
                     Ok(b) => {
                         let head = office.repo.head().unwrap();
-                        let current = head.peel_to_commit().unwrap(); 
-                        let subject = b.get().peel_to_commit().unwrap();  
-                        let index = office.repo.merge_commits(&current, &subject, None).unwrap(); 
+                        let current = head.peel_to_commit().unwrap();
+                        let subject = b.get().peel_to_commit().unwrap();
+                        let index = office.repo.merge_commits(&current, &subject, None).unwrap();
                         if !index.has_conflicts() {
                             return Some(Hover {
                                 contents: HoverContents::Scalar(MarkedString::String(
@@ -797,64 +797,100 @@ impl RootView {
                         enum FileMerge {
                             Our,
                             Their,
-                            None
+                            None,
                         }
                         let mut value = String::new();
-                        
-                        value.push_str("# Potential merge conflicts detected on:\n"); 
-                        
+
+                        value.push_str("# Potential merge conflicts detected!\n");
+
                         for conf in index.conflicts().unwrap() {
                             conf.map(|conflict| {
-                                let res = office
-                                    .repo
-                                    .merge_file_from_index(
-                                        &conflict.ancestor.unwrap(),
-                                        &conflict.our.as_ref().unwrap(),
-                                        &conflict.their.as_ref().unwrap(),
-                                        None,
-                                    )
-                                    .unwrap();
-                                let mut their_line = 0;
-                                let mut our_line = 0;
-                                let mut fm = FileMerge::None;
-                                
                                 value.push('\n');
-                                value.push_str(&format!("< {}: {}\n",head.name().unwrap(), String::from_utf8_lossy(&conflict.our.unwrap().path)));
-                                value.push_str(&format!("> {}: {}\n",&branch.name, String::from_utf8_lossy(&conflict.their.unwrap().path))); 
-                                
-                                for line in res.content().split(|&s| s == b'\n') {
-                                    //value.push_str(&format!("{}\n", String::from_utf8_lossy(line)));
-                                    match line {
-                                        _ if line.starts_with(b"<<<<<<<") => {
-                                            fm = FileMerge::Our;
-                                            value.push_str("<<<<<<<\n");
-                                            
-                                            value.push_str("```\n");
-                                        }
-                                        _ if line.starts_with(b"=======") => {
-                                            fm = FileMerge::Their;
-                                            value.push_str("```\n");
-                                            value.push_str("=======\n");
-                                            value.push_str("```\n");
-                                        }
-                                        _ if line.starts_with(b">>>>>>>") => {
-                                            fm = FileMerge::None;
-                                            value.push_str("```\n");
-                                            value.push_str(">>>>>>>\n");
-                                        }
-                                        l => {
-                                            match fm {
-                                                FileMerge::Our => {
-                                                    our_line += 1;
-                                                    value.push_str(&format!("{our_line} {}\n", String::from_utf8_lossy(l)));
-                                                },
-                                                FileMerge::Their => {
-                                                    their_line += 1;
-                                                    value.push_str(&format!("{their_line} {}\n", String::from_utf8_lossy(l)));
-                                                },
-                                                FileMerge::None => {
-                                                    their_line += 1;
-                                                    our_line += 1;
+                                match conflict.ancestor {
+                                    None => {
+                                        value.push_str("Cause: No common ancestor\n");
+                                        value.push_str(&format!(
+                                            "< {}: {}\n",
+                                            head.shorthand().unwrap(),
+                                            String::from_utf8_lossy(&conflict.our.unwrap().path)
+                                        ));
+                                        value.push_str(&format!(
+                                            "> {}: {}\n",
+                                            &branch.name,
+                                            String::from_utf8_lossy(&conflict.their.unwrap().path)
+                                        ));
+                                    }
+                                    Some(ancestor) => {
+                                        value.push_str("Cause: Conflicting lines\n");
+
+                                        let res = office
+                                            .repo
+                                            .merge_file_from_index(
+                                                &ancestor,
+                                                &conflict.our.as_ref().unwrap(),
+                                                &conflict.their.as_ref().unwrap(),
+                                                None,
+                                            )
+                                            .unwrap();
+                                        let mut their_line = 0;
+                                        let mut our_line = 0;
+                                        let mut fm = FileMerge::None;
+
+                                        let full = PathBuf::from_str(&String::from_utf8_lossy(
+                                            &conflict.our.as_ref().unwrap().path,
+                                        ))
+                                        .unwrap();
+                                        let ex = markdown_language(&full);
+                                        value.push_str(&format!(
+                                            "< {}: {}\n",
+                                            head.shorthand().unwrap(),
+                                            String::from_utf8_lossy(&conflict.our.unwrap().path)
+                                        ));
+                                        value.push_str(&format!(
+                                            "> {}: {}\n",
+                                            &branch.name,
+                                            String::from_utf8_lossy(&conflict.their.unwrap().path)
+                                        ));
+
+                                        for line in res.content().split(|&s| s == b'\n') {
+                                            //value.push_str(&format!("{}\n", String::from_utf8_lossy(line)));
+                                            match line {
+                                                _ if line.starts_with(b"<<<<<<<") => {
+                                                    fm = FileMerge::Our;
+                                                    value.push_str("<<<<<<<\n");
+
+                                                    value.push_str(&format!("```{}\n", &ex));
+                                                }
+                                                _ if line.starts_with(b"=======") => {
+                                                    fm = FileMerge::Their;
+                                                    value.push_str("```\n");
+                                                    value.push_str("=======\n");
+                                                    value.push_str(&format!("```{}\n", &ex));
+                                                }
+                                                _ if line.starts_with(b">>>>>>>") => {
+                                                    fm = FileMerge::None;
+                                                    value.push_str("```\n");
+                                                    value.push_str(">>>>>>>\n");
+                                                }
+                                                l => match fm {
+                                                    FileMerge::Our => {
+                                                        our_line += 1;
+                                                        value.push_str(&format!(
+                                                            "{our_line} {}\n",
+                                                            String::from_utf8_lossy(l)
+                                                        ));
+                                                    }
+                                                    FileMerge::Their => {
+                                                        their_line += 1;
+                                                        value.push_str(&format!(
+                                                            "{their_line} {}\n",
+                                                            String::from_utf8_lossy(l)
+                                                        ));
+                                                    }
+                                                    FileMerge::None => {
+                                                        their_line += 1;
+                                                        our_line += 1;
+                                                    }
                                                 },
                                             }
                                         }
@@ -1120,7 +1156,7 @@ impl RootView {
                     WorkGroup::InputBuffer(InputBuffer::AcceptCommit),
                 ));
                 conn.req(ShowDocument::METHOD, Conn::alpha_req(), &show);
-            } 
+            }
             RootAction::Reload => {
                 office.manifest.clear();
                 office.re_fill_status();
@@ -1951,6 +1987,106 @@ pub fn name_to_url(path: &Path) -> Option<Uri> {
         }
     }
     raw.parse().ok()
+}
+
+fn markdown_language(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        // Systems
+        Some("rs") => "rust",
+        Some("c") => "c",
+        Some("h") => "c",
+        Some("cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx") => "cpp",
+        Some("m") => "objective-c",
+        Some("mm") => "objective-cpp",
+        Some("zig") => "zig",
+        Some("asm" | "s") => "asm",
+
+        // JVM
+        Some("java") => "java",
+        Some("kt" | "kts") => "kotlin",
+        Some("scala") => "scala",
+        Some("groovy") => "groovy",
+
+        // .NET
+        Some("cs") => "csharp",
+        Some("fs" | "fsx" | "fsi") => "fsharp",
+        Some("vb") => "vbnet",
+
+        // JavaScript / TypeScript
+        Some("js" | "mjs" | "cjs") => "javascript",
+        Some("jsx") => "jsx",
+        Some("ts") => "typescript",
+        Some("tsx") => "tsx",
+
+        // Python / scripting
+        Some("py" | "pyw" | "pyi") => "python",
+        Some("rb") => "ruby",
+        Some("php") => "php",
+        Some("pl" | "pm") => "perl",
+        Some("lua") => "lua",
+        Some("r") => "r",
+        Some("dart") => "dart",
+        Some("ex" | "exs") => "elixir",
+        Some("erl" | "hrl") => "erlang",
+        Some("clj" | "cljs" | "cljc") => "clojure",
+        Some("groovy") => "groovy",
+
+        // Go / functional
+        Some("go") => "go",
+        Some("hs" | "lhs") => "haskell",
+        Some("ml" | "mli") => "ocaml",
+        Some("fs" | "fsx") => "fsharp",
+        Some("swift") => "swift",
+
+        // Web
+        Some("html" | "htm") => "html",
+        Some("css") => "css",
+        Some("scss") => "scss",
+        Some("sass") => "sass",
+        Some("less") => "less",
+        Some("vue") => "vue",
+        Some("svelte") => "svelte",
+        Some("astro") => "astro",
+
+        // Data / config
+        Some("json" | "jsonc") => "json",
+        Some("yaml" | "yml") => "yaml",
+        Some("toml") => "toml",
+        Some("xml") => "xml",
+        Some("ini") => "ini",
+        Some("csv") => "csv",
+
+        // Shell
+        Some("sh" | "bash") => "bash",
+        Some("zsh") => "zsh",
+        Some("fish") => "fish",
+        Some("ps1" | "psm1") => "powershell",
+        Some("bat" | "cmd") => "bat",
+
+        // SQL
+        Some("sql") => "sql",
+
+        // Mobile
+        Some("swift") => "swift",
+        Some("m") => "objective-c",
+        Some("dart") => "dart",
+
+        // Functional / misc
+        Some("clj" | "cljs" | "cljc") => "clojure",
+        Some("lisp" | "lsp" | "cl") => "lisp",
+        Some("sol") => "solidity",
+        Some("asm" | "s") => "asm",
+        Some("v") => "verilog",
+        Some("vhd" | "vhdl") => "vhdl",
+
+        // Documentation / markup
+        Some("md" | "markdown" | "mdx") => "markdown",
+        Some("rst") => "rst",
+        Some("tex") => "latex",
+
+        // Default
+        _ => "text",
+    }
 }
 
 fn merge_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> {
