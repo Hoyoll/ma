@@ -879,54 +879,56 @@ impl RootView {
                         for conf in index.conflicts().unwrap() {
                             conf.map(|conflict| {
                                 value.push('\n');
-                                match (
-                                    conflict.ancestor.as_ref(),
-                                    conflict.our.as_ref(),
-                                    conflict.their.as_ref(),
-                                ) {
+                                match (conflict.ancestor, conflict.our, conflict.their) {
                                     (Some(ancestor), Some(our), Some(their)) => {
                                         let res = office
                                             .repo
-                                            .merge_file_from_index(&ancestor, our, their, None)
+                                            .merge_file_from_index(&ancestor, &our, &their, None)
                                             .unwrap();
                                         let mut their_line = 0;
                                         let mut our_line = 0;
                                         let mut fm = FileMerge::None;
 
-                                        let full = PathBuf::from_str(&String::from_utf8_lossy(
-                                            &conflict.our.as_ref().unwrap().path,
-                                        ))
-                                        .unwrap();
+                                        let full =
+                                            PathBuf::from_str(&String::from_utf8_lossy(&our.path))
+                                                .unwrap();
                                         let ex = markdown_language(&full);
+                                        let our_path = String::from_utf8_lossy(&our.path);
+                                        let their_path = String::from_utf8_lossy(&their.path);
+                                        value.push_str(&format!("Cause: Conflicting contents in `{}`\n", &their_path));
+
                                         value.push_str(&format!(
-                                            "< {}: {}\n",
-                                            head.shorthand().unwrap(),
-                                            String::from_utf8_lossy(&conflict.our.unwrap().path)
-                                        ));
-                                        value.push_str(&format!(
-                                            "> {}: {}\n",
-                                            &branch.name,
-                                            String::from_utf8_lossy(&conflict.their.unwrap().path)
+                                            "`^` ancestor: `{}`\n",
+                                            String::from_utf8_lossy(&ancestor.path)
                                         ));
 
                                         for line in res.content().split(|&s| s == b'\n') {
                                             match line {
                                                 _ if line.starts_with(b"<<<<<<<") => {
                                                     fm = FileMerge::Our;
-                                                    value.push_str("<<<<<<<\n");
-
+                                                    value.push_str(&format!(
+                                                        "`<<<<<<<` {}: `{}`\n",
+                                                        head.shorthand().unwrap(),
+                                                        &our_path
+                                                    ));
                                                     value.push_str(&format!("```{}\n", &ex));
                                                 }
                                                 _ if line.starts_with(b"=======") => {
                                                     fm = FileMerge::Their;
                                                     value.push_str("```\n");
-                                                    value.push_str("=======\n");
+                                                    value.push_str("`=======`\n");
                                                     value.push_str(&format!("```{}\n", &ex));
                                                 }
                                                 _ if line.starts_with(b">>>>>>>") => {
                                                     fm = FileMerge::None;
                                                     value.push_str("```\n");
-                                                    value.push_str(">>>>>>>\n");
+
+                                                    value.push_str(&format!(
+                                                        "`>>>>>>>` {}: `{}`\n",
+                                                        &branch.name,
+                                                        &their_path
+                                                    ));
+                                                    //value.push_str(">>>>>>>\n");
                                                 }
                                                 l => match fm {
                                                     FileMerge::Our => {
@@ -951,19 +953,65 @@ impl RootView {
                                             }
                                         }
                                     }
-                                    (Some(ancestor), Some(our), None) => {}
-                                    (Some(ancestor), None, Some(their)) => {}
-                                    (None, Some(our), Some(their)) => {
-                                        value.push_str("Cause: No common ancestor\n");
+                                    (Some(ancestor), Some(our), None) => {
                                         value.push_str(&format!(
-                                            "< {}: {}\n",
+                                            "Cause: `{}` was deleted in `{}`, modified in `{}`\n",
+                                            String::from_utf8_lossy(&our.path),
+                                            &branch.name,
                                             head.shorthand().unwrap(),
-                                            String::from_utf8_lossy(&conflict.our.unwrap().path)
                                         ));
                                         value.push_str(&format!(
-                                            "> {}: {}\n",
+                                            "`^` ancestor: `{}`\n",
+                                            String::from_utf8_lossy(&ancestor.path)
+                                        ));
+
+                                        value.push_str(&format!(
+                                            "`<` {}: `{}`\n",
+                                            head.shorthand().unwrap(),
+                                            String::from_utf8_lossy(&our.path)
+                                        ));
+
+                                        value.push_str(&format!(
+                                            "`>` {}: Does not exist\n",
                                             &branch.name,
-                                            String::from_utf8_lossy(&conflict.their.unwrap().path)
+                                        ));
+                                    }
+                                    (Some(ancestor), None, Some(their)) => {
+                                        value.push_str(&format!(
+                                            "Cause: `{}` was deleted in `{}`, modified in `{}`\n",
+                                            String::from_utf8_lossy(&their.path),
+                                            head.shorthand().unwrap(),
+                                            &branch.name
+                                        ));
+                                        value.push_str(&format!(
+                                            "`^` ancestor: `{}`\n",
+                                            String::from_utf8_lossy(&ancestor.path)
+                                        ));
+                                        value.push_str(&format!(
+                                            "`<` {}: Does not exist\n",
+                                            head.shorthand().unwrap(),
+                                        ));
+                                        value.push_str(&format!(
+                                            "`>` {}: `{}`\n",
+                                            &branch.name,
+                                            String::from_utf8_lossy(&their.path)
+                                        ));
+                                    }
+                                    (None, Some(our), Some(their)) => {
+                                        value.push_str(
+                                            "Cause: Conflicting `add` in both branches\n",
+                                        );
+
+                                        value.push_str("`^` ancestor: Does not exist!\n");
+                                        value.push_str(&format!(
+                                            "`<` {}: `{}`\n",
+                                            head.shorthand().unwrap(),
+                                            String::from_utf8_lossy(&our.path)
+                                        ));
+                                        value.push_str(&format!(
+                                            "`>` {}: `{}`\n",
+                                            &branch.name,
+                                            String::from_utf8_lossy(&their.path)
                                         ));
                                     }
                                     _ => {}
