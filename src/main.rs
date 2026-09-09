@@ -74,7 +74,7 @@ use std::{
     hash::Hash,
     io::BufRead,
     path::{Component, Path, PathBuf, Prefix},
-    process::Command,
+    process::{self, Command},
     str::FromStr,
     usize,
 };
@@ -759,7 +759,7 @@ enum RootAction {
     StageFile(usize),
     UnstageFile(usize),
     //ReplaceFile(usize),
-    //MergeBranch(usize),
+    MergeBranch(usize),
     ViewBranch(usize),
     CheckoutBranch(usize),
     ViewMore,
@@ -895,7 +895,10 @@ impl RootView {
                                         let ex = markdown_language(&full);
                                         let our_path = String::from_utf8_lossy(&our.path);
                                         let their_path = String::from_utf8_lossy(&their.path);
-                                        value.push_str(&format!("Cause: Conflicting contents in `{}`\n", &their_path));
+                                        value.push_str(&format!(
+                                            "Cause: Conflicting contents in `{}`\n",
+                                            &their_path
+                                        ));
 
                                         value.push_str(&format!(
                                             "`^` ancestor: `{}`\n",
@@ -925,8 +928,7 @@ impl RootView {
 
                                                     value.push_str(&format!(
                                                         "`>>>>>>>` {}: `{}`\n",
-                                                        &branch.name,
-                                                        &their_path
+                                                        &branch.name, &their_path
                                                     ));
                                                     //value.push_str(">>>>>>>\n");
                                                 }
@@ -1319,6 +1321,19 @@ impl RootView {
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
             }
+            RootAction::MergeBranch(b) => {
+                let mut proc = process::Command::new("git");
+                proc.args(&["merge", &office.branch[b].name]);
+                let mut sp = proc.spawn().unwrap();
+                let status = sp.wait().unwrap();
+                match status.code() {
+                    Some(0) => {
+                        conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
+                    }
+                    Some(code) => (),
+                    None => (),
+                }
+            }
             //RootAction::MergeBranch(b) => {
             //    let show = ShowDocumentParams {
             //        uri: office.ma_input.clone(),
@@ -1625,52 +1640,6 @@ impl Lsp for Client {
 }
 
 impl Client {
-    fn work_group_folding(wg: &WorkGroup, uri: &lsp_types::Uri) -> Option<impl Serialize + use<>> {
-        return None;
-        match wg {
-            WorkGroup::RootView(root_view) => {
-                let mut ret = Vec::new();
-                let mut start = 0;
-                let mut end = 0;
-                for (idx, giv) in root_view.view.iter().enumerate() {
-                    match giv {
-                        GitView::Command => (),
-                        GitView::NewLine => (),
-                        GitView::BranchHeader => {
-                            start = idx + 1;
-                        }
-                        GitView::BranchMember(_) => match root_view.view.get(idx) {
-                            Some(GitView::BranchMember(_)) => (),
-                            _ => {
-                                ret.push(FoldingRange {
-                                    start_line: start as u32,
-                                    end_line: end as u32,
-                                    ..Default::default()
-                                });
-                            }
-                        },
-                        GitView::CommitHeader => {
-                            start = idx;
-                        }
-                        GitView::CommitMember { .. } => match root_view.view.get(idx) {
-                            Some(GitView::CommitMember { .. }) => (),
-                            _ => {
-                                ret.push(FoldingRange {
-                                    start_line: start as u32,
-                                    end_line: end as u32,
-                                    ..Default::default()
-                                });
-                            }
-                        },
-                        _ => (),
-                    }
-                }
-                Some(ret)
-            }
-            WorkGroup::DiffView(diff) => None,
-            _ => None, //WorkGroup::FileView => todo!(),
-        }
-    }
 
     fn work_group_action(
         wg: &mut WorkGroup,
@@ -1769,14 +1738,56 @@ impl Client {
                                             None,
                                         )],
                                     )),
-                                    (false, true) => Some(RootAction::pack(
-                                        uri,
-                                        &[(
-                                            format!("Checkout {}?", &branch.name),
-                                            RootAction::CheckoutBranch(i),
-                                            None,
-                                        )],
-                                    )),
+                                    (false, true) => {
+                                        match office
+                                            .repo
+                                            .find_branch(&branch.name, branch.b_type)
+                                            .ok()
+                                        {
+                                            None => Some(RootAction::pack(
+                                                uri,
+                                                &[(
+                                                    format!("Checkout {}?", &branch.name),
+                                                    RootAction::CheckoutBranch(i),
+                                                    None,
+                                                )],
+                                            )),
+                                            Some(b) => {
+                                                let head = office.repo.head().unwrap();
+                                                let current = head.peel_to_commit().unwrap();
+                                                let subject = b.get().peel_to_commit().unwrap();
+                                                let index = office
+                                                    .repo
+                                                    .merge_commits(&current, &subject, None)
+                                                    .unwrap();
+                                                if index.has_conflicts() {
+                                                    return Some(RootAction::pack(
+                                                        uri,
+                                                        &[(
+                                                            format!("Checkout {}?", &branch.name),
+                                                            RootAction::CheckoutBranch(i),
+                                                            None,
+                                                        )],
+                                                    ));
+                                                }
+                                                Some(RootAction::pack(
+                                                    uri,
+                                                    &[
+                                                        (
+                                                            format!("Checkout {}?", &branch.name),
+                                                            RootAction::CheckoutBranch(i),
+                                                            None,
+                                                        ),
+                                                        (
+                                                            "Merge to HEAD?".into(),
+                                                            RootAction::MergeBranch(i),
+                                                            None,
+                                                        ),
+                                                    ],
+                                                ))
+                                            }
+                                        }
+                                    }
                                     (false, false) => Some(RootAction::pack(
                                         uri,
                                         &[
