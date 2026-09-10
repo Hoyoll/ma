@@ -1,7 +1,7 @@
 trait Lsp {
     fn hover(&mut self, id: RequestId, params: HoverParams);
     fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams);
-    fn folding(&mut self, id: RequestId, params: FoldingRangeParams);
+    //fn folding(&mut self, id: RequestId, params: FoldingRangeParams);
     fn code_action(&mut self, id: RequestId, params: CodeActionParams);
     fn inlay_hint(&mut self, id: RequestId, params: InlayHintParams);
     fn handle_request(&mut self, request: lsp_server::Request) {
@@ -14,11 +14,6 @@ trait Lsp {
             GotoDefinition::METHOD => {
                 serde_json::from_value(request.params).map(|params: GotoDefinitionParams| {
                     self.goto_definition(request.id, params);
-                });
-            }
-            FoldingRangeRequest::METHOD => {
-                serde_json::from_value(request.params).map(|params: FoldingRangeParams| {
-                    self.folding(request.id, params);
                 });
             }
             CodeActionRequest::METHOD => {
@@ -356,6 +351,8 @@ struct Office {
     ma_root: Uri,
     ma_input: Uri,
     branch: Vec<Branch>,
+    head_branch: usize,
+    viewed_branch: usize,
     //repo_state: RepoState,
 }
 
@@ -375,12 +372,49 @@ impl Office {
                     ma_root,
                     ma_input,
                     branch: Vec::new(),
+                    head_branch: 0,
+                    viewed_branch: 0,
                     //repo_state: RepoState::AcceptNothing,
                 };
                 office.re_fill_status();
+                office.reload_branch();
                 Some(office)
             }
             Err(_) => None,
+        }
+    }
+
+    fn reload_branch(&mut self) {
+        self.branch.clear();
+        if let Ok(branches) = self.repo.branches(None) {
+            for (i, branch) in branches.enumerate() {
+                branch.map(|(branch, b_type)| {
+                    if branch.is_head() {
+                        self.head_branch = i;
+                        self.viewed_branch = i;
+                    }
+                    let commits = {
+                        let mut c = Vec::default();
+                        branch.get().peel_to_commit().map(|commit| {
+                            let mut revwalk = self.repo.revwalk().unwrap();
+
+                            revwalk.push(commit.id());
+                            revwalk.set_sorting(Sort::TIME);
+                            for res in revwalk {
+                                res.map(|id| {
+                                    c.push(id);
+                                });
+                            }
+                        });
+                        c
+                    };
+                    self.branch.push(Branch {
+                        name: branch.name().unwrap().unwrap().to_string(),
+                        b_type,
+                        commits,
+                    });
+                });
+            }
         }
     }
 
@@ -805,8 +839,8 @@ impl RootAction {
 //#[derive(Default)]
 struct RootView {
     //branch: Vec<Branch>,
-    viewed_branch: usize,
-    head_branch: usize,
+    //viewed_branch: usize,
+    //head_branch: usize,
     limit_view: usize,
     format: String,
     view: Vec<GitView>,
@@ -1102,7 +1136,7 @@ impl RootView {
                 false => Some(Client::create_hint(
                     i,
                     GitView::COMMIT_HEADER.len() as u32,
-                    format!(" {}", &office.branch[root_view.viewed_branch].name),
+                    format!(" {}", &office.branch[office.viewed_branch].name),
                 )),
             },
             Some(GitView::CommitMember { .. }) => Some(Client::create_hint(i, 0, "- ")),
@@ -1110,7 +1144,7 @@ impl RootView {
                 true => None,
                 false => {
                     let branch = &office.branch[*on_branch];
-                    let label = match (root_view.head_branch == *on_branch, branch.b_type) {
+                    let label = match (office.head_branch == *on_branch, branch.b_type) {
                         (true, BranchType::Local) => "L HEAD -> ",
                         (true, BranchType::Remote) => "R HEAD -> ",
                         (false, BranchType::Local) => "L      -> ",
@@ -1121,44 +1155,11 @@ impl RootView {
             },
             _ => None,
         }
-    }
-
-    fn reload_branch(&mut self, office: &mut Office) {
-        office.branch.clear();
-        if let Ok(branches) = office.repo.branches(None) {
-            for (i, branch) in branches.enumerate() {
-                branch.map(|(branch, b_type)| {
-                    if branch.is_head() {
-                        self.head_branch = i;
-                        self.viewed_branch = i;
-                    }
-                    let commits = {
-                        let mut c = Vec::default();
-                        branch.get().peel_to_commit().map(|commit| {
-                            let mut revwalk = office.repo.revwalk().unwrap();
-
-                            revwalk.push(commit.id());
-                            revwalk.set_sorting(Sort::TIME);
-                            for res in revwalk {
-                                res.map(|id| {
-                                    c.push(id);
-                                });
-                            }
-                        });
-                        c
-                    };
-                    office.branch.push(Branch {
-                        name: branch.name().unwrap().unwrap().to_string(),
-                        b_type,
-                        commits,
-                    });
-                });
-            }
-        }
-    }
+    } 
 
     fn refresh(&mut self, uri: &lsp_types::Uri, office: &Office) -> ApplyWorkspaceEditParams {
         let old = self.view.len();
+        //self.reload_branch(office);
         self.rebuild_view(office);
         self.rebuild_format(office);
         let mut wf = HashMap::new();
@@ -1200,10 +1201,10 @@ impl RootView {
         }
         self.view.push(GitView::NewLine);
         self.view.push(GitView::CommitHeader);
-        if let Some(branch) = office.branch.get(self.viewed_branch) {
+        if let Some(branch) = office.branch.get(office.viewed_branch) {
             for (from_commit, _) in branch.commits.iter().take(self.limit_view).enumerate() {
                 self.view.push(GitView::CommitMember {
-                    from_branch: self.viewed_branch,
+                    from_branch: office.viewed_branch,
                     from_commit,
                 });
                 //self.view.push(GitView::ViewMore);
@@ -1283,7 +1284,7 @@ impl RootView {
             RootAction::Reload => {
                 office.manifest.clear();
                 office.re_fill_status();
-                self.reload_branch(office);
+                office.reload_branch();
                 self.limit_view = GitView::LIMIT_VIEW;
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
             }
@@ -1313,26 +1314,63 @@ impl RootView {
             }
             RootAction::StatusReload => {
                 office.re_fill_status();
+        
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
             }
             RootAction::ViewBranch(b) => {
-                self.viewed_branch = b;
+                office.viewed_branch = b;
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
             }
             RootAction::MergeBranch(b) => {
-                let mut proc = process::Command::new("git");
-                proc.args(&["merge", &office.branch[b].name]);
-                let mut sp = proc.spawn().unwrap();
-                let status = sp.wait().unwrap();
-                match status.code() {
-                    Some(0) => {
-                        conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
-                    }
-                    Some(code) => (),
-                    None => (),
+                let branch_ref = &office.branch[b];
+                let branch = office
+                    .repo
+                    .find_branch(&branch_ref.name, branch_ref.b_type)
+                    .unwrap();
+                let reference = branch.get();
+                let annotated = office
+                    .repo
+                    .reference_to_annotated_commit(reference)
+                    .unwrap();
+                let (anal, _) = office.repo.merge_analysis(&[&annotated]).unwrap();
+
+                if anal.is_up_to_date() {
+                    return;
                 }
+                let mut head = office.repo.head().unwrap();
+
+                //if anal.is_fast_forward() {
+                //    let target = office.repo.find_commit(annotated.id()).unwrap();
+                //    head.set_target(target.id(), "Fast-forward");
+                //    office.repo.checkout_tree(target.as_object(), Some(CheckoutBuilder::new().safe()));
+                    //office
+                    //    .repo
+                    //    .checkout_head(None);
+                //    RootView::reload(office, conn);
+                    //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
+                //    return;
+                //}
+                let our = head.peel_to_commit().unwrap();
+                office.repo.merge(&[&annotated], None, None);
+                let mut index = office.repo.index().unwrap();
+                let tree_id = index.write_tree().unwrap();
+                let tree = office.repo.find_tree(tree_id).unwrap();
+                let their = office.repo.find_commit(annotated.id()).unwrap();
+                let signature = office.repo.signature().unwrap();
+                office.repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    &format!("Merge branch '{}'", &branch_ref.name),
+                    &tree,
+                    &[&our, &their],
+                );
+                office.repo.checkout_head(None);
+                office.repo.cleanup_state();
+                RootView::reload(office, conn);
+                //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office)); 
             }
             //RootAction::MergeBranch(b) => {
             //    let show = ShowDocumentParams {
@@ -1366,8 +1404,8 @@ impl RootView {
                     return;
                 }
 
-                self.viewed_branch = b;
-                self.head_branch = b;
+                office.viewed_branch = b;
+                office.head_branch = b;
 
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
@@ -1447,11 +1485,13 @@ impl Lsp for Client {
                                         ..Default::default()
                                     },
                                 };
-                                self.conn
-                                    .req(ApplyWorkspaceEdit::METHOD, Conn::beta_req(), &we);
+                                let mut conn = Uniq::make(&self.conn);
+                                conn.req(ApplyWorkspaceEdit::METHOD, &we);
+                                //self.conn
+                                //    .req(ApplyWorkspaceEdit::METHOD, Conn::beta_req(), &we);
                                 RootAction::from_str(&text.text).map(|root_action| {
                                     root_view.root_action(
-                                        &mut Uniq::make(&self.conn),
+                                        &mut conn,
                                         root_action,
                                         office,
                                         &params.text_document.uri,
@@ -1556,20 +1596,6 @@ impl Lsp for Client {
         }
     }
 
-    fn folding(&mut self, id: RequestId, params: FoldingRangeParams) {
-        let uri = params.text_document.uri;
-        //Self::log("FOLDING INITIATED?", conn);
-        // CURRENT
-        if let Some((wg, _)) = self.work_group.get(&uri) {
-            if let Some(fold) = Self::work_group_folding(wg, &uri) {
-                //Self::log("HERE COMES THE FOLD", conn);
-                self.conn.ok(id, &fold);
-                return;
-            }
-            //Self::log("NO FOLD AAAH", conn);
-        }
-    }
-
     fn did_open(&mut self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         match self.work_group.get_mut(&uri) {
@@ -1640,7 +1666,6 @@ impl Lsp for Client {
 }
 
 impl Client {
-
     fn work_group_action(
         wg: &mut WorkGroup,
         idx: usize,
@@ -1728,7 +1753,7 @@ impl Client {
                         let branch = &office.branch[i];
                         match branch.b_type {
                             BranchType::Local => {
-                                match (root_view.head_branch == i, root_view.viewed_branch == i) {
+                                match (office.head_branch == i, office.viewed_branch == i) {
                                     (true, true) => None,
                                     (true, false) => Some(RootAction::pack(
                                         uri,
@@ -2014,13 +2039,13 @@ impl Client {
         //let branch = {
         let mut root = RootView {
             //branch: Vec::new(),
-            viewed_branch: 0,
-            head_branch: 0,
+            //viewed_branch: 0,
+            //head_branch: 0,
             limit_view: GitView::LIMIT_VIEW,
             format: String::new(),
             view: Vec::new(),
         };
-        root.reload_branch(office);
+        //office.reload_branch();
 
         root
     }
