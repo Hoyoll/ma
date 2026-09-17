@@ -1,0 +1,4 @@
+name = "Tree explorer"
+status = "Planned"
+tag = ["navigation", "quality of life"]
+desc = "Allow user the ability to navigate the tree of a given commit"
