@@ -73,7 +73,7 @@ use chrono::{FixedOffset, TimeZone};
 use crossbeam::channel::Sender;
 use git2::{
     BranchType, Commit, DiffFormat, Error, ObjectType, Oid, Repository, Sort, Status,
-    StatusOptions, Time, build::CheckoutBuilder,
+    StatusOptions, Time, TreeWalkMode, build::CheckoutBuilder,
 };
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
@@ -100,7 +100,7 @@ const ROOT_NAME: &str = "ma.md";
 const DIFF_NAME: &str = "ma.diff";
 const CACHE_DIR: &str = "ma-cache";
 const INPUT_MOUTH: &str = "ma-input.md";
-
+const COMMIT_TREE: &str = "tree.md";
 struct Client {
     work_group: HashMap<Uri, Company>,
     office: Vec<Office>,
@@ -203,7 +203,42 @@ enum WorkGroup {
     RootView(RootView),
     DiffView(Diff),
     InputBuffer(InputBuffer),
+    TreeView(Tree),
     FileView,
+}
+
+struct Tree {
+    commit: Oid,
+    path: Vec<PathBuf>,
+    view: Vec<TreeView>,
+}
+
+enum TreeView {
+    Padding,
+    Path(usize),
+}
+
+impl Tree {
+    fn format(&self) -> String {
+        let mut format = String::new();
+        for t in &self.view {
+            match t {
+                TreeView::Padding => format.push_str(&format!("# {}\n", self.commit.to_string())),
+
+                TreeView::Path(p) => {
+                    format.push_str(&format!("{}\n", self.path[*p].to_string_lossy()));
+                },
+            }
+        }
+        format
+    }
+
+    fn fill(&mut self) {
+        self.view.push(TreeView::Padding);
+        for (i, _) in self.path.iter().enumerate() {
+            self.view.push(TreeView::Path(i));
+        }
+    }
 }
 
 enum InputBuffer {
@@ -712,6 +747,10 @@ enum RootAction {
     CheckoutBranch(usize),
     ViewMore,
     ViewLess,
+    ViewTree {
+        from_branch: usize,
+        from_commit: usize,
+    },
 }
 
 impl RootAction {
@@ -1250,17 +1289,6 @@ impl RootView {
                 }
                 let mut head = office.repo.head().unwrap();
 
-                //if anal.is_fast_forward() {
-                //    let target = office.repo.find_commit(annotated.id()).unwrap();
-                //    head.set_target(target.id(), "Fast-forward");
-                //    office.repo.checkout_tree(target.as_object(), Some(CheckoutBuilder::new().safe()));
-                //office
-                //    .repo
-                //    .checkout_head(None);
-                //    RootView::reload(office, conn);
-                //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
-                //    return;
-                //}
                 let our = head.peel_to_commit().unwrap();
                 office.repo.merge(&[&annotated], None, None);
                 let mut index = office.repo.index().unwrap();
@@ -1279,22 +1307,50 @@ impl RootView {
                 office.repo.checkout_head(None);
                 office.repo.cleanup_state();
                 RootView::reload(office, conn);
-                //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
             }
-            //RootAction::MergeBranch(b) => {
-            //    let show = ShowDocumentParams {
-            //        uri: office.ma_input.clone(),
-            //        external: Some(false),
-            //        take_focus: Some(true),
-            //        selection: None,
-            //    };
+            RootAction::ViewTree {
+                from_branch,
+                from_commit,
+            } => {
+                let branch_data = &office.branch[from_branch];
+                let commit_id = branch_data.commits[from_commit];
+                let mut vt = Tree {
+                    commit: commit_id,
+                    path: Vec::new(),
+                    view: Vec::new(),
+                };
+                let commit = office.repo.find_commit(commit_id).unwrap();
+                //commit.tree().unwrap().get_path(path)
+                commit
+                    .tree()
+                    .unwrap()
+                    .walk(TreeWalkMode::PreOrder, |root, entry| {
+                        if entry.kind() != Some(ObjectType::Blob) {
+                            return 0;
+                        }
+                        let path = format!("{root}{}", entry.name().unwrap());
+                        vt.path.push(PathBuf::from(path));
+                        0
+                    });
+                vt.fill();
+                let p = office.cache.join(commit_id.to_string()).join(COMMIT_TREE);
 
-            //    *wg = Some((
-            //        office.ma_input.clone(),
-            //        WorkGroup::InputBuffer(InputBuffer::AcceptMerge(b)),
-            //    ));
-            //    conn.req(ShowDocument::METHOD, &show);
-            //}
+                let url = match office.file_cache.get(&p) {
+                    Some(url) => url.clone(),
+                    None => {
+                        fs::write(&p, vt.format());
+                        name_to_url(&p).unwrap()
+                    }
+                };
+                let show = ShowDocumentParams {
+                    uri: url.clone(),
+                    external: Some(false),
+                    take_focus: Some(true),
+                    selection: None,
+                };
+                *wg = Some((url, WorkGroup::TreeView(vt)));
+                conn.req(ShowDocument::METHOD, &show);
+            }
             RootAction::CheckoutBranch(b) => {
                 let branch = office
                     .repo
@@ -1765,6 +1821,20 @@ impl Client {
                             ),
                         ],
                     )),
+                    GitView::CommitMember {
+                        from_branch,
+                        from_commit,
+                    } => Some(RootAction::pack(
+                        uri,
+                        &[(
+                            "View tree?",
+                            RootAction::ViewTree {
+                                from_branch,
+                                from_commit,
+                            },
+                            Some(CodeActionKind::SOURCE),
+                        )],
+                    )),
                     //GitView::ViewMore => None,
                     _ => None,
                 }
@@ -1887,6 +1957,26 @@ impl Client {
                     }
                 },
             },
+            WorkGroup::TreeView(t) => match t.view[idx] {
+                TreeView::Padding => (None, None),
+                TreeView::Path(p) => {
+                    if let Some(uri) = Self::open_file(office, t.commit, &t.path[p]) {
+                        return (
+                            Some(GotoDefinitionResponse::Scalar(Location::new(
+                                uri.clone(),
+                                Range {
+                                    start: Position::new(0, 0),
+                                    ..Default::default()
+                                },
+                            ))),
+                            Some((uri, WorkGroup::FileView)),
+                        );
+                    }
+                    (None, None)
+                }
+            },
+
+            //return ret;
             _ => (None, None),
         }
     }
