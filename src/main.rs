@@ -1,7 +1,6 @@
 trait Lsp {
     fn hover(&mut self, id: RequestId, params: HoverParams);
     fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams);
-    //fn folding(&mut self, id: RequestId, params: FoldingRangeParams);
     fn code_action(&mut self, id: RequestId, params: CodeActionParams);
     fn inlay_hint(&mut self, id: RequestId, params: InlayHintParams);
     fn handle_request(&mut self, request: lsp_server::Request) {
@@ -66,15 +65,11 @@ trait Lsp {
 use std::{
     collections::HashMap,
     fs,
-    hash::Hash,
-    io::BufRead,
     path::{Component, Path, PathBuf, Prefix},
-    process::{self, Command},
     str::FromStr,
-    usize,
 };
 
-use chrono::{DateTime, FixedOffset, TimeZone};
+use chrono::{FixedOffset, TimeZone};
 use crossbeam::channel::Sender;
 use git2::{
     BranchType, Commit, DiffFormat, Error, ObjectType, Oid, Repository, Sort, Status,
@@ -83,24 +78,20 @@ use git2::{
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CodeActionResponse, CodeLens, DefinitionOptions,
-    DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FoldingRange, FoldingRangeParams,
-    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, LogMessageParams,
-    MarkedString, MarkupContent, MarkupKind, MessageType, OneOf, Position, Range, SaveOptions,
-    ServerCapabilities, ShowDocumentParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
-    lsp_request,
+    CodeActionProviderCapability, CodeActionResponse, DiagnosticOptions,
+    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InlayHint, InlayHintKind, InlayHintLabel,
+    InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MarkupKind,
+    MessageType, OneOf, Position, Range, SaveOptions, ServerCapabilities, ShowDocumentParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
     notification::{
         DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage, Notification,
-        ShowMessage,
     },
     request::{
-        ApplyWorkspaceEdit, CodeActionRequest, CodeLensRequest, DocumentHighlightRequest,
-        FoldingRangeRequest, GotoDefinition, HoverRequest, Initialize, InlayHintRequest, Request,
-        SemanticTokensFullRequest, ShowDocument,
+        ApplyWorkspaceEdit, CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest,
+        Request, SemanticTokensFullRequest, ShowDocument,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -112,9 +103,8 @@ const INPUT_MOUTH: &str = "ma-input.md";
 
 struct Client {
     work_group: HashMap<Uri, Company>,
-    //repo: Vec<Repository>,
     office: Vec<Office>,
-    conn: Conn, //caps: ServerCapabilities,
+    conn: Conn,
 }
 
 struct Conn(Sender<Message>);
@@ -136,17 +126,6 @@ impl<'ma> Uniq<'ma> {
 }
 
 impl Conn {
-    const ALPHA_REQ: i32 = 1;
-    const BETA_REQ: i32 = 2;
-
-    fn alpha_req() -> RequestId {
-        RequestId::from(Self::ALPHA_REQ)
-    }
-
-    fn beta_req() -> RequestId {
-        RequestId::from(Self::BETA_REQ)
-    }
-
     fn log(&self, message: impl Into<String>) {
         let l_params = LogMessageParams {
             typ: MessageType::INFO,
@@ -172,7 +151,6 @@ impl Conn {
     }
 
     fn req(&self, method: impl Into<String>, id: RequestId, result: &impl Serialize) {
-        //let req = Request {}
         self.0.send(Message::Request(lsp_server::Request::new(
             id,
             method.into(),
@@ -226,16 +204,11 @@ enum WorkGroup {
     DiffView(Diff),
     InputBuffer(InputBuffer),
     FileView,
-    //BranchConflict {
-    //    merge_target: String,
-    //    merge_subject: String,
-    //},
 }
 
 enum InputBuffer {
     AcceptNothing,
     AcceptCommit,
-    AcceptMerge(usize),
     ShowErrorMessage(String),
 }
 
@@ -263,47 +236,6 @@ impl InputBuffer {
         match self {
             InputBuffer::ShowErrorMessage(_) => (),
             InputBuffer::AcceptNothing => (),
-            InputBuffer::AcceptMerge(b) => {
-                return;
-                let head = office.repo.head().unwrap();
-                let our = head.peel_to_commit().unwrap();
-
-                let branch = &office.branch[*b];
-                let b_repo = office
-                    .repo
-                    .find_branch(&branch.name, branch.b_type)
-                    .unwrap();
-                let their = b_repo.get().peel_to_commit().unwrap();
-                let mut index = office.repo.merge_commits(&our, &their, None).unwrap();
-                if index.has_conflicts() {
-                    *self = InputBuffer::ShowErrorMessage("Merge conflicts detected!".into());
-                    return;
-                }
-                let author = office.repo.author_from_env().unwrap();
-                let committer = office.repo.committer_from_env().unwrap();
-
-                //index.write();
-                let tree_id = index.write_tree_to(&office.repo).unwrap();
-                //let tree_id = index.write_tree().unwrap();
-                let tree = office.repo.find_tree(tree_id).unwrap();
-                let res = office.repo.commit(
-                    Some("HEAD"),
-                    &author,
-                    &committer,
-                    message.as_ref(),
-                    &tree,
-                    &[&our, &their],
-                );
-                if let Err(_) = res {
-                    *self = InputBuffer::ShowErrorMessage("Commit failed!".into());
-                    return;
-                }
-
-                *self = Self::AcceptNothing;
-                office.repo.checkout_tree(&tree.into_object(), None);
-                RootView::open_buffer(office, conn);
-                RootView::reload(office, conn);
-            }
             InputBuffer::AcceptCommit => {
                 let author = office.repo.author_from_env().unwrap();
                 let committer = office.repo.committer_from_env().unwrap();
@@ -353,7 +285,6 @@ struct Office {
     branch: Vec<Branch>,
     head_branch: usize,
     viewed_branch: usize,
-    //repo_state: RepoState,
 }
 
 impl Office {
@@ -374,7 +305,6 @@ impl Office {
                     branch: Vec::new(),
                     head_branch: 0,
                     viewed_branch: 0,
-                    //repo_state: RepoState::AcceptNothing,
                 };
                 office.re_fill_status();
                 office.reload_branch();
@@ -451,8 +381,6 @@ struct Hunk {
     changes: Vec<u32>,
 }
 
-/// TO-DO: create a nice model for DiffView. with diff hunk head as "goto_definition" anchor
-/// TO-DO done i suppose...
 enum DiffView {
     /// if parent commit > 1
     Merge {
@@ -519,8 +447,6 @@ impl DiffView {
         match self {
             DiffView::Merge { view, parents } => {
                 view.clear();
-                //view.push(MergeView::Padding);
-                //view.push(MergeView::Padding);
 
                 format.push_str("+ ");
                 format.push_str(&commit.id().to_string());
@@ -587,7 +513,6 @@ impl DiffView {
                     }
                     None => repo.diff_tree_to_tree(None, tree.as_ref(), None),
                 };
-                //let parent = commit.parent(0).unwrap().tree().ok();
                 if let Ok(diff) = diff {
                     Self::fill_view(diff, format, view, hunk_col);
                 }
@@ -611,8 +536,7 @@ impl DiffView {
         view.push(NormalView::Padding);
 
         format.push_str("Date: ");
-        // TO-DO: Date!
-        //format.push_str(&self.date);
+
         format.push_str(&format_git_time(author.when()).unwrap_or_default());
         format.push('\n');
         view.push(NormalView::Padding);
@@ -620,19 +544,14 @@ impl DiffView {
         format.push('\n');
         view.push(NormalView::Padding);
         let message = &commit.message().unwrap_or_default();
-        //format.push_str(&commit.message().unwrap_or_default());
-        //format.push('\n');
-        //view.push(NormalView::Padding);
+
         for ms in message.lines() {
             format.push_str(ms);
             format.push('\n');
             view.push(NormalView::Padding);
         }
-        //view.push(NormalView::Padding);
-        //view.push(NormalView::Padding);
 
         format.push('\n');
-        //view.push(NormalView::Padding);
     }
 
     fn fill_view(
@@ -671,7 +590,7 @@ impl DiffView {
                 }
                 format.push('\n');
                 view.push(NormalView::Padding);
-                //format.push(line.origin());
+
                 format.push_str("+++ ");
                 format.push_str(&file.path().unwrap().to_string_lossy());
                 format.push('\n');
@@ -696,7 +615,7 @@ impl DiffView {
 
                     hunk_current_line = hunk.new_start();
                     change_on = hunk.new_start() - 1;
-                    //view.push(NormalView::Padding);
+
                     view.push(NormalView::Hunk {
                         from_hunk: current_hunk,
                         change_on,
@@ -718,8 +637,6 @@ impl DiffView {
                     }
                     format.push(' ');
                     format.push_str(&String::from_utf8_lossy(line.content()));
-                    //change_on += 1;
-                    //view.push(NormalView::HunkLine { from_hunk: current_hunk, change_on });
                 }
                 _ => (),
             }
@@ -733,7 +650,6 @@ struct Diff {
     oid: Oid,
     format: String,
     diff_view: DiffView,
-    //repo_id: RepoId,
 }
 
 impl Diff {
@@ -777,7 +693,6 @@ enum GitView {
         from_branch: usize,
         from_commit: usize,
     },
-    //ViewMore,
 }
 
 impl GitView {
@@ -792,7 +707,6 @@ enum RootAction {
     StatusReload,
     StageFile(usize),
     UnstageFile(usize),
-    //ReplaceFile(usize),
     MergeBranch(usize),
     ViewBranch(usize),
     CheckoutBranch(usize),
@@ -836,11 +750,7 @@ impl RootAction {
     }
 }
 
-//#[derive(Default)]
 struct RootView {
-    //branch: Vec<Branch>,
-    //viewed_branch: usize,
-    //head_branch: usize,
     limit_view: usize,
     format: String,
     view: Vec<GitView>,
@@ -854,7 +764,6 @@ impl RootView {
             take_focus: Some(true),
             selection: None,
         };
-        //*wg = Some((uri, WorkGroup::InputBuffer(InputBuffer::AcceptCommit)));
         conn.req(ShowDocument::METHOD, &show);
     }
 
@@ -1155,7 +1064,7 @@ impl RootView {
             },
             _ => None,
         }
-    } 
+    }
 
     fn refresh(&mut self, uri: &lsp_types::Uri, office: &Office) -> ApplyWorkspaceEditParams {
         let old = self.view.len();
@@ -1314,7 +1223,7 @@ impl RootView {
             }
             RootAction::StatusReload => {
                 office.re_fill_status();
-        
+
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
             }
@@ -1345,11 +1254,11 @@ impl RootView {
                 //    let target = office.repo.find_commit(annotated.id()).unwrap();
                 //    head.set_target(target.id(), "Fast-forward");
                 //    office.repo.checkout_tree(target.as_object(), Some(CheckoutBuilder::new().safe()));
-                    //office
-                    //    .repo
-                    //    .checkout_head(None);
+                //office
+                //    .repo
+                //    .checkout_head(None);
                 //    RootView::reload(office, conn);
-                    //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
+                //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //    return;
                 //}
                 let our = head.peel_to_commit().unwrap();
@@ -1370,7 +1279,7 @@ impl RootView {
                 office.repo.checkout_head(None);
                 office.repo.cleanup_state();
                 RootView::reload(office, conn);
-                //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office)); 
+                //conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
             }
             //RootAction::MergeBranch(b) => {
             //    let show = ShowDocumentParams {
@@ -1407,7 +1316,7 @@ impl RootView {
                 }
                 office.viewed_branch = b;
                 office.head_branch = b;
- 
+
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
             }
@@ -1599,12 +1508,12 @@ impl Lsp for Client {
 
     fn did_open(&mut self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
+        let mut uniq = Uniq::make(&self.conn);
         match self.work_group.get_mut(&uri) {
             Some((wg, office_id)) => match wg {
                 WorkGroup::RootView(root_view) => {
-                    self.conn.req(
+                    uniq.req(
                         ApplyWorkspaceEdit::METHOD,
-                        Conn::alpha_req(),
                         &root_view.refresh(&uri, &mut self.office[*office_id]),
                     );
                 }
@@ -1619,7 +1528,7 @@ impl Lsp for Client {
                             let parent = PathBuf::from(p.parent().unwrap());
                             let p = parent.strip_prefix("/").unwrap();
                             Office::new(uri.clone(), p).map(|mut office| {
-                                let mut root_view = Self::new_root(&mut office);
+                                let mut root_view = Self::new_root();
 
                                 // clean up old stale cache if exist
                                 fs::remove_dir_all(&office.cache);
@@ -1651,8 +1560,7 @@ impl Lsp for Client {
                                     uri,
                                     (WorkGroup::RootView(root_view), self.office.len() - 1),
                                 );
-                                self.conn
-                                    .req(ApplyWorkspaceEdit::METHOD, Conn::alpha_req(), &we);
+                                uniq.req(ApplyWorkspaceEdit::METHOD, &we);
                             });
                         }
                         Some(INPUT_MOUTH) => {
@@ -2009,45 +1917,12 @@ impl Client {
         None
     }
 
-    fn new_open_file(office: &mut Office, oid: Oid, path: &Path) -> Option<(Uri, String)> {
-        if let Ok(commit) = office.repo.find_commit(oid) {
-            let tree = commit.tree().unwrap();
-            if let Ok(entry) = tree.get_path(path) {
-                if entry.kind() != Some(ObjectType::Blob) {
-                    return None;
-                }
-                if let Ok(blob) = office.repo.find_blob(entry.id()) {
-                    let p = office.cache.join(oid.to_string()).join(path);
-                    //if let Err(_) = fs::create_dir_all(p.parent().unwrap()) {
-                    //    return None;
-                    //}
-
-                    //if let Err(_) = fs::write(&p, blob.content()) {
-                    //    return None;
-                    //}
-                    let uri = name_to_url(&p).unwrap();
-                    office.file_cache.insert(p, uri.clone());
-                    return Some((uri, String::from_utf8_lossy(blob.content()).to_string()));
-                    //return (So);
-                }
-            }
-        }
-        None
-    }
-
-    fn new_root(office: &mut Office) -> RootView {
-        //let repo = &office.repo;
-        //let branch = {
-        let mut root = RootView {
-            //branch: Vec::new(),
-            //viewed_branch: 0,
-            //head_branch: 0,
+    fn new_root() -> RootView {
+        let root = RootView {
             limit_view: GitView::LIMIT_VIEW,
             format: String::new(),
             view: Vec::new(),
         };
-        //office.reload_branch();
-
         root
     }
 
@@ -2258,95 +2133,6 @@ fn markdown_language(path: &Path) -> &'static str {
         // Default
         _ => "text",
     }
-}
-
-fn merge_branch(repo: &Repository, branch_name: &str) -> Result<(), Error> {
-    // Current branch / HEAD
-    let head = repo.head()?;
-    let current = head.peel_to_commit()?;
-
-    // The branch we're merging INTO current HEAD
-    let branch = repo.find_branch(branch_name, BranchType::Local)?;
-    let other = branch.get().peel_to_commit()?;
-
-    let annotated = repo.find_annotated_commit(other.id())?;
-
-    // Ask Git what kind of merge this is.
-    let (analysis, _) = repo.merge_analysis(&[&annotated])?;
-
-    if analysis.is_up_to_date() {
-        println!("Already up to date.");
-        return Ok(());
-    }
-
-    if analysis.is_fast_forward() {
-        // No merge commit needed.
-        //
-        // Move the current branch to the other commit.
-        let branch_ref = head.name().unwrap();
-        repo.reference(
-            branch_ref,
-            other.id(),
-            true,
-            &format!("Fast-forward merge '{branch_name}'"),
-        )?;
-        //let tree = branch.get().peel_to_tree().unwrap();
-
-        repo.checkout_tree(
-            other.tree()?.as_object(),
-            Some(CheckoutBuilder::new().safe()),
-        )?;
-
-        //repo.checkout_head(None)?;
-
-        return Ok(());
-    }
-    let i = repo.merge_commits(&current, &other, None).unwrap();
-    i.has_conflicts();
-    for conf in i.conflicts().unwrap() {
-        conf.map(|conflict| {
-            conflict.ancestor; // common ancestor duh
-            conflict.our; // HEAD
-            conflict.their; // commit yang mau merge
-        });
-    }
-    // Real three-way merge.
-    //repo.merge(&[&annotated], None, None)?;
-
-    // Check whether Git produced conflicts.
-    let mut index = repo.index()?;
-
-    if index.has_conflicts() {
-        println!("Merge has conflicts!");
-
-        // Don't create the merge commit yet.
-        //
-        // The user needs to resolve the conflicts first.
-        return Ok(());
-    }
-
-    // The merge result is now in the index.
-    let tree_id = index.write_tree()?;
-    let tree = repo.find_tree(tree_id)?;
-
-    let signature = repo.signature()?;
-
-    // Current HEAD + merged branch HEAD
-    repo.commit(
-        Some("HEAD"),
-        &signature,
-        &signature,
-        &format!("Merge branch '{branch_name}'"),
-        &tree,
-        &[&current, &other],
-    )?;
-
-    // Update working tree to match the new commit.
-    repo.checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().safe()))?;
-
-    //repo.checkout_head(None)?;
-
-    Ok(())
 }
 
 fn has_staged_changes(repo: &git2::Repository) -> bool {
