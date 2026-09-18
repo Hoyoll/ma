@@ -1393,20 +1393,21 @@ impl RootView {
                     .unwrap();
                 let tree = branch.get().peel_to_tree().unwrap();
 
-                if let Err(_) = office
+                if let Err(e) = office
                     .repo
                     .checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().safe()))
                 {
-                    return;
+                    conn.conn.log(e.to_string());
+                    //return;
                 }
 
-                if let Err(_) = office.repo.set_head(branch.get().name().unwrap()) {
-                    return;
+                if let Err(e) = office.repo.set_head(branch.get().name().unwrap()) {
+                    conn.conn.log(e.to_string());
+                    //return;
                 }
-
                 office.viewed_branch = b;
                 office.head_branch = b;
-
+ 
                 conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
                 //Some(root_view.refresh(uri, office))
             }
