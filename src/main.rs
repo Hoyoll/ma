@@ -128,7 +128,7 @@ impl<'ma> Uniq<'ma> {
 impl Conn {
     fn log(&self, message: impl Into<String>) {
         let l_params = LogMessageParams {
-            typ: MessageType::INFO,
+            typ: MessageType::WARNING,
             message: message.into(),
         };
 
@@ -227,7 +227,7 @@ impl Tree {
 
                 TreeView::Path(p) => {
                     format.push_str(&format!("{}\n", self.path[*p].to_string_lossy()));
-                },
+                }
             }
         }
         format
@@ -1320,25 +1320,28 @@ impl RootView {
                     view: Vec::new(),
                 };
                 let commit = office.repo.find_commit(commit_id).unwrap();
-                //commit.tree().unwrap().get_path(path)
-                commit
-                    .tree()
-                    .unwrap()
-                    .walk(TreeWalkMode::PreOrder, |root, entry| {
-                        if entry.kind() != Some(ObjectType::Blob) {
-                            return 0;
-                        }
-                        let path = format!("{root}{}", entry.name().unwrap());
-                        vt.path.push(PathBuf::from(path));
-                        0
-                    });
+                
+                let tree = commit.tree().unwrap();
+                tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+                    if entry.kind() == Some(ObjectType::Blob) {
+                        let path = format!("{}{}", root, entry.name().unwrap());
+                        vt.path.push(PathBuf::from(path));   
+                    }
+                    0
+                });
                 vt.fill();
                 let p = office.cache.join(commit_id.to_string()).join(COMMIT_TREE);
 
                 let url = match office.file_cache.get(&p) {
                     Some(url) => url.clone(),
                     None => {
-                        fs::write(&p, vt.format());
+                        if let Err(e) = fs::create_dir_all(&p.parent().unwrap()) {
+                            conn.conn.log(e.to_string());
+                        }
+                        if let Err(e) = fs::write(&p, vt.format()) {
+                            conn.conn.log(e.to_string());
+                        }
+
                         name_to_url(&p).unwrap()
                     }
                 };
