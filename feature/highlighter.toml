@@ -1,0 +1,5 @@
+name = "Highlighter"
+status = "Planned"
+tag = ["quality of life", "***aesthetics***"]
+desc = "Highlighting pieces of object so it looks nice"
+lsp-ref = ["Semantic Highlighting"]
