@@ -66,6 +66,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Component, Path, PathBuf, Prefix},
+    process,
     str::FromStr,
 };
 
@@ -1320,12 +1321,12 @@ impl RootView {
                     view: Vec::new(),
                 };
                 let commit = office.repo.find_commit(commit_id).unwrap();
-                
+
                 let tree = commit.tree().unwrap();
                 tree.walk(TreeWalkMode::PreOrder, |root, entry| {
-                    if entry.kind() == Some(ObjectType::Blob) {
+                    if entry.kind() == Some(ObjectType::Blob) {
                         let path = format!("{}{}", root, entry.name().unwrap());
-                        vt.path.push(PathBuf::from(path));   
+                        vt.path.push(PathBuf::from(path));
                     }
                     0
                 });
@@ -1355,6 +1356,26 @@ impl RootView {
                 conn.req(ShowDocument::METHOD, &show);
             }
             RootAction::CheckoutBranch(b) => {
+                let mut proc = process::Command::new("git");
+                proc.args(&[
+                    "-C",
+                    &format!("{}", office.repo.workdir().unwrap().to_string_lossy()),
+                    "switch",
+                    &office.branch[b].name,
+                ]);
+                let mut git = proc.spawn().unwrap();
+                match git.wait() {
+                    Ok(e) if e.success() => {
+                        office.viewed_branch = b;
+                        office.head_branch = b;
+
+                        conn.req(ApplyWorkspaceEdit::METHOD, &self.refresh(uri, office));
+                    }
+                    _ => (),
+                }
+                return;
+                // tbh, currently i just block it out.
+                panic!("How did we get here?");
                 let branch = office
                     .repo
                     .find_branch(&office.branch[b].name, office.branch[b].b_type)
@@ -1880,6 +1901,16 @@ impl Client {
                             return (None, None);
                         }
                     }
+                }
+                Some(GitView::StatusMember { from_file }) => {
+                    let (file, _) = &office.status[*from_file];
+                    return (
+                        Some(GotoDefinitionResponse::Scalar(Location::new(
+                            name_to_url(&office.repo.workdir().unwrap().join(&file)).unwrap(),
+                            Range::default(),
+                        ))),
+                        None,
+                    );
                 }
                 _ => (None, None),
             },
