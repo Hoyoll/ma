@@ -1605,14 +1605,22 @@ impl Lsp for Client {
                 if let Some(s) = p.file_name() {
                     match s.to_str() {
                         Some(ROOT_NAME) => {
-                            let parent = PathBuf::from(p.parent().unwrap());
-                            let p = parent.strip_prefix("/").unwrap();
-                            Office::new(uri.clone(), p).map(|mut office| {
+                            let pre_root = PathBuf::from(p);
+                            let root = pre_root.strip_prefix("/").unwrap();
+                            Office::new(uri.clone(), root.parent().unwrap()).map(|mut office| {
                                 let mut root_view = Self::new_root();
-
+                                //let ma = p.join(ROOT_NAME);
                                 // clean up old stale cache if exist
                                 fs::remove_dir_all(&office.cache);
-
+                                let line = match fs::read_to_string(&root) {
+                                    Err(_) => {
+                                        //self.conn.log(e.to_string());
+                                        0
+                                    },
+                                    Ok(old_content) => {
+                                        old_content.lines().count()
+                                    }
+                                };
                                 root_view.rebuild_view(&mut office);
                                 root_view.rebuild_format(&office);
 
@@ -1625,7 +1633,7 @@ impl Lsp for Client {
                                         new_text: root_view.format.clone(),
                                         range: Range {
                                             start: Position::new(0, 0),
-                                            end: Position::new(root_view.view.len() as u32, 0),
+                                            end: Position::new(line as u32, 0),
                                         },
                                     }],
                                 );
@@ -1636,6 +1644,7 @@ impl Lsp for Client {
                                         ..Default::default()
                                     },
                                 };
+                                
                                 self.work_group.insert(
                                     uri,
                                     (WorkGroup::RootView(root_view), self.office.len() - 1),
