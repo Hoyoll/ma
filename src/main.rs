@@ -78,22 +78,12 @@ use git2::{
 };
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionProviderCapability, CodeActionResponse, DiagnosticOptions,
-    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InlayHint, InlayHintKind, InlayHintLabel,
-    InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MarkupKind,
-    MessageType, OneOf, Position, Range, SaveOptions, ServerCapabilities, ShowDocumentParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
-    notification::{
+    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse, DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFilter, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MarkupKind, MessageType, OneOf, Position, Range, SaveOptions, SemanticTokensOptions, SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities, ShowDocumentParams, StaticRegistrationOptions, TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit, notification::{
         DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage, Notification,
-    },
-    request::{
+    }, request::{
         ApplyWorkspaceEdit, CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest,
         Request, SemanticTokensFullRequest, ShowDocument,
-    },
+    }
 };
 use serde::{Deserialize, Serialize};
 
@@ -1612,14 +1602,12 @@ impl Lsp for Client {
                                 //let ma = p.join(ROOT_NAME);
                                 // clean up old stale cache if exist
                                 fs::remove_dir_all(&office.cache);
-                                let line = match fs::read_to_string(&root) {
+                                let line = match fs::read_to_string(&root) {
                                     Err(_) => {
                                         //self.conn.log(e.to_string());
                                         0
-                                    },
-                                    Ok(old_content) => {
-                                        old_content.lines().count()
                                     }
+                                    Ok(old_content) => old_content.lines().count(),
                                 };
                                 root_view.rebuild_view(&mut office);
                                 root_view.rebuild_format(&office);
@@ -1644,7 +1632,7 @@ impl Lsp for Client {
                                         ..Default::default()
                                     },
                                 };
-                                
+
                                 self.work_group.insert(
                                     uri,
                                     (WorkGroup::RootView(root_view), self.office.len() - 1),
@@ -2102,6 +2090,35 @@ fn main() {
     let caps = ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                SemanticTokensRegistrationOptions {
+                    text_document_registration_options: TextDocumentRegistrationOptions {
+                        document_selector: Some(vec![
+                            DocumentFilter {
+                                language: Some("markdown".into()),
+                                scheme: Some("file".into()),
+                                pattern: Some("*.{md}".into()),
+                            },
+                            DocumentFilter {
+                                language: Some("diff".into()),
+                                scheme: Some("file".into()),
+                                pattern: Some("*.{diff}".into()),
+                            },
+                        ]),
+                    },
+                    semantic_tokens_options: SemanticTokensOptions {
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                        legend: todo!(),
+                        range: None,
+                        full: todo!(),
+                    },
+                    static_registration_options: StaticRegistrationOptions {
+                        id: None,
+                    },
+                },
+            ),
+        ),
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
