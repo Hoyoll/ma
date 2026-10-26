@@ -1,11 +1,17 @@
+mod container;
+mod app;
+mod workgroup;
+
 trait Lsp {
     fn hover(&mut self, id: RequestId, params: HoverParams);
     fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams);
     fn code_action(&mut self, id: RequestId, params: CodeActionParams);
     fn inlay_hint(&mut self, id: RequestId, params: InlayHintParams);
+    fn semantic_token(&mut self, id: RequestId, params: SemanticTokensParams);
     fn handle_request(&mut self, request: lsp_server::Request) {
         match request.method.as_str() {
             HoverRequest::METHOD => {
+                //container::Container
                 serde_json::from_value(request.params).map(|params: HoverParams| {
                     self.hover(request.id, params);
                 });
@@ -25,7 +31,11 @@ trait Lsp {
                     self.inlay_hint(request.id, params);
                 });
             }
-            SemanticTokensFullRequest::METHOD => {}
+            SemanticTokensFullRequest::METHOD => {
+                serde_json::from_value(request.params).map(|params: SemanticTokensParams| {
+                    self.semantic_token(request.id, params);
+                });
+            }
             _ => {}
         }
     }
@@ -78,12 +88,26 @@ use git2::{
 };
 use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse, DiagnosticOptions, DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFilter, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MarkupKind, MessageType, OneOf, Position, Range, SaveOptions, SemanticTokensOptions, SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities, ShowDocumentParams, StaticRegistrationOptions, TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit, notification::{
+    ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, DiagnosticOptions,
+    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentFilter, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InlayHint, InlayHintKind, InlayHintLabel,
+    InlayHintParams, Location, LogMessageParams, MarkedString, MarkupContent, MarkupKind,
+    MessageType, OneOf, PartialResultParams, Position, Range, SaveOptions, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRegistrationOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ShowDocumentParams, StaticRegistrationOptions,
+    TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions,
+    WorkDoneProgressParams, WorkspaceEdit,
+    notification::{
         DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage, Notification,
-    }, request::{
+    },
+    request::{
         ApplyWorkspaceEdit, CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest,
         Request, SemanticTokensFullRequest, ShowDocument,
-    }
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -1408,6 +1432,38 @@ impl RootView {
 }
 
 impl Lsp for Client {
+    fn semantic_token(&mut self, id: RequestId, params: SemanticTokensParams) {
+        let url = params.text_document.uri;
+        if let Some((wg, o_id)) = self.work_group.get(&url) {
+            let office = &self.office[*o_id];
+            match wg {
+                WorkGroup::RootView(root_view) => {
+                    for (line, g) in root_view.view.iter().enumerate() {
+                        match g {
+                            GitView::StatusMember { from_file } => {
+                                let (file, _) = &office.status[*from_file];
+                            },
+                            GitView::BranchMember(b) => {
+                                let branch = &office.branch[*b];
+                            },
+                            GitView::CommitMember {
+                                from_branch,
+                                from_commit,
+                            } => todo!(),
+                            _ => (),
+                        }
+                        let tokens = SemanticTokensParams {
+                            work_done_progress_params: WorkDoneProgressParams::default(),
+                            partial_result_params: PartialResultParams::default(),
+                            text_document: todo!(),
+                        };
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
     fn did_save(&mut self, params: DidSaveTextDocumentParams) {
         let url = params.text_document.uri;
         match self.work_group.get_mut(&url) {
@@ -2109,13 +2165,18 @@ fn main() {
                     },
                     semantic_tokens_options: SemanticTokensOptions {
                         work_done_progress_options: WorkDoneProgressOptions::default(),
-                        legend: todo!(),
+                        legend: lsp_types::SemanticTokensLegend {
+                            token_types: vec![
+                                SemanticTokenType::NAMESPACE,
+                                SemanticTokenType::VARIABLE,
+                                SemanticTokenType::TYPE,
+                            ],
+                            token_modifiers: vec![],
+                        },
                         range: None,
-                        full: todo!(),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
                     },
-                    static_registration_options: StaticRegistrationOptions {
-                        id: None,
-                    },
+                    static_registration_options: StaticRegistrationOptions { id: None },
                 },
             ),
         ),
