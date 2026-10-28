@@ -1,7 +1,7 @@
-mod container;
+mod util;
 mod app;
 mod workgroup;
-
+mod lsp;
 trait Lsp {
     fn hover(&mut self, id: RequestId, params: HoverParams);
     fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams);
