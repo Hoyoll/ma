@@ -1,11 +1,20 @@
 use lsp_server::RequestId;
-use lsp_types::{CodeActionParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams, HoverParams, InlayHintParams, SemanticTokensParams, notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification}, request::{CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest, Request, SemanticTokensFullRequest}};
+use lsp_types::{
+    CodeActionParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, GotoDefinitionParams, HoverParams, InlayHintParams,
+    SemanticTokensParams,
+    notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification},
+    request::{
+        CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest, Request,
+        SemanticTokensFullRequest,
+    },
+};
 
 pub trait Lsp {
-    fn hover(&mut self, id: RequestId, params: HoverParams);
-    fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams);
-    fn code_action(&mut self, id: RequestId, params: CodeActionParams);
-    fn inlay_hint(&mut self, id: RequestId, params: InlayHintParams);
+    fn hover(&mut self, id: RequestId, params: HoverParams) {}
+    fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams) {}
+    fn code_action(&mut self, id: RequestId, params: CodeActionParams) {}
+    fn inlay_hint(&mut self, id: RequestId, params: InlayHintParams) {}
     fn semantic_token(&mut self, id: RequestId, params: SemanticTokensParams) {}
     fn handle_request(&mut self, request: lsp_server::Request) {
         match request.method.as_str() {
@@ -66,16 +75,19 @@ pub trait Lsp {
         }
     }
 
-    fn did_save(&mut self, params: DidSaveTextDocumentParams);
-    fn did_open(&mut self, params: DidOpenTextDocumentParams);
-    fn did_change(&mut self, params: DidChangeTextDocumentParams);
+    fn did_save(&mut self, params: DidSaveTextDocumentParams) {}
+    fn did_open(&mut self, params: DidOpenTextDocumentParams) {}
+    fn did_change(&mut self, params: DidChangeTextDocumentParams) {}
 }
 
 pub struct Conn(crossbeam::channel::Sender<lsp_server::Message>);
 
 impl Conn {
-    pub fn uniq(&mut self) -> Uniq {
-        Uniq { count: 0, conn: self }
+    pub fn uniq(&self) -> Uniq {
+        Uniq {
+            count: 0,
+            conn: self,
+        }
     }
 }
 
@@ -104,12 +116,18 @@ impl Conn {
         self.0.send(lsp_server::Message::Response(resp));
     }
 
-    pub fn req(&self, method: impl Into<String>, id: lsp_server::RequestId, result: &impl serde::Serialize) {
-        self.0.send(lsp_server::Message::Request(lsp_server::Request::new(
-            id,
-            method.into(),
-            result,
-        )));
+    pub fn req(
+        &self,
+        method: impl Into<String>,
+        id: lsp_server::RequestId,
+        result: &impl serde::Serialize,
+    ) {
+        self.0
+            .send(lsp_server::Message::Request(lsp_server::Request::new(
+                id,
+                method.into(),
+                result,
+            )));
     }
 
     pub fn err(&self, id: lsp_server::RequestId, code: lsp_server::ErrorCode, msg: &str) {
@@ -133,6 +151,7 @@ pub struct Uniq<'ma> {
 impl<'ma> Uniq<'ma> {
     pub fn req(&mut self, method: impl Into<String>, result: &impl serde::Serialize) {
         self.count += 1;
-        self.conn.req(method, lsp_server::RequestId::from(self.count), result);
+        self.conn
+            .req(method, lsp_server::RequestId::from(self.count), result);
     }
 }

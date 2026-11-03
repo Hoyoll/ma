@@ -1,7 +1,7 @@
-mod util;
 mod app;
-mod workgroup;
 mod lsp;
+mod util;
+mod workgroup;
 trait Lsp {
     fn hover(&mut self, id: RequestId, params: HoverParams);
     fn goto_definition(&mut self, id: RequestId, params: GotoDefinitionParams);
@@ -1442,10 +1442,10 @@ impl Lsp for Client {
                         match g {
                             GitView::StatusMember { from_file } => {
                                 let (file, _) = &office.status[*from_file];
-                            },
+                            }
                             GitView::BranchMember(b) => {
                                 let branch = &office.branch[*b];
-                            },
+                            }
                             GitView::CommitMember {
                                 from_branch,
                                 from_commit,
