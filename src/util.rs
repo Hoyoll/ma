@@ -5,7 +5,9 @@ use std::{
 
 use chrono::{FixedOffset, TimeZone};
 use git2::Time;
-use lsp_types::{Uri, notification::Notification};
+use lsp_types::{
+    InlayHint, InlayHintKind, InlayHintLabel, Position, Uri, notification::Notification,
+};
 
 pub struct Container<T> {
     inner: Vec<T>,
@@ -213,4 +215,17 @@ pub fn format_git_time(time: Time) -> Option<String> {
         }
     }
     None
+}
+
+pub fn create_inlay_hint(line: u32, character: u32, label: impl Into<String>) -> InlayHint {
+    InlayHint {
+        position: Position::new(line, character),
+        label: InlayHintLabel::String(label.into()),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: None,
+        padding_right: None,
+        data: None,
+    }
 }

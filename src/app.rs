@@ -2,28 +2,30 @@ use std::{collections::HashMap, path::PathBuf};
 
 use crossbeam::channel::Sender;
 use git2::Repository;
-use lsp_server::{Connection, Message};
+use lsp_server::{Connection, Message, RequestId};
 use lsp_types::{
-    CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
+    ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
     DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentFilter, GotoDefinitionParams, HoverParams,
-    HoverProviderCapability, InlayHintParams, OneOf, SaveOptions, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    HoverProviderCapability, InlayHintParams, OneOf, Position, Range, SaveOptions,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities,
     StaticRegistrationOptions, TextDocumentRegistrationOptions, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
-    WorkDoneProgressOptions,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit,
     notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification},
     request::{
-        CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest, Request,
-        SemanticTokensFullRequest,
+        ApplyWorkspaceEdit, CodeActionRequest, GotoDefinition, HoverRequest, InlayHintRequest,
+        Request, SemanticTokensFullRequest,
     },
 };
+use serde::{Deserialize, Serialize};
+use serde_json::to_value;
 
 use crate::{
-    lsp::{Conn, Lsp},
-    util::Container,
-    workgroup::{ToolBox, WorkGroup},
+    lsp::{self, Conn, Kind, Lsp},
+    util::{Container, name_to_url},
+    workgroup::{Root, ToolBox, WorkGroup},
 };
 
 pub struct Office {
@@ -40,19 +42,29 @@ impl Office {
 
 pub type OfficeId = usize;
 
-struct App {
+pub struct App {
     office: Container<Office>,
     work_group: HashMap<Uri, (WorkGroup, OfficeId)>,
-    lsp_conn: Conn,
-    ma_conn: Sender<MaAction>,
+    lsp_conn: Sender<Kind<Message, MaAction>>,
+    //ma_conn: Sender<MaAction>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub enum MaAction {
     Init { anchor_path: Uri },
+    FillContent { url: Uri, content: String },
 }
 
 impl App {
-    fn handle_request(&mut self, request: lsp_server::Request) {
+    pub fn new(lsp_conn: Sender<Kind<Message, MaAction>>) -> Self {
+        Self {
+            office: Container::new(),
+            work_group: HashMap::new(),
+            lsp_conn,
+        }
+    }
+
+    pub fn handle_request(&mut self, request: lsp_server::Request) {
         //let toolbox = ToolBox { office: &mut self.office, lsp_conn: &self.lsp_conn, ma_conn: &self.ma_conn };
         match request.method.as_str() {
             HoverRequest::METHOD => {
@@ -66,7 +78,7 @@ impl App {
                             ToolBox {
                                 office: &mut self.office[office_id],
                                 lsp_conn: &self.lsp_conn,
-                                ma_conn: &self.ma_conn,
+                                //ma_conn: &self.ma_conn,
                             },
                             request.id,
                             params,
@@ -84,7 +96,7 @@ impl App {
                             ToolBox {
                                 office: &mut self.office[office_id],
                                 lsp_conn: &self.lsp_conn,
-                                ma_conn: &self.ma_conn,
+                                //ma_conn: &self.ma_conn,
                             },
                             request.id,
                             params,
@@ -102,7 +114,7 @@ impl App {
                             ToolBox {
                                 office: &mut self.office[office_id],
                                 lsp_conn: &self.lsp_conn,
-                                ma_conn: &self.ma_conn,
+                                //ma_conn: &self.ma_conn,
                             },
                             request.id,
                             params,
@@ -120,7 +132,7 @@ impl App {
                             ToolBox {
                                 office: &mut self.office[office_id],
                                 lsp_conn: &self.lsp_conn,
-                                ma_conn: &self.ma_conn,
+                                //ma_conn: &self.ma_conn,
                             },
                             request.id,
                             params,
@@ -138,7 +150,7 @@ impl App {
                             ToolBox {
                                 office: &mut self.office[office_id],
                                 lsp_conn: &self.lsp_conn,
-                                ma_conn: &self.ma_conn,
+                                //ma_conn: &self.ma_conn,
                             },
                             request.id,
                             params,
@@ -151,7 +163,7 @@ impl App {
         }
     }
 
-    fn handle_notification(&mut self, notification: lsp_server::Notification) {
+    pub fn handle_notification(&mut self, notification: lsp_server::Notification) {
         match notification.method.as_str() {
             DidOpenTextDocument::METHOD => {
                 serde_json::from_value(notification.params).map(
@@ -163,14 +175,15 @@ impl App {
                                 ToolBox {
                                     office: &mut self.office[office_id],
                                     lsp_conn: &self.lsp_conn,
-                                    ma_conn: &self.ma_conn,
+                                    //ma_conn: &self.ma_conn,
                                 },
                                 params,
                             );
                         } else {
-                            self.ma_conn.send(MaAction::Init {
+                            //panic!("here did_open!?");
+                            self.lsp_conn.send(Kind::Other(MaAction::Init {
                                 anchor_path: params.text_document.uri,
-                            });
+                            }));
                         }
                     },
                 );
@@ -185,7 +198,7 @@ impl App {
                                 ToolBox {
                                     office: &mut self.office[office_id],
                                     lsp_conn: &self.lsp_conn,
-                                    ma_conn: &self.ma_conn,
+                                    //ma_conn: &self.ma_conn,
                                 },
                                 params,
                             );
@@ -204,7 +217,7 @@ impl App {
                                 ToolBox {
                                     office: &mut self.office[office_id],
                                     lsp_conn: &self.lsp_conn,
-                                    ma_conn: &self.ma_conn,
+                                    //ma_conn: &self.ma_conn,
                                 },
                                 params,
                             );
@@ -217,103 +230,92 @@ impl App {
         }
     }
 
-    fn ma_action(&mut self, action: MaAction) {
+    pub fn ma_action(&mut self, action: MaAction) {
+        //panic!("action work!?");
         match action {
             MaAction::Init { anchor_path } => {
                 let path = PathBuf::from(anchor_path.path().as_str());
                 path.file_name().map(|file_name| match file_name.to_str() {
                     Some("ma.md") => {
-                        let candidate = path.parent().unwrap();
-                        Repository::open(candidate).map(|repo| {
-                            let office = Office::new(repo);
-                        });
+                        //panic!("init works?");
+                        let candidate = path.parent().unwrap().strip_prefix("/").unwrap();
+                        //panic!("{}", candidate.to_string_lossy());
+                        let mut office = match Repository::open(candidate) {
+                            Ok(repo) => Office::new(repo),
+                            Err(_) => return,
+                        };
+                        let mut root = Root::new();
+                        root.fill_root(&mut office);
+                        root.build_view();
+                        let format = root.format();
+                        let office_id = self.office.add(office);
+                        //let url = name_to_url(&path).unwrap();
+                        self.work_group
+                            .insert(anchor_path.clone(), (WorkGroup::Root(root), office_id));
+                        //panic!("here!");
+                        self.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                            url: anchor_path,
+                            content: format,
+                        }));
+                        //self.lsp_conn.send()
                     }
                     _ => (),
                 });
             }
-        }
-    }
-    fn run(mut app: Self) {
-        let (lsp_conn, io_t) = Connection::stdio();
-        let caps = ServerCapabilities {
-            hover_provider: Some(HoverProviderCapability::Simple(true)),
-            definition_provider: Some(OneOf::Left(true)),
-            semantic_tokens_provider: Some(
-                SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
-                    SemanticTokensRegistrationOptions {
-                        text_document_registration_options: TextDocumentRegistrationOptions {
-                            document_selector: Some(vec![
-                                DocumentFilter {
-                                    language: Some("markdown".into()),
-                                    scheme: Some("file".into()),
-                                    pattern: Some("*.{md}".into()),
-                                },
-                                DocumentFilter {
-                                    language: Some("diff".into()),
-                                    scheme: Some("file".into()),
-                                    pattern: Some("*.{diff}".into()),
-                                },
-                            ]),
+            MaAction::FillContent { url, content } => {
+                let mut wf = HashMap::new();
+                wf.insert(
+                    url,
+                    vec![TextEdit {
+                        new_text: content,
+                        range: Range {
+                            start: Position::new(0, 0),
+                            end: Position::new(1000, 0),
                         },
-                        semantic_tokens_options: SemanticTokensOptions {
-                            work_done_progress_options: WorkDoneProgressOptions::default(),
-                            legend: lsp_types::SemanticTokensLegend {
-                                token_types: vec![
-                                    SemanticTokenType::NAMESPACE,
-                                    SemanticTokenType::VARIABLE,
-                                    SemanticTokenType::TYPE,
-                                ],
-                                token_modifiers: vec![],
-                            },
-                            range: None,
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
-                        },
-                        static_registration_options: StaticRegistrationOptions { id: None },
+                    }],
+                );
+                let we = ApplyWorkspaceEditParams {
+                    label: None,
+                    edit: WorkspaceEdit {
+                        changes: Some(wf),
+                        ..Default::default()
                     },
-                ),
-            ),
-            text_document_sync: Some(TextDocumentSyncCapability::Options(
-                TextDocumentSyncOptions {
-                    open_close: Some(true),
-                    change: Some(TextDocumentSyncKind::INCREMENTAL),
-                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                        include_text: Some(true),
-                    })),
-                    ..Default::default()
-                },
-            )),
-            diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                DiagnosticOptions::default(),
-            )),
-            //folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-            code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
-            inlay_hint_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        };
-        //println!("{init}");
-        //return;
-        let init_params = lsp_conn
-            .initialize(serde_json::to_value(&caps).unwrap())
-            .unwrap();
-        let (ma_conn, ma_rec) = crossbeam::channel::unbounded::<MaAction>();
-        loop {
-            crossbeam::select! {
-                recv(lsp_conn.receiver) -> msg => {
-                    if let Ok(msg) = msg {
-                        match msg {
-                            Message::Request(request) => app.handle_request(request),
-                            Message::Response(response) => (),
-                            Message::Notification(notification) => app.handle_notification(notification),
-                        }
+                };
+                //panic!("here!");
+                self.lsp_conn.send(Kind::Main(
+                    lsp_server::Request {
+                        id: RequestId::from(1),
+                        method: ApplyWorkspaceEdit::METHOD.into(),
+                        params: to_value(we).unwrap(),
                     }
-                }
-                recv(ma_rec) -> msg => {
-                    if let Ok(msg) = msg {
-                        app.ma_action(msg);
-                    }
-                }
+                    .into(),
+                ));
             }
         }
+    }
+
+    fn run(mut app: Self) {
+        //let (send) = lsp::stdio::<MaAction>();
+
+        //let (ma_conn, ma_rec) = crossbeam::channel::unbounded::<MaAction>();
+        //loop {
+        //    crossbeam::select! {
+        //        recv(lsp_conn.receiver) -> msg => {
+        //            if let Ok(msg) = msg {
+        //                match msg {
+        //                    Message::Request(request) => app.handle_request(request),
+        //                    Message::Response(response) => (),
+        //                    Message::Notification(notification) => app.handle_notification(notification),
+        //                }
+        //            }
+        //        }
+        //        recv(ma_rec) -> msg => {
+        //            if let Ok(msg) = msg {
+        //                app.ma_action(msg);
+        //            }
+        //        }
+        //    }
+        //}
 
         //println!("{init_params}");
         //return;
@@ -326,6 +328,6 @@ impl App {
         //    }
         //}
         //client.main_loop(conn, init_params);
-        io_t.join();
+        //io_t.join();
     }
 }
