@@ -1451,7 +1451,7 @@ impl Lsp for Client {
                             GitView::CommitMember {
                                 from_branch,
                                 from_commit,
-                            } => todo!(),
+                            } => (),
                             _ => (),
                         }
                     }
@@ -2227,62 +2227,7 @@ fn development() {
     //panic!("here! it works!");
     let (conn, io_t) = lsp::Connection::<MaAction>::stdio();
     //let (lsp_conn, io_t) = Connection::stdio();
-    let caps = ServerCapabilities {
-        hover_provider: Some(HoverProviderCapability::Simple(true)),
-        definition_provider: Some(OneOf::Left(true)),
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
-                SemanticTokensRegistrationOptions {
-                    text_document_registration_options: TextDocumentRegistrationOptions {
-                        document_selector: Some(vec![
-                            DocumentFilter {
-                                language: Some("markdown".into()),
-                                scheme: Some("file".into()),
-                                pattern: Some("*.{md}".into()),
-                            },
-                            DocumentFilter {
-                                language: Some("diff".into()),
-                                scheme: Some("file".into()),
-                                pattern: Some("*.{diff}".into()),
-                            },
-                        ]),
-                    },
-                    semantic_tokens_options: SemanticTokensOptions {
-                        work_done_progress_options: WorkDoneProgressOptions::default(),
-                        legend: lsp_types::SemanticTokensLegend {
-                            token_types: vec![
-                                SemanticTokenType::NAMESPACE,
-                                SemanticTokenType::VARIABLE,
-                                SemanticTokenType::TYPE,
-                            ],
-                            token_modifiers: vec![],
-                        },
-                        range: None,
-                        full: Some(SemanticTokensFullOptions::Bool(true)),
-                    },
-                    static_registration_options: StaticRegistrationOptions { id: None },
-                },
-            ),
-        ),
-        text_document_sync: Some(TextDocumentSyncCapability::Options(
-            TextDocumentSyncOptions {
-                open_close: Some(true),
-                change: Some(TextDocumentSyncKind::INCREMENTAL),
-                save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                    include_text: Some(true),
-                })),
-                ..Default::default()
-            },
-        )),
-        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-            DiagnosticOptions::default(),
-        )),
-        //folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
-        inlay_hint_provider: Some(OneOf::Left(true)),
-        ..Default::default()
-    };
-    //println!("{init}");
+    let caps = app::capabilities(); //println!("{init}");
     //return;
     let init_params = conn
         .initialize(serde_json::to_value(&caps).unwrap())

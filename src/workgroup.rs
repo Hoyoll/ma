@@ -1,19 +1,20 @@
 use std::path::PathBuf;
 
 use crossbeam::channel::Sender;
-use git2::{BranchType, Oid, Status, StatusOptions};
+use git2::{BranchType, IndexAddOption, Oid, Status, StatusOptions};
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
-    CodeActionParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams,
-    SemanticTokensParams,
+    Position, Range, SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult,
+    Uri,
 };
 use serde_json::to_value;
 
 use crate::{
-    app::{MaAction, Office},
-    lsp::{Conn, Kind, Lsp},
-    util::create_inlay_hint,
+    app::{MaAction, Office, SemanticTokenList},
+    lsp::Kind,
+    util::{Container, create_inlay_hint, create_semantic_token},
 };
 
 pub struct ToolBox<'ma> {
@@ -22,22 +23,24 @@ pub struct ToolBox<'ma> {
     //pub ma_conn: &'ma Sender<MaAction>,
 }
 
+const HASH_LENGTH: usize = 7;
+
 pub enum WorkGroup {
     Root(Root),
 }
 
 pub struct Root {
-    status: Vec<(PathBuf, Status)>,
+    status: Container<(PathBuf, Status)>,
     head_branch: String,
-    remote: Vec<String>,
-    tag: Vec<String>,
-    commits: Vec<Oid>,
-    view: Vec<RootView>,
+    remote: Container<String>,
+    tag: Container<String>,
+    commits: Container<Oid>,
+    view: Container<RootView>,
 }
 
 enum RootView {
     LineBreak,
-    MessageBus,
+    HeadFile,
     HeadLabel,
     RemoteLabel,
     RemoteMember(usize),
@@ -52,80 +55,100 @@ enum RootView {
 impl Root {
     pub fn new() -> Self {
         Self {
-            status: vec![],
+            status: Container::new(),
             head_branch: "".into(),
-            remote: vec![],
-            tag: vec![],
-            commits: vec![],
-            view: vec![],
+            remote: Container::new(),
+            tag: Container::new(),
+            commits: Container::new(),
+            view: Container::new(),
         }
     }
 
     pub fn format(&self) -> String {
         let mut format = String::new();
-        self.view.iter().for_each(|root_view| match root_view {
-            RootView::LineBreak | RootView::MessageBus => format.push_str("\n"),
-            RootView::HeadLabel => {
-                format.push_str("# Head\n");
-            }
-            RootView::RemoteLabel => {
-                format.push_str("# Remote\n");
-            }
-            RootView::RemoteMember(i) => {
-                let member = &self.remote[*i];
-                format.push_str(member);
-                format.push_str("\n");
-            }
-            RootView::TagLabel => {
-                format.push_str("# Tag\n");
-            }
-            RootView::TagMember(i) => {
-                let member = &self.tag[*i];
-                format.push_str(member);
-                format.push_str("\n");
-            }
-            RootView::StatusLabel => {
-                format.push_str("# Current Status\n");
-            }
-            RootView::StatusMember(i) => {
-                let (member, _) = &self.status[*i];
-                format.push_str(&member.to_string_lossy());
-                format.push_str("\n");
-            }
-            RootView::CommitLabel => {
-                format.push_str("# Recent Commits\n");
-            }
-            RootView::CommitMember(i) => {
-                let member = &self.commits[*i];
-                format.push_str(&member.to_string()[0..8]);
-                format.push_str("\n");
-            }
-        });
+        self.view
+            .inner()
+            .iter()
+            .for_each(|root_view| match root_view {
+                RootView::LineBreak | RootView::HeadFile => format.push_str("\n"),
+                RootView::HeadLabel => {
+                    format.push_str("# Head\n");
+                }
+                RootView::RemoteLabel => {
+                    format.push_str("# Remote\n");
+                }
+                RootView::RemoteMember(i) => {
+                    let member = &self.remote[*i];
+                    format.push_str(member);
+                    format.push_str("\n");
+                }
+                RootView::TagLabel => {
+                    format.push_str("# Tag\n");
+                }
+                RootView::TagMember(i) => {
+                    let member = &self.tag[*i];
+                    format.push_str(member);
+                    format.push_str("\n");
+                }
+                RootView::StatusLabel => {
+                    format.push_str("# Current Status\n");
+                }
+                RootView::StatusMember(i) => {
+                    let (member, _) = &self.status[*i];
+                    format.push_str(&member.to_string_lossy());
+                    format.push_str("\n");
+                }
+                RootView::CommitLabel => {
+                    format.push_str("# Recent Commits\n");
+                }
+                RootView::CommitMember(i) => {
+                    let member = &self.commits[*i];
+                    format.push_str(&member.to_string()[0..HASH_LENGTH]);
+                    format.push_str("\n");
+                }
+            });
         format
     }
 
     pub fn build_view(&mut self) {
-        self.view.push(RootView::MessageBus);
+        self.view.push(RootView::HeadFile);
 
         self.view.push(RootView::HeadLabel);
         self.view.push(RootView::RemoteLabel);
-        self.remote.iter().enumerate().for_each(|(i, _)| {
+        self.remote.inner().iter().enumerate().for_each(|(i, _)| {
             self.view.push(RootView::RemoteMember(i));
         });
         self.view.push(RootView::TagLabel);
-        self.tag.iter().enumerate().for_each(|(i, _)| {
+        self.tag.inner().iter().enumerate().for_each(|(i, _)| {
             self.view.push(RootView::TagMember(i));
         });
         self.view.push(RootView::LineBreak);
         self.view.push(RootView::StatusLabel);
-        self.status.iter().enumerate().for_each(|(i, _)| {
+        self.status.inner().iter().enumerate().for_each(|(i, _)| {
             self.view.push(RootView::StatusMember(i));
         });
         self.view.push(RootView::LineBreak);
         self.view.push(RootView::CommitLabel);
-        self.commits.iter().enumerate().for_each(|(i, _)| {
+        self.commits.inner().iter().enumerate().for_each(|(i, _)| {
             self.view.push(RootView::CommitMember(i));
         });
+    }
+
+    pub fn fill_status(&mut self, office: &Office) {
+        self.status.inner_mut().clear();
+        office
+            .repo
+            .statuses(Some(
+                StatusOptions::new()
+                    .include_untracked(true)
+                    .recurse_untracked_dirs(true),
+            ))
+            .map(|status| {
+                for entry in status.iter() {
+                    self.status
+                        .push((PathBuf::from(entry.path().unwrap()), entry.status()));
+                }
+            });
     }
 
     pub fn fill_root(&mut self, office: &mut Office) {
@@ -141,6 +164,8 @@ impl Root {
             }
         });
 
+        self.fill_status(office);
+
         office.repo.tag_names(None).map(|tags| {
             for tag in tags.iter().flatten() {
                 if let Some(tag) = tag {
@@ -148,20 +173,6 @@ impl Root {
                 }
             }
         });
-
-        office
-            .repo
-            .statuses(Some(
-                StatusOptions::new()
-                    .include_untracked(true)
-                    .recurse_untracked_dirs(true),
-            ))
-            .map(|status| {
-                for entry in status.iter() {
-                    self.status
-                        .push((PathBuf::from(entry.path().unwrap()), entry.status()));
-                }
-            });
 
         office.repo.revwalk().map(|mut revwalk| {
             revwalk.push(head.target().unwrap());
@@ -171,6 +182,17 @@ impl Root {
                 }
             }
         });
+    }
+
+    pub fn refresh(&self, url: Uri, lsp_conn: &Sender<Kind<Message, MaAction>>) {
+        lsp_conn.send(Kind::Other(MaAction::FillContent {
+            url,
+            content: self.format(),
+            range: Range {
+                start: Position::new(0, 0),
+                end: Position::new(1000, 0),
+            },
+        }));
     }
 }
 
@@ -182,70 +204,255 @@ impl Root {
         ret: &mut Vec<InlayHint>,
     ) {
         for i in start_line..end_line {
-            self.view.get(i as usize).map(|view| {
-                match view {
-                    RootView::LineBreak => (),
-                    RootView::MessageBus => {
-                        ret.push(create_inlay_hint(
-                            i,
-                            0,
-                            office.repo.workdir().unwrap().to_string_lossy(),
-                        ));
+            self.view.get(i as usize).map(|view| match view {
+                RootView::LineBreak => (),
+                RootView::HeadFile => {
+                    ret.push(create_inlay_hint(
+                        i,
+                        0,
+                        office.repo.workdir().unwrap().to_string_lossy(),
+                    ));
+                }
+                RootView::HeadLabel => {
+                    ret.push(create_inlay_hint(i, 7, format!(" {}", &self.head_branch)));
+                }
+                RootView::RemoteLabel => (),
+                RootView::RemoteMember(member) => {
+                    let remote = &self.remote[member];
+                    let res = office.repo.find_remote(remote).unwrap();
+                    ret.push(create_inlay_hint(i, 0, "  "));
+                    ret.push(create_inlay_hint(
+                        i,
+                        remote.len() as u32,
+                        format!(" * {}", res.url().unwrap()),
+                    ));
+                }
+                RootView::TagLabel => (),
+                RootView::TagMember(member) => {
+                    let tag = &self.tag[member];
+                    let find = office
+                        .repo
+                        .find_tag(
+                            office
+                                .repo
+                                .refname_to_id(&format!("refs/tags/{tag}"))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    ret.push(create_inlay_hint(i, 0, "  "));
+                    if let Ok(Some(message)) = find.message() {
+                        let content = format!(" * {}", message.trim_end());
+                        ret.push(create_inlay_hint(i, tag.len() as u32, content));
                     }
-                    RootView::HeadLabel => {
-                        ret.push(create_inlay_hint(i, 7, format!(" {}", &self.head_branch)));
-                    }
-                    RootView::RemoteLabel => (),
-                    RootView::RemoteMember(_) => {
-                        //let remote = &self.remote[*member];
-                        ret.push(create_inlay_hint(i, 0, "      -> "));
-                    }
-                    RootView::TagLabel => (),
-                    RootView::TagMember(_) => {
-                        ret.push(create_inlay_hint(i, 0, "      -> "));
-                    }
-                    RootView::StatusLabel => (),
-                    RootView::StatusMember(member) => {
-                        let (_, status) = &self.status[*member];
-                        let staged = if status.contains(Status::INDEX_NEW) {
-                            "A"
-                        } else if status.contains(Status::INDEX_MODIFIED) {
-                            "M"
-                        } else if status.contains(Status::INDEX_DELETED) {
-                            "D"
-                        } else if status.contains(Status::INDEX_RENAMED) {
-                            "R"
-                        } else if status.contains(Status::INDEX_TYPECHANGE) {
-                            "T"
-                        } else {
-                            " "
-                        };
+                }
+                RootView::StatusLabel => (),
+                RootView::StatusMember(member) => {
+                    let (_, status) = &self.status[*member];
+                    let staged = if status.contains(Status::INDEX_NEW) {
+                        "A"
+                    } else if status.contains(Status::INDEX_MODIFIED) {
+                        "M"
+                    } else if status.contains(Status::INDEX_DELETED) {
+                        "D"
+                    } else if status.contains(Status::INDEX_RENAMED) {
+                        "R"
+                    } else if status.contains(Status::INDEX_TYPECHANGE) {
+                        "T"
+                    } else {
+                        " "
+                    };
 
-                        let unstaged = if status.contains(Status::WT_NEW) {
-                            "?"
-                        } else if status.contains(Status::WT_MODIFIED) {
-                            "M"
-                        } else if status.contains(Status::WT_DELETED) {
-                            "D"
-                        } else if status.contains(Status::WT_RENAMED) {
-                            "R"
-                        } else if status.contains(Status::WT_TYPECHANGE) {
-                            "T"
-                        } else {
-                            " "
-                        };
+                    let unstaged = if status.contains(Status::WT_NEW) {
+                        "?"
+                    } else if status.contains(Status::WT_MODIFIED) {
+                        "M"
+                    } else if status.contains(Status::WT_DELETED) {
+                        "D"
+                    } else if status.contains(Status::WT_RENAMED) {
+                        "R"
+                    } else if status.contains(Status::WT_TYPECHANGE) {
+                        "T"
+                    } else {
+                        " "
+                    };
+                    ret.push(create_inlay_hint(
+                        i,
+                        0,
+                        format!("  {} | {} -> ", staged, unstaged),
+                    ));
+                }
+                RootView::CommitLabel => (),
+                RootView::CommitMember(member) => {
+                    let commit = &self.commits[member];
+                    let com = office.repo.find_commit(*commit).unwrap();
+                    ret.push(create_inlay_hint(i, 0, "  "));
+                    let mut line = com.message().unwrap().lines();
+                    if let Some(message) = line.next() {
                         ret.push(create_inlay_hint(
                             i,
-                            0,
-                            format!("{} | {} -> ", staged, unstaged),
+                            HASH_LENGTH as u32,
+                            format!(" * {}", message),
                         ));
                     }
-                    RootView::CommitLabel => (),
-                    RootView::CommitMember(_) => {
-                        ret.push(create_inlay_hint(i, 0, "* "));
-                    },
                 }
             });
+        }
+    }
+
+    fn semantic_token(&self, ret: &mut Vec<SemanticToken>) {
+        let mut current_line_token = 0u32;
+        let mut prev_line_token = 0u32;
+        self.view
+            .inner()
+            .iter()
+            .enumerate()
+            .for_each(|(line, view)| match view {
+                RootView::CommitLabel
+                | RootView::StatusLabel
+                | RootView::LineBreak
+                | RootView::HeadFile
+                | RootView::HeadLabel
+                | RootView::RemoteLabel
+                | RootView::TagLabel => (),
+                RootView::RemoteMember(member) => {
+                    let remote = &self.remote[member];
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        remote.len() as u32,
+                        SemanticTokenList::TYPE,
+                    ));
+                    prev_line_token = current_line_token;
+                }
+                RootView::TagMember(member) => {
+                    let remote = &self.tag[member];
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        remote.len() as u32,
+                        SemanticTokenList::KEYWORD,
+                    ));
+                    prev_line_token = current_line_token;
+                }
+                RootView::StatusMember(member) => {
+                    let (remote, _) = &self.status[member];
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        remote.to_string_lossy().len() as u32,
+                        SemanticTokenList::FUNCTION,
+                    ));
+                    prev_line_token = current_line_token;
+                }
+                RootView::CommitMember(member) => {
+                    let remote = &self.commits[member];
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        remote.to_string().len() as u32,
+                        SemanticTokenList::STRUCT,
+                    ));
+                    prev_line_token = current_line_token;
+                }
+            });
+    }
+
+    fn code_action(
+        &mut self,
+        office: &Office,
+        params: CodeActionParams,
+        ret: &mut CodeActionResponse,
+    ) {
+        match &self.view[params.range.start.line as usize] {
+            RootView::LineBreak => (),
+            RootView::HeadFile => (),
+            RootView::HeadLabel => {
+                let branch = match office.repo.branches(Some(BranchType::Local)) {
+                    Ok(branch) => branch,
+                    Err(_) => return,
+                };
+                for b in branch {
+                    match b {
+                        Ok((branch, _)) => {
+                            if let Ok(Some(name)) = branch.name() {
+                                if name == self.head_branch {
+                                    continue;
+                                }
+                                ret.push(CodeActionOrCommand::Command(Command {
+                                    title: format!("Switch branch to {}", name),
+                                    command: MaAction::ACTION.into(),
+                                    arguments: MaAction::SwitchBranch { branch: name.into() }.into(),
+                                }));
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+            RootView::RemoteLabel => (),
+            RootView::RemoteMember(_) => (),
+            RootView::TagLabel => (),
+            RootView::TagMember(_) => (),
+            RootView::StatusLabel => {
+                ret.push(CodeActionOrCommand::Command(Command {
+                    title: "Stage all".into(),
+                    command: MaAction::ACTION.into(),
+                    arguments: MaAction::StageAll {
+                        uri: params.text_document.uri,
+                    }
+                    .into(),
+                }));
+            }
+            RootView::StatusMember(path) => {
+                let (file, status) = &self.status[path];
+                let staged = status.intersects(
+                    Status::INDEX_NEW
+                        | Status::INDEX_MODIFIED
+                        | Status::INDEX_DELETED
+                        | Status::INDEX_RENAMED
+                        | Status::INDEX_TYPECHANGE,
+                );
+                if staged {
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Restage {}", file.to_string_lossy()),
+                        command: MaAction::ACTION.into(),
+                        arguments: MaAction::StageFile {
+                            uri: params.text_document.uri.clone(),
+                            path: *path,
+                        }
+                        .into(),
+                    }));
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Unstage {}", file.to_string_lossy()),
+                        command: MaAction::ACTION.into(),
+                        arguments: MaAction::UnstageFile {
+                            uri: params.text_document.uri,
+                            path: *path,
+                        }
+                        .into(),
+                    }));
+                } else {
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Stage {}", file.to_string_lossy()),
+                        command: MaAction::ACTION.into(),
+                        arguments: MaAction::StageFile {
+                            uri: params.text_document.uri,
+                            path: *path,
+                        }
+                        .into(),
+                    }));
+                }
+            }
+            RootView::CommitLabel => (),
+            RootView::CommitMember(_) => (),
         }
     }
 }
@@ -259,12 +466,33 @@ impl WorkGroup {
         params: GotoDefinitionParams,
     ) {
     }
-    pub fn code_action(&mut self, toolbox: ToolBox, id: RequestId, params: CodeActionParams) {}
-    pub fn inlay_hint(&mut self, toolbox: ToolBox, id: RequestId, params: InlayHintParams) {
-        let mut ret = Vec::<InlayHint>::new();
+
+    pub fn code_action(&mut self, toolbox: ToolBox, id: RequestId, params: CodeActionParams) {
+        let mut ret = CodeActionResponse::new();
         match self {
             WorkGroup::Root(root) => {
-                root.inlay_hint((params.range.start.line, params.range.end.line), toolbox.office, &mut ret);
+                root.code_action(toolbox.office, params, &mut ret);
+            }
+        }
+        toolbox.lsp_conn.send(Kind::Main(
+            Response {
+                id,
+                response_result: Ok(to_value(Some(ret)).unwrap()),
+            }
+            .into(),
+        ));
+    }
+
+    pub fn inlay_hint(&mut self, toolbox: ToolBox, id: RequestId, params: InlayHintParams) {
+        let mut ret = Vec::<InlayHint>::new();
+        //eprintln!("here!");
+        match self {
+            WorkGroup::Root(root) => {
+                root.inlay_hint(
+                    (params.range.start.line, params.range.end.line),
+                    toolbox.office,
+                    &mut ret,
+                );
             }
         }
 
@@ -275,17 +503,95 @@ impl WorkGroup {
                 response_result: Ok(to_value(ret).unwrap()),
             })));
     }
+
     pub fn semantic_token(
         &mut self,
         toolbox: ToolBox,
         id: RequestId,
-        params: SemanticTokensParams,
+        _params: SemanticTokensParams,
     ) {
+        let mut data: Vec<SemanticToken> = vec![];
+
+        match self {
+            WorkGroup::Root(root) => {
+                root.semantic_token(&mut data);
+            }
+            _ => (),
+        }
+        let st = SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        });
+        toolbox
+            .lsp_conn
+            .send(Kind::Main(Message::Response(Response {
+                id,
+                response_result: Ok(to_value(st).unwrap()),
+            })));
+    }
+}
+
+impl WorkGroup {
+    pub fn stage_file(&mut self, toolbox: ToolBox, uri: Uri, path: usize) {
+        match self {
+            WorkGroup::Root(root) => {
+                let (path_buf, status) = &root.status[path];
+                let mut index = match toolbox.office.repo.index() {
+                    Ok(index) => index,
+                    Err(_) => return,
+                };
+                if status.is_wt_deleted() {
+                    index.remove_path(path_buf);
+                } else {
+                    index.add_path(path_buf);
+                }
+                index.write();
+                root.fill_status(toolbox.office);
+                root.build_view();
+
+                root.refresh(uri, toolbox.lsp_conn);
+            }
+        }
+    }
+
+    pub fn unstage_file(&mut self, toolbox: ToolBox, uri: Uri, path: usize) {
+        match self {
+            WorkGroup::Root(root) => {
+                let (path_buf, _) = &root.status[path];
+                let mut index = match toolbox.office.repo.index() {
+                    Ok(index) => index,
+                    Err(_) => return,
+                };
+                index.remove_path(&path_buf);
+                index.write();
+                root.fill_status(toolbox.office);
+                root.build_view();
+
+                root.refresh(uri, toolbox.lsp_conn);
+            }
+        }
+    }
+
+    pub fn stage_all(&mut self, toolbox: ToolBox, uri: Uri) {
+        match self {
+            WorkGroup::Root(root) => {
+                //let (path_buf, status) = &root.status[path];
+                let mut index = match toolbox.office.repo.index() {
+                    Ok(index) => index,
+                    Err(_) => return,
+                };
+                index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None);
+                index.write();
+                root.fill_status(toolbox.office);
+                root.build_view();
+
+                root.refresh(uri, toolbox.lsp_conn);
+            }
+        }
     }
 }
 
 impl WorkGroup {
     pub fn did_save(&mut self, toolbox: ToolBox, params: DidSaveTextDocumentParams) {}
     pub fn did_open(&mut self, toolbox: ToolBox, params: DidOpenTextDocumentParams) {}
-    pub fn did_change(&mut self, toolbox: ToolBox, params: DidChangeTextDocumentParams) {}
 }

@@ -6,8 +6,11 @@ use std::{
 use chrono::{FixedOffset, TimeZone};
 use git2::Time;
 use lsp_types::{
-    InlayHint, InlayHintKind, InlayHintLabel, Position, Uri, notification::Notification,
+    InlayHint, InlayHintKind, InlayHintLabel, Position, SemanticToken, Uri,
+    notification::Notification,
 };
+
+use crate::app::SemanticTokenList;
 
 pub struct Container<T> {
     inner: Vec<T>,
@@ -21,6 +24,10 @@ impl<T> Container<T> {
     pub fn add(&mut self, item: T) -> usize {
         self.inner.push(item);
         self.inner.len() - 1
+    }
+
+    pub fn push(&mut self, item: T) {
+        self.inner.push(item);
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -229,3 +236,20 @@ pub fn create_inlay_hint(line: u32, character: u32, label: impl Into<String>) ->
         data: None,
     }
 }
+
+pub fn create_semantic_token(
+    delta_line: impl Into<u32>,
+    delta_start: impl Into<u32>,
+    length: impl Into<u32>,
+    token_type: impl Into<u32>,
+) -> SemanticToken {
+    SemanticToken {
+        delta_line: delta_line.into(),
+        delta_start: delta_start.into(),
+        length: length.into(),
+        token_type: token_type.into(),
+        token_modifiers_bitset: 0,
+    }
+}
+
+pub fn create_code_action() {}
