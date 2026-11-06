@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use crossbeam::channel::Sender;
-use git2::Repository;
+use git2::{Oid, Repository};
 use lsp_server::{Message, RequestId};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
@@ -25,7 +25,7 @@ use serde_json::{Value, from_value, to_value};
 use crate::{
     lsp::Kind,
     util::Container,
-    workgroup::{Root, ToolBox, WorkGroup},
+    workgroup::{Diff, DiffView, Root, ToolBox, WorkGroup},
 };
 #[repr(u32)]
 pub enum SemanticTokenList {
@@ -93,7 +93,7 @@ pub fn capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
-                change: Some(TextDocumentSyncKind::FULL),
+                //change: Some(TextDocumentSyncKind::FULL), 
                 save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                     include_text: Some(true),
                 })),
@@ -168,6 +168,18 @@ pub enum MaAction {
     CancelCommit {
         uri: Uri,
     },
+    PullRemote {
+        uri: Uri,
+        name: String,
+    },
+    PushRemote {
+        uri: Uri,
+        name: String,
+    },
+    OpenDiff {
+        uri: Uri,
+        oid: usize,
+    }
 }
 
 impl MaAction {
@@ -361,16 +373,13 @@ impl App {
         }
     }
 
-    pub fn ma_action(&mut self, action: MaAction) {
-        //panic!("action work!?");
+    pub fn ma_action(&mut self, action: MaAction) { 
         match action {
             MaAction::Init { anchor_path } => {
                 let path = PathBuf::from(anchor_path.path().as_str());
                 path.file_name().map(|file_name| match file_name.to_str() {
                     Some("ma.md") => {
-                        //panic!("init works?");
                         let candidate = path.parent().unwrap().strip_prefix("/").unwrap();
-                        //panic!("{}", candidate.to_string_lossy());
                         let mut office = match Repository::open(candidate) {
                             Ok(repo) => Office::new(repo),
                             Err(_) => return,
@@ -378,15 +387,12 @@ impl App {
                         let mut root = Root::new();
                         root.fill_root(&mut office);
                         root.build_view();
-                        let format = root.format();
                         let office_id = self.office.add(office);
-                        //let url = name_to_url(&path).unwrap();
-                        //panic!("here!");
+                        
                         root.refresh(anchor_path.clone(), &self.lsp_conn);
                         self.work_group
                             .insert(anchor_path, (WorkGroup::Root(root), office_id));
 
-                        //self.lsp_conn.send()
                     }
                     _ => (),
                 });
@@ -487,6 +493,30 @@ impl App {
             MaAction::CancelCommit { uri } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
                     wg.cancel_commit(ToolBox { office: &mut self.office[office_id], lsp_conn: &self.lsp_conn }, uri);
+                }
+            },
+            MaAction::PullRemote { uri, name } => (),
+            MaAction::PushRemote { uri, name } => (),
+            MaAction::OpenDiff { uri, oid } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    let office = &self.office[office_id];
+                    let oid = wg.open_diff(oid);
+                    let commit = office.repo.find_commit(oid).unwrap();
+                    let mut diff_group = Diff::new();
+                    //diff_group.view.push(DiffView::Author);
+                    //diff_group.view.push(DiffView::Date);
+                    //diff_group.view.push(DiffView::LineBreak);
+                    commit.message().map(|message| {
+                        message.lines().for_each(|line| {
+                        });
+                    });
+                    match commit.parent_count() {
+                        1 => {
+                            //diff_group.view.push(DiffView::Parent { oid: commit. });
+                        }
+                        more => {
+                        }
+                    }
                 }
             },
         }

@@ -27,6 +27,7 @@ const HASH_LENGTH: usize = 7;
 
 pub enum WorkGroup {
     Root(Root),
+    //Diff(Diff),
 }
 
 pub struct Root {
@@ -743,6 +744,12 @@ impl WorkGroup {
             },
         }
     }
+
+    pub fn open_diff(&mut self, oid_id: usize) -> Oid {
+        match self {
+            WorkGroup::Root(root) => root.commits[oid_id],
+        }
+    }
 }
 
 impl WorkGroup {
@@ -763,4 +770,50 @@ impl WorkGroup {
     }
 
     pub fn did_open(&mut self, toolbox: ToolBox, params: DidOpenTextDocumentParams) {}
+}
+
+pub struct Diff {
+    pub view: Container<DiffView>,
+    //pub diff_file: Container<PathBuf>
+}
+
+impl Diff {
+    pub fn new() -> Self {
+        Self { view: Container::new() }
+    }
+}
+
+pub type Length = usize;
+
+pub enum DiffView {
+    LineBreak,
+    //Padding,
+    Author {
+        username: Length,
+        email: Length,
+    },
+    Date {
+        date: Length,
+    },
+    MessageLine(String),
+    DiffFile { old: PathBuf, new: PathBuf }, 
+    HunkHeader {
+        from_file: usize,
+        old: Position,
+        new: Position,
+    },
+    Parent {
+        oid: Oid
+    },
+    Current {
+        oid: Oid
+    },
+    HunkLine {
+        from_diff_file: usize,
+        position: u32,
+        //content: Length,
+    },
+    OldLine {
+        content: Length
+    }
 }
