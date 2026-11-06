@@ -5,14 +5,14 @@ use git2::Repository;
 use lsp_server::{Message, RequestId};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
-    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFilter, ExecuteCommandOptions, ExecuteCommandParams,
-    GotoDefinitionParams, HoverParams, HoverProviderCapability, InlayHintParams, OneOf, Position,
-    Range, SaveOptions, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities,
-    ServerCapabilities, StaticRegistrationOptions, TextDocumentRegistrationOptions,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
+    DiagnosticServerCapabilities, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFilter, ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams, HoverParams,
+    HoverProviderCapability, InlayHintParams, OneOf, Range, SaveOptions, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities,
+    StaticRegistrationOptions, TextDocumentRegistrationOptions, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit,
     notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification},
     request::{
         ApplyWorkspaceEdit, CodeActionRequest, ExecuteCommand, GotoDefinition, HoverRequest,
@@ -93,7 +93,7 @@ pub fn capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
-                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                change: Some(TextDocumentSyncKind::FULL),
                 save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                     include_text: Some(true),
                 })),
@@ -156,7 +156,17 @@ pub enum MaAction {
         path: usize,
     },
     SwitchBranch {
+        uri: Uri,
         branch: String,
+    },
+    Reload {
+        uri: Uri,
+    },
+    AttemptCommit {
+        uri: Uri,
+    },
+    CancelCommit {
+        uri: Uri,
     },
 }
 
@@ -327,7 +337,7 @@ impl App {
                         }
                     },
                 );
-            }
+            } 
             DidSaveTextDocument::METHOD => {
                 serde_json::from_value(notification.params).map(
                     |params: DidSaveTextDocumentParams| {
@@ -446,7 +456,39 @@ impl App {
                     );
                 }
             }
-            MaAction::SwitchBranch { branch } => {}
+            MaAction::SwitchBranch { uri, branch } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.switch_branch(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                        branch,
+                    );
+                }
+            }
+            MaAction::Reload { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.reload(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                    );
+                }
+            }
+            MaAction::AttemptCommit { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.attempt_commit(ToolBox { office: &mut self.office[office_id], lsp_conn: &self.lsp_conn }, uri);
+                }
+            }
+            MaAction::CancelCommit { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.cancel_commit(ToolBox { office: &mut self.office[office_id], lsp_conn: &self.lsp_conn }, uri);
+                }
+            },
         }
     }
 }

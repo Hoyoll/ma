@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, process, thread::spawn};
 
 use crossbeam::channel::Sender;
 use git2::{BranchType, IndexAddOption, Oid, Status, StatusOptions};
@@ -36,6 +36,13 @@ pub struct Root {
     tag: Container<String>,
     commits: Container<Oid>,
     view: Container<RootView>,
+    mode: RootMode,
+}
+
+#[derive(PartialEq, Debug)]
+pub enum RootMode {
+    Dashboard,
+    Input { message: String },
 }
 
 enum RootView {
@@ -61,6 +68,7 @@ impl Root {
             tag: Container::new(),
             commits: Container::new(),
             view: Container::new(),
+            mode: RootMode::Dashboard,
         }
     }
 
@@ -111,6 +119,7 @@ impl Root {
     }
 
     pub fn build_view(&mut self) {
+        self.view.inner_mut().clear();
         self.view.push(RootView::HeadFile);
 
         self.view.push(RootView::HeadLabel);
@@ -155,7 +164,7 @@ impl Root {
         let head = office.repo.head().unwrap();
 
         self.head_branch = head.shorthand().unwrap().to_string();
-
+        self.remote.inner_mut().clear();
         office.repo.remotes().map(|remotes| {
             for name in remotes.iter().flatten() {
                 if let Some(name) = name {
@@ -166,6 +175,7 @@ impl Root {
 
         self.fill_status(office);
 
+        self.tag.inner_mut().clear();
         office.repo.tag_names(None).map(|tags| {
             for tag in tags.iter().flatten() {
                 if let Some(tag) = tag {
@@ -174,6 +184,7 @@ impl Root {
             }
         });
 
+        self.commits.inner_mut().clear();
         office.repo.revwalk().map(|mut revwalk| {
             revwalk.push(head.target().unwrap());
             for oid in revwalk.take(10) {
@@ -203,99 +214,106 @@ impl Root {
         office: &Office,
         ret: &mut Vec<InlayHint>,
     ) {
-        for i in start_line..end_line {
-            self.view.get(i as usize).map(|view| match view {
-                RootView::LineBreak => (),
-                RootView::HeadFile => {
-                    ret.push(create_inlay_hint(
-                        i,
-                        0,
-                        office.repo.workdir().unwrap().to_string_lossy(),
-                    ));
-                }
-                RootView::HeadLabel => {
-                    ret.push(create_inlay_hint(i, 7, format!(" {}", &self.head_branch)));
-                }
-                RootView::RemoteLabel => (),
-                RootView::RemoteMember(member) => {
-                    let remote = &self.remote[member];
-                    let res = office.repo.find_remote(remote).unwrap();
-                    ret.push(create_inlay_hint(i, 0, "  "));
-                    ret.push(create_inlay_hint(
-                        i,
-                        remote.len() as u32,
-                        format!(" * {}", res.url().unwrap()),
-                    ));
-                }
-                RootView::TagLabel => (),
-                RootView::TagMember(member) => {
-                    let tag = &self.tag[member];
-                    let find = office
-                        .repo
-                        .find_tag(
-                            office
+        match &self.mode {
+            RootMode::Input { .. } => {
+                ret.push(create_inlay_hint(0, 0, "Waiting for commit message"));
+            },
+            RootMode::Dashboard => {
+                for i in start_line..end_line {
+                    self.view.get(i as usize).map(|view| match view {
+                        RootView::LineBreak => (),
+                        RootView::HeadFile => {
+                            ret.push(create_inlay_hint(
+                                i,
+                                0,
+                                office.repo.workdir().unwrap().to_string_lossy(),
+                            ));
+                        }
+                        RootView::HeadLabel => {
+                            ret.push(create_inlay_hint(i, 7, format!(" {}", &self.head_branch)));
+                        }
+                        RootView::RemoteLabel => (),
+                        RootView::RemoteMember(member) => {
+                            let remote = &self.remote[member];
+                            let res = office.repo.find_remote(remote).unwrap();
+                            ret.push(create_inlay_hint(i, 0, "  "));
+                            ret.push(create_inlay_hint(
+                                i,
+                                remote.len() as u32,
+                                format!(" * {}", res.url().unwrap()),
+                            ));
+                        }
+                        RootView::TagLabel => (),
+                        RootView::TagMember(member) => {
+                            let tag = &self.tag[member];
+                            let find = office
                                 .repo
-                                .refname_to_id(&format!("refs/tags/{tag}"))
-                                .unwrap(),
-                        )
-                        .unwrap();
-                    ret.push(create_inlay_hint(i, 0, "  "));
-                    if let Ok(Some(message)) = find.message() {
-                        let content = format!(" * {}", message.trim_end());
-                        ret.push(create_inlay_hint(i, tag.len() as u32, content));
-                    }
-                }
-                RootView::StatusLabel => (),
-                RootView::StatusMember(member) => {
-                    let (_, status) = &self.status[*member];
-                    let staged = if status.contains(Status::INDEX_NEW) {
-                        "A"
-                    } else if status.contains(Status::INDEX_MODIFIED) {
-                        "M"
-                    } else if status.contains(Status::INDEX_DELETED) {
-                        "D"
-                    } else if status.contains(Status::INDEX_RENAMED) {
-                        "R"
-                    } else if status.contains(Status::INDEX_TYPECHANGE) {
-                        "T"
-                    } else {
-                        " "
-                    };
+                                .find_tag(
+                                    office
+                                        .repo
+                                        .refname_to_id(&format!("refs/tags/{tag}"))
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                            ret.push(create_inlay_hint(i, 0, "  "));
+                            if let Ok(Some(message)) = find.message() {
+                                let content = format!(" * {}", message.trim_end());
+                                ret.push(create_inlay_hint(i, tag.len() as u32, content));
+                            }
+                        }
+                        RootView::StatusLabel => (),
+                        RootView::StatusMember(member) => {
+                            let (_, status) = &self.status[*member];
+                            let staged = if status.contains(Status::INDEX_NEW) {
+                                "A"
+                            } else if status.contains(Status::INDEX_MODIFIED) {
+                                "M"
+                            } else if status.contains(Status::INDEX_DELETED) {
+                                "D"
+                            } else if status.contains(Status::INDEX_RENAMED) {
+                                "R"
+                            } else if status.contains(Status::INDEX_TYPECHANGE) {
+                                "T"
+                            } else {
+                                " "
+                            };
 
-                    let unstaged = if status.contains(Status::WT_NEW) {
-                        "?"
-                    } else if status.contains(Status::WT_MODIFIED) {
-                        "M"
-                    } else if status.contains(Status::WT_DELETED) {
-                        "D"
-                    } else if status.contains(Status::WT_RENAMED) {
-                        "R"
-                    } else if status.contains(Status::WT_TYPECHANGE) {
-                        "T"
-                    } else {
-                        " "
-                    };
-                    ret.push(create_inlay_hint(
-                        i,
-                        0,
-                        format!("  {} | {} -> ", staged, unstaged),
-                    ));
+                            let unstaged = if status.contains(Status::WT_NEW) {
+                                "?"
+                            } else if status.contains(Status::WT_MODIFIED) {
+                                "M"
+                            } else if status.contains(Status::WT_DELETED) {
+                                "D"
+                            } else if status.contains(Status::WT_RENAMED) {
+                                "R"
+                            } else if status.contains(Status::WT_TYPECHANGE) {
+                                "T"
+                            } else {
+                                " "
+                            };
+                            ret.push(create_inlay_hint(
+                                i,
+                                0,
+                                format!("  {} | {} -> ", staged, unstaged),
+                            ));
+                        }
+                        RootView::CommitLabel => (),
+                        RootView::CommitMember(member) => {
+                            let commit = &self.commits[member];
+                            let com = office.repo.find_commit(*commit).unwrap();
+                            ret.push(create_inlay_hint(i, 0, "  "));
+                            let mut line = com.message().unwrap().lines();
+                            if let Some(message) = line.next() {
+                                ret.push(create_inlay_hint(
+                                    i,
+                                    HASH_LENGTH as u32,
+                                    format!(" * {}", message),
+                                ));
+                            }
+                        }
+                    });
                 }
-                RootView::CommitLabel => (),
-                RootView::CommitMember(member) => {
-                    let commit = &self.commits[member];
-                    let com = office.repo.find_commit(*commit).unwrap();
-                    ret.push(create_inlay_hint(i, 0, "  "));
-                    let mut line = com.message().unwrap().lines();
-                    if let Some(message) = line.next() {
-                        ret.push(create_inlay_hint(
-                            i,
-                            HASH_LENGTH as u32,
-                            format!(" * {}", message),
-                        ));
-                    }
-                }
-            });
+            }
         }
     }
 
@@ -371,88 +389,123 @@ impl Root {
         params: CodeActionParams,
         ret: &mut CodeActionResponse,
     ) {
-        match &self.view[params.range.start.line as usize] {
-            RootView::LineBreak => (),
-            RootView::HeadFile => (),
-            RootView::HeadLabel => {
-                let branch = match office.repo.branches(Some(BranchType::Local)) {
-                    Ok(branch) => branch,
-                    Err(_) => return,
-                };
-                for b in branch {
-                    match b {
-                        Ok((branch, _)) => {
-                            if let Ok(Some(name)) = branch.name() {
-                                if name == self.head_branch {
-                                    continue;
+        match &self.mode {
+            RootMode::Dashboard => match &self.view[params.range.start.line as usize] {
+                RootView::LineBreak => (),
+                RootView::HeadFile => (),
+                RootView::HeadLabel => {
+                    let branch = match office.repo.branches(Some(BranchType::Local)) {
+                        Ok(branch) => branch,
+                        Err(_) => return,
+                    };
+                    for b in branch {
+                        match b {
+                            Ok((branch, _)) => {
+                                if let Ok(Some(name)) = branch.name() {
+                                    if name == self.head_branch {
+                                        continue;
+                                    }
+                                    ret.push(CodeActionOrCommand::Command(Command {
+                                        title: format!("Switch branch to {}", name),
+                                        command: MaAction::ACTION.into(),
+                                        arguments: MaAction::SwitchBranch {
+                                            uri: params.text_document.uri.clone(),
+                                            branch: name.into(),
+                                        }
+                                        .into(),
+                                    }));
                                 }
-                                ret.push(CodeActionOrCommand::Command(Command {
-                                    title: format!("Switch branch to {}", name),
-                                    command: MaAction::ACTION.into(),
-                                    arguments: MaAction::SwitchBranch { branch: name.into() }.into(),
-                                }));
                             }
+                            Err(_) => continue,
                         }
-                        Err(_) => continue,
                     }
                 }
-            }
-            RootView::RemoteLabel => (),
-            RootView::RemoteMember(_) => (),
-            RootView::TagLabel => (),
-            RootView::TagMember(_) => (),
-            RootView::StatusLabel => {
+                RootView::RemoteLabel => (),
+                RootView::RemoteMember(_) => (),
+                RootView::TagLabel => (),
+                RootView::TagMember(_) => (),
+                RootView::StatusLabel => {
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: "Stage all".into(),
+                        command: MaAction::ACTION.into(),
+                        arguments: MaAction::StageAll {
+                            uri: params.text_document.uri.clone(),
+                        }
+                        .into(),
+                    }));
+                    if !self.status.inner().is_empty() {
+                        ret.push(CodeActionOrCommand::Command(Command {
+                            title: "Commit changes".into(),
+                            command: MaAction::ACTION.into(),
+                            arguments: MaAction::AttemptCommit {
+                                uri: params.text_document.uri,
+                            }
+                            .into(),
+                        }));
+                    }
+                }
+                RootView::StatusMember(path) => {
+                    let (file, status) = &self.status[path];
+                    let staged = status.intersects(
+                        Status::INDEX_NEW
+                            | Status::INDEX_MODIFIED
+                            | Status::INDEX_DELETED
+                            | Status::INDEX_RENAMED
+                            | Status::INDEX_TYPECHANGE,
+                    );
+                    if staged {
+                        ret.push(CodeActionOrCommand::Command(Command {
+                            title: format!("Restage {}", file.to_string_lossy()),
+                            command: MaAction::ACTION.into(),
+                            arguments: MaAction::StageFile {
+                                uri: params.text_document.uri.clone(),
+                                path: *path,
+                            }
+                            .into(),
+                        }));
+                        ret.push(CodeActionOrCommand::Command(Command {
+                            title: format!("Unstage {}", file.to_string_lossy()),
+                            command: MaAction::ACTION.into(),
+                            arguments: MaAction::UnstageFile {
+                                uri: params.text_document.uri,
+                                path: *path,
+                            }
+                            .into(),
+                        }));
+                    } else {
+                        ret.push(CodeActionOrCommand::Command(Command {
+                            title: format!("Stage {}", file.to_string_lossy()),
+                            command: MaAction::ACTION.into(),
+                            arguments: MaAction::StageFile {
+                                uri: params.text_document.uri,
+                                path: *path,
+                            }
+                            .into(),
+                        }));
+                    }
+                }
+                RootView::CommitLabel => (),
+                RootView::CommitMember(_) => (),
+            },
+            RootMode::Input { .. } => {
+                //ret.push(CodeActionOrCommand::Command(Command {
+                //    title: "Commit".into(),
+                //    command: MaAction::ACTION.into(),
+                //    arguments: MaAction::AttemptCommit {
+                //        uri: params.text_document.uri.clone(),
+                //    }
+                //    .into(),
+                //}));
+
                 ret.push(CodeActionOrCommand::Command(Command {
-                    title: "Stage all".into(),
+                    title: "Cancel commit".into(),
                     command: MaAction::ACTION.into(),
-                    arguments: MaAction::StageAll {
+                    arguments: MaAction::CancelCommit {
                         uri: params.text_document.uri,
                     }
                     .into(),
                 }));
             }
-            RootView::StatusMember(path) => {
-                let (file, status) = &self.status[path];
-                let staged = status.intersects(
-                    Status::INDEX_NEW
-                        | Status::INDEX_MODIFIED
-                        | Status::INDEX_DELETED
-                        | Status::INDEX_RENAMED
-                        | Status::INDEX_TYPECHANGE,
-                );
-                if staged {
-                    ret.push(CodeActionOrCommand::Command(Command {
-                        title: format!("Restage {}", file.to_string_lossy()),
-                        command: MaAction::ACTION.into(),
-                        arguments: MaAction::StageFile {
-                            uri: params.text_document.uri.clone(),
-                            path: *path,
-                        }
-                        .into(),
-                    }));
-                    ret.push(CodeActionOrCommand::Command(Command {
-                        title: format!("Unstage {}", file.to_string_lossy()),
-                        command: MaAction::ACTION.into(),
-                        arguments: MaAction::UnstageFile {
-                            uri: params.text_document.uri,
-                            path: *path,
-                        }
-                        .into(),
-                    }));
-                } else {
-                    ret.push(CodeActionOrCommand::Command(Command {
-                        title: format!("Stage {}", file.to_string_lossy()),
-                        command: MaAction::ACTION.into(),
-                        arguments: MaAction::StageFile {
-                            uri: params.text_document.uri,
-                            path: *path,
-                        }
-                        .into(),
-                    }));
-                }
-            }
-            RootView::CommitLabel => (),
-            RootView::CommitMember(_) => (),
         }
     }
 }
@@ -589,9 +642,125 @@ impl WorkGroup {
             }
         }
     }
+
+    pub fn switch_branch(&mut self, toolbox: ToolBox, uri: Uri, branch: String) {
+        match self {
+            WorkGroup::Root(root) => {
+                let mut cmd = process::Command::new("git");
+                cmd.args(&[
+                    "-C",
+                    &toolbox.office.repo.workdir().unwrap().to_string_lossy(),
+                    "switch",
+                    &branch,
+                ]);
+
+                let conn = toolbox.lsp_conn.clone();
+                let url = uri.clone();
+                spawn(move || {
+                    let mut git = match cmd.spawn() {
+                        Ok(git) => git,
+                        Err(_) => return,
+                    };
+                    match git.wait() {
+                        Ok(e) if e.success() => {
+                            conn.send(Kind::Other(MaAction::Reload { uri }));
+                        }
+                        _ => (),
+                    }
+                });
+                // Nasty shit going on here, you need to send this action so the reload happen
+                root.refresh(url, toolbox.lsp_conn);
+            }
+        }
+    }
+
+    pub fn reload(&mut self, toolbox: ToolBox, uri: Uri) {
+        match self {
+            WorkGroup::Root(root) => {
+                root.fill_root(toolbox.office);
+                root.build_view();
+                root.refresh(uri, toolbox.lsp_conn);
+            }
+        }
+    }
+
+    pub fn attempt_commit(&mut self, toolbox: ToolBox, uri: Uri) {
+        match self {
+            WorkGroup::Root(root) => match &root.mode {
+                RootMode::Dashboard => {
+                    root.mode = RootMode::Input {
+                        message: String::new(),
+                        
+                    };
+                    toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                        url: uri,
+                        content: "\n\n".into(),
+                        range: Range::new(Position::new(0, 0), Position::new(1000, 0)),
+                    }));
+                }
+                RootMode::Input { message, .. } => {
+                    let author = toolbox.office.repo.author_from_env().unwrap();
+                    let committer = toolbox.office.repo.committer_from_env().unwrap();
+                    let mut index = toolbox.office.repo.index().unwrap();
+                    let tree_id = index.write_tree().unwrap();
+                    let tree = toolbox.office.repo.find_tree(tree_id).unwrap();
+                    let res = match toolbox.office.repo.head().ok() {
+                        Some(head) => {
+                            let parent = head.peel_to_commit().unwrap();
+                            // Existing commit
+                            toolbox.office.repo.commit(
+                                Some("HEAD"),
+                                &author,
+                                &committer,
+                                message.trim_start(),
+                                &tree,
+                                &[&parent],
+                            )
+                        }
+                        None => toolbox.office.repo.commit(
+                            Some("HEAD"),
+                            &author,
+                            &committer,
+                            message.as_ref(),
+                            &tree,
+                            &[],
+                        ),
+                    };
+                    if let Ok(_) = res {
+                        root.mode = RootMode::Dashboard;
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::Reload { uri }));
+                    }
+                }
+            },
+        }
+    }
+
+    pub fn cancel_commit(&mut self, toolbox: ToolBox, uri: Uri) {
+        match self {
+            WorkGroup::Root(root) => {
+                root.mode = RootMode::Dashboard;
+                toolbox.lsp_conn.send(Kind::Other(MaAction::Reload { uri }));
+            },
+        }
+    }
 }
 
 impl WorkGroup {
-    pub fn did_save(&mut self, toolbox: ToolBox, params: DidSaveTextDocumentParams) {}
+    pub fn did_save(&mut self, toolbox: ToolBox, params: DidSaveTextDocumentParams) {
+        match self {
+            WorkGroup::Root(root) => {
+                match &mut root.mode {
+                    RootMode::Dashboard => (),
+                    RootMode::Input { message } => {
+                        if let Some(text) = params.text {
+                            *message = text;
+                            toolbox.lsp_conn.send(Kind::Other(MaAction::AttemptCommit { uri: params.text_document.uri }));
+                        }
+                    },
+                }
+            },
+        }
+    }
+
     pub fn did_open(&mut self, toolbox: ToolBox, params: DidOpenTextDocumentParams) {}
 }
