@@ -218,7 +218,7 @@ impl Root {
         match &self.mode {
             RootMode::Input { .. } => {
                 ret.push(create_inlay_hint(0, 0, "Waiting for commit message"));
-            },
+            }
             RootMode::Dashboard => {
                 for i in start_line..end_line {
                     self.view.get(i as usize).map(|view| match view {
@@ -691,7 +691,6 @@ impl WorkGroup {
                 RootMode::Dashboard => {
                     root.mode = RootMode::Input {
                         message: String::new(),
-                        
                     };
                     toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
                         url: uri,
@@ -741,7 +740,7 @@ impl WorkGroup {
             WorkGroup::Root(root) => {
                 root.mode = RootMode::Dashboard;
                 toolbox.lsp_conn.send(Kind::Other(MaAction::Reload { uri }));
-            },
+            }
         }
     }
 
@@ -755,15 +754,15 @@ impl WorkGroup {
 impl WorkGroup {
     pub fn did_save(&mut self, toolbox: ToolBox, params: DidSaveTextDocumentParams) {
         match self {
-            WorkGroup::Root(root) => {
-                match &mut root.mode {
-                    RootMode::Dashboard => (),
-                    RootMode::Input { message } => {
-                        if let Some(text) = params.text {
-                            *message = text;
-                            toolbox.lsp_conn.send(Kind::Other(MaAction::AttemptCommit { uri: params.text_document.uri }));
-                        }
-                    },
+            WorkGroup::Root(root) => match &mut root.mode {
+                RootMode::Dashboard => (),
+                RootMode::Input { message } => {
+                    if let Some(text) = params.text {
+                        *message = text;
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::AttemptCommit {
+                            uri: params.text_document.uri,
+                        }));
+                    }
                 }
             },
         }
@@ -774,12 +773,15 @@ impl WorkGroup {
 
 pub struct Diff {
     pub view: Container<DiffView>,
-    //pub diff_file: Container<PathBuf>
+    pub diff_file: Container<PathBuf>,
 }
 
 impl Diff {
     pub fn new() -> Self {
-        Self { view: Container::new() }
+        Self {
+            view: Container::new(),
+            diff_file: Container::new(),
+        }
     }
 }
 
@@ -795,25 +797,29 @@ pub enum DiffView {
     Date {
         date: Length,
     },
-    MessageLine(String),
-    DiffFile { old: PathBuf, new: PathBuf }, 
+    MessageLine(Length),
+    OldFile(Option<PathBuf>),
+    //    old: Option<PathBuf>,
+    //},
+    NewFile {
+        from_file: usize,
+    },
     HunkHeader {
         from_file: usize,
-        old: Position,
-        new: Position,
+        length: Length,
     },
     Parent {
-        oid: Oid
+        oid: Oid,
     },
     Current {
-        oid: Oid
+        oid: Oid,
     },
     HunkLine {
         from_diff_file: usize,
-        position: u32,
+        line: u32,
         //content: Length,
     },
     OldLine {
-        content: Length
-    }
+        content: Length,
+    },
 }
