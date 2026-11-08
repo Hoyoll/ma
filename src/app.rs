@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use crossbeam::channel::Sender;
 use git2::{Oid, Repository};
@@ -10,13 +10,13 @@ use lsp_types::{
     HoverProviderCapability, InlayHintParams, OneOf, Range, SaveOptions, SemanticTokenType,
     SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities,
-    StaticRegistrationOptions, TextDocumentRegistrationOptions, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
-    WorkDoneProgressOptions, WorkspaceEdit,
+    ShowDocumentParams, StaticRegistrationOptions, TextDocumentRegistrationOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
     notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification},
     request::{
         ApplyWorkspaceEdit, CodeActionRequest, ExecuteCommand, GotoDefinition, HoverRequest,
-        InlayHintRequest, Request, SemanticTokensFullRequest,
+        InlayHintRequest, Request, SemanticTokensFullRequest, ShowDocument,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use serde_json::{Value, from_value, to_value};
 
 use crate::{
     lsp::Kind,
-    util::{self, Container},
+    util::{self, Container, name_to_url},
     workgroup::{Diff, DiffView, Root, ToolBox, WorkGroup},
 };
 #[repr(u32)]
@@ -93,7 +93,7 @@ pub fn capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
-                //change: Some(TextDocumentSyncKind::FULL),
+                change: Some(TextDocumentSyncKind::FULL),
                 save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                     include_text: Some(true),
                 })),
@@ -509,161 +509,41 @@ impl App {
             MaAction::PullRemote { uri, name } => (),
             MaAction::PushRemote { uri, name } => (),
             MaAction::OpenDiff { uri, oid } => {
-                let (wg, office_id) = match self.work_group.get_mut(&uri) {
-                    None => return,
-                    Some(ret) => ret,
-                };
-                let office = &self.office[office_id];
-                let oid = wg.open_diff(oid);
-                let commit = office.repo.find_commit(oid).unwrap();
-                let mut diff_group = Diff::new();
-                let mut format = String::new();
-                let author_signature = commit.author();
-                let author_name = author_signature.name().unwrap_or_default();
-                let author_email = author_signature.email().unwrap_or_default();
-                let author_date =
-                    util::format_git_time(author_signature.when()).unwrap_or_default();
+                let new_wg = match self.work_group.get_mut(&uri) {
+                    None => None,
+                    Some((wg, office_id)) => {
+                        let office = &self.office[*office_id];
+                        let oid = wg.open_diff(oid);
+                        let commit = match office.repo.find_commit(oid) {
+                            Ok(commit) => commit,
+                            Err(_) => return,
+                        };
+                        let mut diff_group = Diff::new(office, &commit);
+                        let format = diff_group.build_diff(office, &commit);
 
-                let author_content = format!("Author: {} {}\n", author_name, author_email);
-                format.push_str(&author_content);
-                diff_group.view.push(DiffView::Author {
-                    username: author_name.len(),
-                    email: author_email.len(),
-                });
-
-                let date_content = format!("Date  : {}\n", &author_date);
-                format.push_str(&date_content);
-                diff_group.view.push(DiffView::Date {
-                    date: author_date.len(),
-                });
-
-                commit.message().map(|message| {
-                    message.lines().for_each(|line| {
-                        diff_group.view.push(DiffView::MessageLine(line.len()));
-                    });
-                });
-                let current_tree = commit.tree().ok();
-
-                format.push_str("\n");
-                diff_group.view.push(DiffView::LineBreak);
-
-                let diff = match commit.parent_count() {
-                    0 => {
-                        office
-                            .repo
-                            .diff_tree_to_tree(None, current_tree.as_ref(), None)
-                            .ok()
-                        //None
-                    }
-                    1 => {
-                        let parent_oid = commit.parent(0).unwrap().id();
-                        let parent_tree = office.repo.find_commit(parent_oid).unwrap().tree().ok();
-                        format.push_str(&format!("- {}\n", parent_oid.to_string()));
-                        diff_group.view.push(DiffView::Parent { oid: parent_oid });
-
-                        format.push_str(&format!("+ {}\n", oid.to_string()));
-                        diff_group.view.push(DiffView::Parent { oid });
-
-                        office
-                            .repo
-                            .diff_tree_to_tree(parent_tree.as_ref(), current_tree.as_ref(), None)
-                            .ok()
-                        //diff_group.view.push(DiffView::Parent { oid: commit. });
-                    }
-                    _ => {
-                        for parent in commit.parents() {
-                            format.push_str(&format!("- {}\n", parent.id().to_string()));
-                            diff_group.view.push(DiffView::Parent { oid: parent.id() });
-                        }
-
-                        None
+                        let location = diff_group.write_diff(&format);
+                        let url = name_to_url(&location).unwrap(); 
+                        Some((url, (WorkGroup::Diff(diff_group), office_id.clone())))
                     }
                 };
-
-                diff.map(|diff| {
-                    format.push_str("\n");
-                    diff_group.view.push(DiffView::LineBreak);
-
-                    let mut file_id = Oid::ZERO_SHA1;
-                    let mut from_file = 0usize;
-                    let mut hunk_id = 0u32;
-                    let mut hunk_line = 0u32;
-                    diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-                        let file = delta.new_file();
-                        let new_file = file.id() != file_id;
-                        if new_file {
-                            file_id = file.id();
-                            hunk_id = 0;
-                            let path = file.path().unwrap();
-                            from_file = diff_group.diff_file.add(path.into());
-                            let old_file = match delta.old_file().path() {
-                                Some(path) => {
-                                    diff_group
-                                        .view
-                                        .push(DiffView::OldFile(Some(path.to_path_buf())));
-                                    &path.to_string_lossy()
-                                }
-                                None => {
-                                    diff_group.view.push(DiffView::OldFile(None));
-                                    "/dev/null"
-                                }
-                            };
-                            let content =
-                                format!("--- {}\n +++ {}\n", old_file, path.to_string_lossy());
-                            format.push_str(&content);
-
-                            diff_group.view.push(DiffView::NewFile { from_file });
-                        }
-
-                        match hunk {
-                            Some(hunk) if hunk_id != hunk.new_start() => {
-                                hunk_id = hunk.new_start();
-                                hunk_line = hunk.new_start() - 1;
-                                let header = format!(
-                                    "@@ -{},{} +{},{}\n",
-                                    hunk.old_start(),
-                                    hunk.old_lines(),
-                                    hunk.new_start(),
-                                    hunk.new_lines()
-                                );
-                                diff_group.view.push(DiffView::HunkHeader {
-                                    from_file,
-                                    length: header.len(),
-                                });
-                                format.push_str(&header);
+                if let Some((uri, wg)) = new_wg {
+                    self.work_group.insert(uri.clone(), wg);
+                    self.lsp_conn.send(Kind::Main(
+                            lsp_server::Request {
+                                id: RequestId::from(1),
+                                method: ShowDocument::METHOD.into(),
+                                params: to_value(ShowDocumentParams {
+                                    uri,
+                                    external: None,
+                                    take_focus: Some(true),
+                                    selection: None,
+                                })
+                                .unwrap(),
                             }
-                            Some(_) => {
-                                hunk_line += 1;
-                                match line.origin() {
-                                    ' ' | '+' => {
-                                        diff_group.view.push(DiffView::HunkLine {
-                                            from_diff_file: from_file,
-                                            line: hunk_line,
-                                        });
-                                        format.push_str(&format!(
-                                            "{} {}",
-                                            line.origin(),
-                                            String::from_utf8_lossy(line.content())
-                                        ));
-                                    }
-                                    '-' => {
-                                        diff_group.view.push(DiffView::OldLine {
-                                            content: line.content().len(),
-                                        });
-                                        format.push_str(&format!(
-                                            "{} {}",
-                                            line.origin(),
-                                            String::from_utf8_lossy(line.content())
-                                        ));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            None => (),
-                        }
-                        true
-                    });
-                });
+                            .into(),
+                        ));
+                }
+                //let diff_file = diff_path.join(".diff");
             }
         }
     }

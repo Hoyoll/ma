@@ -1,20 +1,25 @@
-use std::{path::PathBuf, process, thread::spawn};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process,
+    thread::spawn,
+};
 
 use crossbeam::channel::Sender;
-use git2::{BranchType, IndexAddOption, Oid, Status, StatusOptions};
+use git2::{BranchType, Commit, IndexAddOption, Oid, Status, StatusOptions};
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams,
     Position, Range, SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult,
-    Uri,
+    TextDocumentPositionParams, Uri,
 };
 use serde_json::to_value;
 
 use crate::{
     app::{MaAction, Office, SemanticTokenList},
     lsp::Kind,
-    util::{Container, create_inlay_hint, create_semantic_token},
+    util::{self, Container, create_inlay_hint, create_semantic_token},
 };
 
 pub struct ToolBox<'ma> {
@@ -27,7 +32,7 @@ const HASH_LENGTH: usize = 7;
 
 pub enum WorkGroup {
     Root(Root),
-    //Diff(Diff),
+    Diff(Diff),
 }
 
 pub struct Root {
@@ -209,18 +214,46 @@ impl Root {
 }
 
 impl Root {
+    fn goto_definition(
+        &self,
+        lsp_conn: &Sender<Kind<Message, MaAction>>,
+        params: TextDocumentPositionParams,
+    ) {
+        match self.view[params.position.line as usize] {
+            RootView::LineBreak => (),
+            RootView::HeadFile => (),
+            RootView::HeadLabel => (),
+            RootView::RemoteLabel => (),
+            RootView::RemoteMember(_) => (),
+            RootView::TagLabel => (),
+            RootView::TagMember(_) => (),
+            RootView::StatusLabel => (),
+            RootView::StatusMember(_) => (),
+            RootView::CommitLabel => (),
+            RootView::CommitMember(member) => {
+                lsp_conn.send(Kind::Other(MaAction::OpenDiff {
+                    uri: params.text_document.uri,
+                    oid: member,
+                }));
+            }
+        }
+    }
+
     fn inlay_hint(
         &self,
         (start_line, end_line): (u32, u32),
         office: &Office,
         ret: &mut Vec<InlayHint>,
     ) {
+        //eprintln!("hint!");
         match &self.mode {
             RootMode::Input { .. } => {
+                //eprintln!("it's impossible to be here!");
                 ret.push(create_inlay_hint(0, 0, "Waiting for commit message"));
             }
             RootMode::Dashboard => {
                 for i in start_line..end_line {
+                    //eprintln!("{i}");
                     self.view.get(i as usize).map(|view| match view {
                         RootView::LineBreak => (),
                         RootView::HeadFile => {
@@ -512,13 +545,24 @@ impl Root {
 }
 
 impl WorkGroup {
-    pub fn hover(&mut self, toolbox: ToolBox, id: RequestId, params: HoverParams) {}
+    pub fn hover(&mut self, toolbox: ToolBox, id: RequestId, params: HoverParams) {
+        match self {
+            WorkGroup::Root(root) => (),
+            WorkGroup::Diff(diff) => (),
+        }
+    }
     pub fn goto_definition(
         &mut self,
         toolbox: ToolBox,
         id: RequestId,
         params: GotoDefinitionParams,
     ) {
+        match self {
+            WorkGroup::Root(root) => {
+                root.goto_definition(toolbox.lsp_conn, params.text_document_position_params);
+            },
+            WorkGroup::Diff(diff) => (),
+        }
     }
 
     pub fn code_action(&mut self, toolbox: ToolBox, id: RequestId, params: CodeActionParams) {
@@ -527,6 +571,7 @@ impl WorkGroup {
             WorkGroup::Root(root) => {
                 root.code_action(toolbox.office, params, &mut ret);
             }
+            WorkGroup::Diff(diff) => (),
         }
         toolbox.lsp_conn.send(Kind::Main(
             Response {
@@ -542,12 +587,14 @@ impl WorkGroup {
         //eprintln!("here!");
         match self {
             WorkGroup::Root(root) => {
+                //eprintln!("{:?}", params.range);
                 root.inlay_hint(
                     (params.range.start.line, params.range.end.line),
                     toolbox.office,
                     &mut ret,
                 );
             }
+            WorkGroup::Diff(diff) => (),
         }
 
         toolbox
@@ -605,6 +652,7 @@ impl WorkGroup {
 
                 root.refresh(uri, toolbox.lsp_conn);
             }
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -623,6 +671,7 @@ impl WorkGroup {
 
                 root.refresh(uri, toolbox.lsp_conn);
             }
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -641,6 +690,7 @@ impl WorkGroup {
 
                 root.refresh(uri, toolbox.lsp_conn);
             }
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -672,6 +722,7 @@ impl WorkGroup {
                 // Nasty shit going on here, you need to send this action so the reload happen
                 root.refresh(url, toolbox.lsp_conn);
             }
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -682,6 +733,7 @@ impl WorkGroup {
                 root.build_view();
                 root.refresh(uri, toolbox.lsp_conn);
             }
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -732,6 +784,7 @@ impl WorkGroup {
                     }
                 }
             },
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -741,12 +794,17 @@ impl WorkGroup {
                 root.mode = RootMode::Dashboard;
                 toolbox.lsp_conn.send(Kind::Other(MaAction::Reload { uri }));
             }
+            _ => (),
         }
     }
 
     pub fn open_diff(&mut self, oid_id: usize) -> Oid {
         match self {
             WorkGroup::Root(root) => root.commits[oid_id],
+            WorkGroup::Diff(diff) => match diff.view[oid_id] {
+                DiffView::Parent { oid } => oid,
+                _ => Oid::ZERO_SHA1,
+            },
         }
     }
 }
@@ -765,6 +823,7 @@ impl WorkGroup {
                     }
                 }
             },
+            WorkGroup::Diff(diff) => todo!(),
         }
     }
 
@@ -774,14 +833,188 @@ impl WorkGroup {
 pub struct Diff {
     pub view: Container<DiffView>,
     pub diff_file: Container<PathBuf>,
+    pub diff_dir: PathBuf,
 }
 
 impl Diff {
-    pub fn new() -> Self {
+    pub fn new(office: &Office, commit: &Commit) -> Self {
         Self {
             view: Container::new(),
             diff_file: Container::new(),
+            diff_dir: office
+                .repo
+                .workdir()
+                .unwrap()
+                .join(".git")
+                .join("ma")
+                .join(commit.id().to_string()),
         }
+    }
+
+    pub fn build_diff(&mut self, office: &Office, commit: &Commit) -> String {
+        let diff_group = self;
+        let mut format = String::new();
+        //let commit = office.repo.find_commit(oid).unwrap();
+        let author_signature = commit.author();
+        let author_name = author_signature.name().unwrap_or_default();
+        let author_email = author_signature.email().unwrap_or_default();
+        let author_date = util::format_git_time(author_signature.when()).unwrap_or_default();
+
+        let author_content = format!("Author: {} {}\n", author_name, author_email);
+        format.push_str(&author_content);
+        diff_group.view.push(DiffView::Author {
+            username: author_name.len(),
+            email: author_email.len(),
+        });
+
+        let date_content = format!("Date  : {}\n", &author_date);
+        format.push_str(&date_content);
+        diff_group.view.push(DiffView::Date {
+            date: author_date.len(),
+        });
+
+        format.push_str("\n");
+        diff_group.view.push(DiffView::LineBreak);
+
+        commit.message().map(|message| {
+            message.lines().for_each(|line| {
+                diff_group.view.push(DiffView::MessageLine(line.len()));
+                format.push_str(line);
+                format.push_str("\n");
+            });
+        });
+        let current_tree = commit.tree().ok();
+
+        format.push_str("\n");
+        diff_group.view.push(DiffView::LineBreak);
+
+        let diff = match commit.parent_count() {
+            0 => {
+                office
+                    .repo
+                    .diff_tree_to_tree(None, current_tree.as_ref(), None)
+                    .ok()
+                //None
+            }
+            1 => {
+                let parent_oid = commit.parent(0).unwrap().id();
+                let parent_tree = office.repo.find_commit(parent_oid).unwrap().tree().ok();
+                format.push_str(&format!("- {}\n", parent_oid.to_string()));
+                diff_group.view.push(DiffView::Parent { oid: parent_oid });
+
+                format.push_str(&format!("+ {}\n", commit.id().to_string()));
+                diff_group.view.push(DiffView::Parent { oid: commit.id() });
+
+                office
+                    .repo
+                    .diff_tree_to_tree(parent_tree.as_ref(), current_tree.as_ref(), None)
+                    .ok()
+                //diff_group.view.push(DiffView::Parent { oid: commit. });
+            }
+            _ => {
+                for parent in commit.parents() {
+                    format.push_str(&format!("- {}\n", parent.id().to_string()));
+                    diff_group.view.push(DiffView::Parent { oid: parent.id() });
+                }
+
+                None
+            }
+        };
+
+        diff.map(|diff| {
+            format.push_str("\n");
+            diff_group.view.push(DiffView::LineBreak);
+
+            let mut file_id = Oid::ZERO_SHA1;
+            let mut from_file = 0usize;
+            let mut hunk_id = 0u32;
+            let mut hunk_line = 0u32;
+            diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
+                let file = delta.new_file();
+                let new_file = file.id() != file_id;
+                if new_file {
+                    file_id = file.id();
+                    hunk_id = 0;
+                    let path = file.path().unwrap();
+                    from_file = diff_group.diff_file.add(path.into());
+                    let old_file = match delta.old_file().path() {
+                        Some(path) => {
+                            diff_group
+                                .view
+                                .push(DiffView::OldFile(Some(path.to_path_buf())));
+                            &path.to_string_lossy()
+                        }
+                        None => {
+                            diff_group.view.push(DiffView::OldFile(None));
+                            "/dev/null"
+                        }
+                    };
+                    let content = format!("--- {}\n+++ {}\n", old_file, path.to_string_lossy());
+                    format.push_str(&content);
+
+                    diff_group.view.push(DiffView::NewFile { from_file });
+                }
+
+                match hunk {
+                    Some(hunk) if hunk_id != hunk.new_start() => {
+                        hunk_id = hunk.new_start();
+                        hunk_line = hunk.new_start() - 1;
+                        let header = format!(
+                            "@@ -{},{} +{},{} @@\n",
+                            hunk.old_start(),
+                            hunk.old_lines(),
+                            hunk.new_start(),
+                            hunk.new_lines()
+                        );
+                        diff_group.view.push(DiffView::HunkHeader {
+                            from_file,
+                            length: header.len(),
+                        });
+                        format.push_str(&header);
+                    }
+                    Some(_) => {
+                        hunk_line += 1;
+                        match line.origin() {
+                            ' ' | '+' => {
+                                diff_group.view.push(DiffView::HunkLine {
+                                    from_diff_file: from_file,
+                                    line: hunk_line,
+                                });
+                                format.push_str(&format!(
+                                    "{} {}",
+                                    line.origin(),
+                                    String::from_utf8_lossy(line.content())
+                                ));
+                            }
+                            '-' => {
+                                diff_group.view.push(DiffView::OldLine {
+                                    content: line.content().len(),
+                                });
+                                format.push_str(&format!(
+                                    "{} {}",
+                                    line.origin(),
+                                    String::from_utf8_lossy(line.content())
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => (),
+                }
+                true
+            });
+        });
+        format
+    }
+
+    pub fn write_diff(&self, format: &str) -> PathBuf {
+        fs::create_dir_all(&self.diff_dir);
+        let location = self.diff_dir.join("commit.diff");
+        if let Err(e) = fs::write(&location, &format) {
+            eprintln!("{}", e.to_string());
+            //return;
+        }
+        location
     }
 }
 
