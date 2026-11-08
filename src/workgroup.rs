@@ -10,17 +10,135 @@ use git2::{BranchType, Commit, IndexAddOption, Oid, Status, StatusOptions};
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams,
-    Position, Range, SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult,
-    TextDocumentPositionParams, Uri,
+    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
+    InlayHint, InlayHintParams, Location, Position, Range, SemanticToken, SemanticTokens,
+    SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, Uri,
 };
 use serde_json::to_value;
 
 use crate::{
     app::{MaAction, Office, SemanticTokenList},
     lsp::Kind,
-    util::{self, Container, create_inlay_hint, create_semantic_token},
+    util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
+
+impl WorkGroup {
+    pub fn did_save(&mut self, toolbox: ToolBox, params: DidSaveTextDocumentParams) {
+        match self {
+            WorkGroup::Root(root) => match &mut root.mode {
+                RootMode::Dashboard => (),
+                RootMode::Input { message } => {
+                    if let Some(text) = params.text {
+                        *message = text;
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::AttemptCommit {
+                            uri: params.text_document.uri,
+                        }));
+                    }
+                }
+            },
+            WorkGroup::Diff(diff) => todo!(),
+        }
+    }
+
+    pub fn did_open(&mut self, toolbox: ToolBox, params: DidOpenTextDocumentParams) {}
+}
+
+impl WorkGroup {
+    pub fn hover(&mut self, toolbox: ToolBox, id: RequestId, params: HoverParams) {
+        match self {
+            WorkGroup::Root(root) => (),
+            WorkGroup::Diff(diff) => (),
+        }
+    }
+
+    pub fn goto_definition(
+        &mut self,
+        toolbox: ToolBox,
+        id: RequestId,
+        params: GotoDefinitionParams,
+    ) {
+        match self {
+            WorkGroup::Root(root) => {
+                root.goto_definition(toolbox.lsp_conn, params.text_document_position_params);
+            }
+            WorkGroup::Diff(diff) => {
+                diff.goto_definition(&toolbox, (id, params.text_document_position_params));
+            }
+        }
+    }
+
+    pub fn code_action(&mut self, toolbox: ToolBox, id: RequestId, params: CodeActionParams) {
+        let mut ret = CodeActionResponse::new();
+        match self {
+            WorkGroup::Root(root) => {
+                root.code_action(toolbox.office, params, &mut ret);
+            }
+            WorkGroup::Diff(diff) => (),
+        }
+        toolbox.lsp_conn.send(Kind::Main(
+            Response {
+                id,
+                response_result: Ok(to_value(Some(ret)).unwrap()),
+            }
+            .into(),
+        ));
+    }
+
+    pub fn inlay_hint(&mut self, toolbox: ToolBox, id: RequestId, params: InlayHintParams) {
+        let mut ret = Vec::<InlayHint>::new();
+        //eprintln!("here!");
+        match self {
+            WorkGroup::Root(root) => {
+                //eprintln!("{:?}", params.range);
+                root.inlay_hint(
+                    (params.range.start.line, params.range.end.line),
+                    toolbox.office,
+                    &mut ret,
+                );
+            }
+            WorkGroup::Diff(diff) => {
+                diff.inlay_hint(
+                    (params.range.start.line, params.range.end.line),
+                    toolbox.office,
+                    &mut ret,
+                );
+            }
+        }
+
+        toolbox
+            .lsp_conn
+            .send(Kind::Main(Message::Response(Response {
+                id,
+                response_result: Ok(to_value(ret).unwrap()),
+            })));
+    }
+
+    pub fn semantic_token(
+        &mut self,
+        toolbox: ToolBox,
+        id: RequestId,
+        _params: SemanticTokensParams,
+    ) {
+        let mut data: Vec<SemanticToken> = vec![];
+
+        match self {
+            WorkGroup::Root(root) => {
+                root.semantic_token(&mut data);
+            }
+            _ => (),
+        }
+        let st = SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        });
+        toolbox
+            .lsp_conn
+            .send(Kind::Main(Message::Response(Response {
+                id,
+                response_result: Ok(to_value(st).unwrap()),
+            })));
+    }
+}
 
 pub struct ToolBox<'ma> {
     pub office: &'ma mut Office,
@@ -545,94 +663,6 @@ impl Root {
 }
 
 impl WorkGroup {
-    pub fn hover(&mut self, toolbox: ToolBox, id: RequestId, params: HoverParams) {
-        match self {
-            WorkGroup::Root(root) => (),
-            WorkGroup::Diff(diff) => (),
-        }
-    }
-    pub fn goto_definition(
-        &mut self,
-        toolbox: ToolBox,
-        id: RequestId,
-        params: GotoDefinitionParams,
-    ) {
-        match self {
-            WorkGroup::Root(root) => {
-                root.goto_definition(toolbox.lsp_conn, params.text_document_position_params);
-            },
-            WorkGroup::Diff(diff) => (),
-        }
-    }
-
-    pub fn code_action(&mut self, toolbox: ToolBox, id: RequestId, params: CodeActionParams) {
-        let mut ret = CodeActionResponse::new();
-        match self {
-            WorkGroup::Root(root) => {
-                root.code_action(toolbox.office, params, &mut ret);
-            }
-            WorkGroup::Diff(diff) => (),
-        }
-        toolbox.lsp_conn.send(Kind::Main(
-            Response {
-                id,
-                response_result: Ok(to_value(Some(ret)).unwrap()),
-            }
-            .into(),
-        ));
-    }
-
-    pub fn inlay_hint(&mut self, toolbox: ToolBox, id: RequestId, params: InlayHintParams) {
-        let mut ret = Vec::<InlayHint>::new();
-        //eprintln!("here!");
-        match self {
-            WorkGroup::Root(root) => {
-                //eprintln!("{:?}", params.range);
-                root.inlay_hint(
-                    (params.range.start.line, params.range.end.line),
-                    toolbox.office,
-                    &mut ret,
-                );
-            }
-            WorkGroup::Diff(diff) => (),
-        }
-
-        toolbox
-            .lsp_conn
-            .send(Kind::Main(Message::Response(Response {
-                id,
-                response_result: Ok(to_value(ret).unwrap()),
-            })));
-    }
-
-    pub fn semantic_token(
-        &mut self,
-        toolbox: ToolBox,
-        id: RequestId,
-        _params: SemanticTokensParams,
-    ) {
-        let mut data: Vec<SemanticToken> = vec![];
-
-        match self {
-            WorkGroup::Root(root) => {
-                root.semantic_token(&mut data);
-            }
-            _ => (),
-        }
-        let st = SemanticTokensResult::Tokens(SemanticTokens {
-            result_id: None,
-            data,
-        });
-        toolbox
-            .lsp_conn
-            .send(Kind::Main(Message::Response(Response {
-                id,
-                response_result: Ok(to_value(st).unwrap()),
-            })));
-    }
-}
-
-impl WorkGroup {
     pub fn stage_file(&mut self, toolbox: ToolBox, uri: Uri, path: usize) {
         match self {
             WorkGroup::Root(root) => {
@@ -809,34 +839,56 @@ impl WorkGroup {
     }
 }
 
-impl WorkGroup {
-    pub fn did_save(&mut self, toolbox: ToolBox, params: DidSaveTextDocumentParams) {
-        match self {
-            WorkGroup::Root(root) => match &mut root.mode {
-                RootMode::Dashboard => (),
-                RootMode::Input { message } => {
-                    if let Some(text) = params.text {
-                        *message = text;
-                        toolbox.lsp_conn.send(Kind::Other(MaAction::AttemptCommit {
-                            uri: params.text_document.uri,
-                        }));
-                    }
-                }
-            },
-            WorkGroup::Diff(diff) => todo!(),
-        }
-    }
-
-    pub fn did_open(&mut self, toolbox: ToolBox, params: DidOpenTextDocumentParams) {}
-}
-
 pub struct Diff {
     pub view: Container<DiffView>,
     pub diff_file: Container<PathBuf>,
     pub diff_dir: PathBuf,
+    pub oid: Oid,
+}
+
+pub type Length = usize;
+
+pub enum DiffView {
+    LineBreak,
+    //Padding,
+    Author {
+        username: Length,
+        email: Length,
+    },
+    Date {
+        date: Length,
+    },
+    MessageLine(Length),
+    OldFile(Option<PathBuf>),
+    //    old: Option<PathBuf>,
+    //},
+    NewFile {
+        from_file: usize,
+    },
+    HunkHeader {
+        from_file: usize,
+        length: Length,
+    },
+    Parent {
+        oid: Oid,
+    },
+    Current {
+        oid: Oid,
+    },
+    HunkLine {
+        from_diff_file: usize,
+        line: u32,
+        //content: Length,
+    },
+    OldLine {
+        content: Length,
+    },
 }
 
 impl Diff {
+    const DATE_LABEL: &str = "Date  : ";
+    const AUTHOR_LABEL: &str = "Author: ";
+    const MESSAGE_PADDING: &str = "        ";
     pub fn new(office: &Office, commit: &Commit) -> Self {
         Self {
             view: Container::new(),
@@ -848,7 +900,35 @@ impl Diff {
                 .join(".git")
                 .join("ma")
                 .join(commit.id().to_string()),
+            oid: commit.id(),
         }
+    }
+
+    fn build_old_file(&self, office: &Office, path: &Path) -> Option<String> {
+        let commit = match office.repo.find_commit(self.oid) {
+            Ok(commmit) => commmit,
+            Err(_) => return None,
+        };
+        let tree = commit.tree().unwrap();
+        let entry = match tree.get_path(path) {
+            Ok(tree_entry) => tree_entry,
+            Err(_) => return None,
+        };
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            return None;
+        }
+        let blob = match office.repo.find_blob(entry.id()) {
+            Ok(blob) => blob,
+            Err(_) => return None,
+        };
+        Some(String::from_utf8_lossy(blob.content()).into())
+    }
+
+    fn write_old_file(&self, content: &str, path: &Path) -> PathBuf {
+        let location = self.diff_dir.join(path);
+        fs::create_dir_all(location.parent().unwrap());
+        fs::write(&location, content);
+        location
     }
 
     pub fn build_diff(&mut self, office: &Office, commit: &Commit) -> String {
@@ -860,14 +940,14 @@ impl Diff {
         let author_email = author_signature.email().unwrap_or_default();
         let author_date = util::format_git_time(author_signature.when()).unwrap_or_default();
 
-        let author_content = format!("Author: {} {}\n", author_name, author_email);
+        let author_content = format!("{}{} {}\n", Diff::AUTHOR_LABEL, author_name, author_email);
         format.push_str(&author_content);
         diff_group.view.push(DiffView::Author {
             username: author_name.len(),
             email: author_email.len(),
         });
 
-        let date_content = format!("Date  : {}\n", &author_date);
+        let date_content = format!("{}{}\n", Diff::DATE_LABEL, &author_date);
         format.push_str(&date_content);
         diff_group.view.push(DiffView::Date {
             date: author_date.len(),
@@ -879,8 +959,7 @@ impl Diff {
         commit.message().map(|message| {
             message.lines().for_each(|line| {
                 diff_group.view.push(DiffView::MessageLine(line.len()));
-                format.push_str(line);
-                format.push_str("\n");
+                format.push_str(&format!("{}{}\n", Diff::MESSAGE_PADDING, line));
             });
         });
         let current_tree = commit.tree().ok();
@@ -903,7 +982,7 @@ impl Diff {
                 diff_group.view.push(DiffView::Parent { oid: parent_oid });
 
                 format.push_str(&format!("+ {}\n", commit.id().to_string()));
-                diff_group.view.push(DiffView::Parent { oid: commit.id() });
+                diff_group.view.push(DiffView::Current { oid: commit.id() });
 
                 office
                     .repo
@@ -973,7 +1052,6 @@ impl Diff {
                         format.push_str(&header);
                     }
                     Some(_) => {
-                        hunk_line += 1;
                         match line.origin() {
                             ' ' | '+' => {
                                 diff_group.view.push(DiffView::HunkLine {
@@ -985,6 +1063,7 @@ impl Diff {
                                     line.origin(),
                                     String::from_utf8_lossy(line.content())
                                 ));
+                                hunk_line += 1;
                             }
                             '-' => {
                                 diff_group.view.push(DiffView::OldLine {
@@ -1018,41 +1097,90 @@ impl Diff {
     }
 }
 
-pub type Length = usize;
+impl Diff {
+    fn inlay_hint(
+        &self,
+        (start_line, end_line): (u32, u32),
+        office: &Office,
+        ret: &mut Vec<InlayHint>,
+    ) {
+        for i in start_line..end_line {
+            match &self.view[i as usize] {
+                DiffView::LineBreak => (),
+                DiffView::Author { username, email } => (),
+                DiffView::Date { date } => (),
+                DiffView::MessageLine(_) => (),
+                DiffView::OldFile(path_buf) => (),
+                DiffView::NewFile { from_file } => (),
+                DiffView::HunkHeader { from_file, length } => {
+                    ret.push(create_inlay_hint(
+                        i,
+                        *length as u32,
+                        format!(" * {}", self.diff_file[from_file].to_string_lossy()),
+                    ));
+                }
+                DiffView::Parent { oid } => (),
+                DiffView::Current { oid } => (),
+                DiffView::HunkLine {
+                    from_diff_file,
+                    line,
+                } => (),
+                DiffView::OldLine { content } => (),
+            }
+        }
+    }
 
-pub enum DiffView {
-    LineBreak,
-    //Padding,
-    Author {
-        username: Length,
-        email: Length,
-    },
-    Date {
-        date: Length,
-    },
-    MessageLine(Length),
-    OldFile(Option<PathBuf>),
-    //    old: Option<PathBuf>,
-    //},
-    NewFile {
-        from_file: usize,
-    },
-    HunkHeader {
-        from_file: usize,
-        length: Length,
-    },
-    Parent {
-        oid: Oid,
-    },
-    Current {
-        oid: Oid,
-    },
-    HunkLine {
-        from_diff_file: usize,
-        line: u32,
-        //content: Length,
-    },
-    OldLine {
-        content: Length,
-    },
+    fn goto_definition(
+        &self,
+        toolbox: &ToolBox,
+        (id, params): (RequestId, TextDocumentPositionParams),
+    ) {
+        match &self.view[params.position.line as usize] {
+            DiffView::LineBreak => (),
+            DiffView::Author { username, email } => (),
+            DiffView::Date { date } => (),
+            DiffView::MessageLine(_) => (),
+            DiffView::OldFile(path_buf) => {
+                let path = match path_buf {
+                    Some(path) => path,
+                    None => return,
+                };
+            }
+            DiffView::NewFile { from_file } => (),
+            DiffView::HunkHeader { from_file, length } => (),
+            DiffView::Parent { .. } => {
+                toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
+                    uri: params.text_document.uri,
+                    oid: params.position.line as usize,
+                }));
+            }
+            DiffView::Current { oid } => (),
+            DiffView::HunkLine {
+                from_diff_file,
+                line,
+            } => {
+                let path = &self.diff_file[from_diff_file];
+                let content = match self.build_old_file(toolbox.office, path) {
+                    Some(content) => content,
+                    None => return,
+                };
+                let location = self.write_old_file(&content, path);
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&location).unwrap(),
+                    Range {
+                        start: Position::new(*line, params.position.character),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
+                    }
+                    .into(),
+                ));
+            }
+            DiffView::OldLine { content } => (),
+        }
+    }
 }

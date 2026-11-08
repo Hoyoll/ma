@@ -522,26 +522,26 @@ impl App {
                         let format = diff_group.build_diff(office, &commit);
 
                         let location = diff_group.write_diff(&format);
-                        let url = name_to_url(&location).unwrap(); 
+                        let url = name_to_url(&location).unwrap();
                         Some((url, (WorkGroup::Diff(diff_group), office_id.clone())))
                     }
                 };
                 if let Some((uri, wg)) = new_wg {
                     self.work_group.insert(uri.clone(), wg);
                     self.lsp_conn.send(Kind::Main(
-                            lsp_server::Request {
-                                id: RequestId::from(1),
-                                method: ShowDocument::METHOD.into(),
-                                params: to_value(ShowDocumentParams {
-                                    uri,
-                                    external: None,
-                                    take_focus: Some(true),
-                                    selection: None,
-                                })
-                                .unwrap(),
-                            }
-                            .into(),
-                        ));
+                        lsp_server::Request {
+                            id: RequestId::from(1),
+                            method: ShowDocument::METHOD.into(),
+                            params: to_value(ShowDocumentParams {
+                                uri,
+                                external: None,
+                                take_focus: Some(true),
+                                selection: None,
+                            })
+                            .unwrap(),
+                        }
+                        .into(),
+                    ));
                 }
                 //let diff_file = diff_path.join(".diff");
             }
