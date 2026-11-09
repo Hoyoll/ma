@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
 use crossbeam::channel::Sender;
-use git2::{Oid, Repository};
+use git2::{Oid, PackBuilderStage, Repository};
 use lsp_server::{Message, RequestId};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
@@ -104,7 +104,7 @@ pub fn capabilities() -> ServerCapabilities {
             DiagnosticOptions::default(),
         )),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![MaAction::ACTION.into()],
+            commands: vec![MaAction::COMMAND.into()],
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         //folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -133,7 +133,6 @@ pub struct App {
     //ma_conn: Sender<MaAction>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
 pub enum MaAction {
     Init {
         anchor_path: Uri,
@@ -144,46 +143,63 @@ pub enum MaAction {
         range: Range,
     },
     //Insert {url: Uri, content: String},
-    StageAll {
-        uri: Uri,
-    },
-    StageFile {
-        uri: Uri,
-        path: usize,
-    },
-    UnstageFile {
-        uri: Uri,
-        path: usize,
-    },
-    SwitchBranch {
-        uri: Uri,
-        branch: String,
-    },
-    Reload {
-        uri: Uri,
-    },
-    AttemptCommit {
-        uri: Uri,
-    },
-    CancelCommit {
-        uri: Uri,
-    },
-    PullRemote {
-        uri: Uri,
-        name: String,
-    },
-    PushRemote {
-        uri: Uri,
-        name: String,
-    },
     OpenDiff {
         uri: Uri,
-        oid: usize,
+        oid: Oid,
+    },
+    //OpenTree {
+    //    uri: Uri,
+    //    //commit_id: Oid,
+    //    tree_id: Oid
+    //},
+    Command {
+        //uri: Uri,
+        command: Command,
+    },
+    GitPushProgress {
+        uri: Uri,
+        remote_id: usize,
+        progress: GitPush,
     },
 }
 
 impl MaAction {
-    pub const ACTION: &str = "ma.action";
+    pub const COMMAND: &str = "ma.command";
+}
+
+pub enum Progress {
+    GitPush { remote_id: usize, progress: GitPush },
+}
+
+pub enum GitPush {
+    Packing {
+        percentage: usize,
+        stage: PackBuilderStage,
+    },
+    Transfer {
+        percentage: usize,
+    },
+    Error {
+        message: String,
+    },
+    Done,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Command {
+    StageAll { uri: Uri },
+    StageFile { uri: Uri, path: usize },
+    UnstageFile { uri: Uri, path: usize },
+    SwitchBranch { uri: Uri, branch: String },
+    Reload { uri: Uri },
+    AttemptCommit { uri: Uri },
+    CancelCommit { uri: Uri },
+    PullRemote { uri: Uri, name: usize },
+    PushRemote { uri: Uri, name: usize },
+}
+
+impl Command {
+    //pub const ACTION: &str = "ma.action";
 
     pub fn to_string(&self) -> String {
         serde_json::to_string(self).unwrap()
@@ -202,9 +218,15 @@ impl MaAction {
     }
 }
 
-impl From<MaAction> for Option<Vec<Value>> {
-    fn from(value: MaAction) -> Self {
+impl From<Command> for Option<Vec<Value>> {
+    fn from(value: Command) -> Self {
         Some(vec![value.to_value()])
+    }
+}
+
+impl From<Command> for MaAction {
+    fn from(value: Command) -> Self {
+        MaAction::Command { command: value }
     }
 }
 
@@ -315,8 +337,8 @@ impl App {
             ExecuteCommand::METHOD => {
                 serde_json::from_value(request.params).map(|params: ExecuteCommandParams| {
                     for command in params.arguments {
-                        let action = MaAction::from_value(command);
-                        self.ma_action(action);
+                        let action = Command::from_value(command);
+                        self.ma_command(action);
                     }
                     //self.ma_action(params.arguments);
                 });
@@ -426,99 +448,17 @@ impl App {
                     .into(),
                 ));
             }
-            MaAction::StageAll { uri } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.stage_all(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                    );
-                }
-            }
-            MaAction::StageFile { uri, path } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.stage_file(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                        path,
-                    );
-                }
-            }
-            MaAction::UnstageFile { uri, path } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.unstage_file(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                        path,
-                    );
-                }
-            }
-            MaAction::SwitchBranch { uri, branch } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.switch_branch(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                        branch,
-                    );
-                }
-            }
-            MaAction::Reload { uri } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.reload(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                    );
-                }
-            }
-            MaAction::AttemptCommit { uri } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.attempt_commit(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                    );
-                }
-            }
-            MaAction::CancelCommit { uri } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.cancel_commit(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
-                    );
-                }
-            }
-            MaAction::PullRemote { uri, name } => (),
-            MaAction::PushRemote { uri, name } => (),
             MaAction::OpenDiff { uri, oid } => {
                 let new_wg = match self.work_group.get_mut(&uri) {
                     None => None,
                     Some((wg, office_id)) => {
                         let office = &self.office[*office_id];
-                        let oid = wg.open_diff(oid);
+                        //let oid = wg.open_diff(oid);
                         let commit = match office.repo.find_commit(oid) {
                             Ok(commit) => commit,
                             Err(_) => return,
                         };
-                        let mut diff_group = Diff::new(office, &commit);
+                        let mut diff_group = Diff::new(office, oid);
                         let format = diff_group.build_diff(office, &commit);
 
                         let location = diff_group.write_diff(&format);
@@ -544,6 +484,110 @@ impl App {
                     ));
                 }
                 //let diff_file = diff_path.join(".diff");
+            }
+            MaAction::Command { command } => {
+                self.ma_command(command);
+            }
+            MaAction::GitPushProgress {
+                uri,
+                remote_id,
+                progress,
+            } => {
+                if let Some((wg, _office_id)) = self.work_group.get_mut(&uri) {
+                    wg.git_push_progress(remote_id, progress, &self.lsp_conn);
+                }
+            },
+        }
+    }
+
+    fn ma_command(&mut self, command: Command) {
+        match command {
+            Command::StageAll { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.stage_all(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                    );
+                }
+            }
+            Command::StageFile { uri, path } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.stage_file(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                        path,
+                    );
+                }
+            }
+            Command::UnstageFile { uri, path } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.unstage_file(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                        path,
+                    );
+                }
+            }
+            Command::SwitchBranch { uri, branch } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.switch_branch(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                        branch,
+                    );
+                }
+            }
+            Command::Reload { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.reload(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                    );
+                }
+            }
+            Command::AttemptCommit { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.attempt_commit(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                    );
+                }
+            }
+            Command::CancelCommit { uri } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.cancel_commit(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                    );
+                }
+            }
+            Command::PullRemote { uri, name } => (),
+            Command::PushRemote { uri, name } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    let office = &self.office[office_id];
+                    //let remote = office.repo.find_remote(&name);
+                }
             }
         }
     }

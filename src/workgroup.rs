@@ -6,18 +6,21 @@ use std::{
 };
 
 use crossbeam::channel::Sender;
-use git2::{BranchType, Commit, IndexAddOption, Oid, Status, StatusOptions};
+use git2::{
+    BranchType, Commit, IndexAddOption, Oid, PackBuilderStage, PushOptions, RemoteCallbacks,
+    Repository, Status, StatusOptions,
+};
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
     InlayHint, InlayHintParams, Location, Position, Range, SemanticToken, SemanticTokens,
-    SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, Uri,
+    SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, Uri, request::{InlayHintRefreshRequest, Request},
 };
 use serde_json::to_value;
 
 use crate::{
-    app::{MaAction, Office, SemanticTokenList},
+    app::{self, GitPush, MaAction, Office, Progress, SemanticTokenList},
     lsp::Kind,
     util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
@@ -30,9 +33,12 @@ impl WorkGroup {
                 RootMode::Input { message } => {
                     if let Some(text) = params.text {
                         *message = text;
-                        toolbox.lsp_conn.send(Kind::Other(MaAction::AttemptCommit {
-                            uri: params.text_document.uri,
-                        }));
+                        toolbox.lsp_conn.send(Kind::Other(
+                            app::Command::AttemptCommit {
+                                uri: params.text_document.uri,
+                            }
+                            .into(),
+                        ));
                     }
                 }
             },
@@ -59,7 +65,7 @@ impl WorkGroup {
     ) {
         match self {
             WorkGroup::Root(root) => {
-                root.goto_definition(toolbox.lsp_conn, params.text_document_position_params);
+                root.goto_definition(&toolbox, params.text_document_position_params);
             }
             WorkGroup::Diff(diff) => {
                 diff.goto_definition(&toolbox, (id, params.text_document_position_params));
@@ -156,11 +162,32 @@ pub enum WorkGroup {
 pub struct Root {
     status: Container<(PathBuf, Status)>,
     head_branch: String,
-    remote: Container<String>,
+    remote: Container<Remote>,
+    //remote_activity: Container<RemoteActivity>,
     tag: Container<String>,
     commits: Container<Oid>,
     view: Container<RootView>,
     mode: RootMode,
+}
+
+pub struct Remote {
+    name: String,
+    activity: RemoteActivity, //error: Option<String>,
+}
+
+pub enum RemoteActivity {
+    None,
+    Push(GitPush),
+    Pull,
+}
+
+impl Remote {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            activity: RemoteActivity::None,
+        }
+    }
 }
 
 #[derive(PartialEq, Debug)]
@@ -189,6 +216,7 @@ impl Root {
             status: Container::new(),
             head_branch: "".into(),
             remote: Container::new(),
+            //remote_activity: Container::new(),
             tag: Container::new(),
             commits: Container::new(),
             view: Container::new(),
@@ -211,7 +239,7 @@ impl Root {
                 }
                 RootView::RemoteMember(i) => {
                     let member = &self.remote[*i];
-                    format.push_str(member);
+                    format.push_str(&member.name);
                     format.push_str("\n");
                 }
                 RootView::TagLabel => {
@@ -292,7 +320,7 @@ impl Root {
         office.repo.remotes().map(|remotes| {
             for name in remotes.iter().flatten() {
                 if let Some(name) = name {
-                    self.remote.push(name.into());
+                    self.remote.push(Remote::new(name));
                 }
             }
         });
@@ -332,26 +360,46 @@ impl Root {
 }
 
 impl Root {
-    fn goto_definition(
-        &self,
-        lsp_conn: &Sender<Kind<Message, MaAction>>,
-        params: TextDocumentPositionParams,
-    ) {
-        match self.view[params.position.line as usize] {
+    fn goto_definition(&self, toolbox: &ToolBox, params: TextDocumentPositionParams) {
+        match &self.view[params.position.line as usize] {
             RootView::LineBreak => (),
             RootView::HeadFile => (),
             RootView::HeadLabel => (),
             RootView::RemoteLabel => (),
             RootView::RemoteMember(_) => (),
             RootView::TagLabel => (),
-            RootView::TagMember(_) => (),
+            RootView::TagMember(member) => {
+                let tag = &self.tag[member];
+                let reference = match toolbox
+                    .office
+                    .repo
+                    .find_reference(&format!("refs/tags/{tag}"))
+                {
+                    Ok(reference) => reference,
+                    Err(_) => return,
+                };
+                let object = reference.peel(git2::ObjectType::Any).unwrap();
+                match object.kind().unwrap() {
+                    git2::ObjectType::Commit => {
+                        let oid = object.id();
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
+                            uri: params.text_document.uri,
+                            oid,
+                        }));
+                    }
+                    git2::ObjectType::Tree => {
+                        //toolbox.lsp_conn.send(Kind::Other(MaAction::OpenTree { uri: params.text_document.uri, tree_id: object.id() }));
+                    }
+                    _ => (),
+                }
+            }
             RootView::StatusLabel => (),
             RootView::StatusMember(_) => (),
             RootView::CommitLabel => (),
             RootView::CommitMember(member) => {
-                lsp_conn.send(Kind::Other(MaAction::OpenDiff {
+                toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
                     uri: params.text_document.uri,
-                    oid: member,
+                    oid: self.commits[member],
                 }));
             }
         }
@@ -387,13 +435,53 @@ impl Root {
                         RootView::RemoteLabel => (),
                         RootView::RemoteMember(member) => {
                             let remote = &self.remote[member];
-                            let res = office.repo.find_remote(remote).unwrap();
+                            let res = office.repo.find_remote(&remote.name).unwrap();
                             ret.push(create_inlay_hint(i, 0, "  "));
-                            ret.push(create_inlay_hint(
-                                i,
-                                remote.len() as u32,
-                                format!(" * {}", res.url().unwrap()),
-                            ));
+                            let content = format!(" * {}", res.url().unwrap());
+
+                            ret.push(create_inlay_hint(i, remote.name.len() as u32, &content));
+                            match &remote.activity {
+                                RemoteActivity::None => (),
+                                RemoteActivity::Push(git_push) => match git_push {
+                                    GitPush::Packing { percentage, stage } => {
+                                        let stage = match stage {
+                                            PackBuilderStage::AddingObjects => {
+                                                format!("Adding objects: {percentage}%")
+                                            }
+                                            PackBuilderStage::Deltafication => {
+                                                format!("Delta compression: {percentage}%")
+                                            }
+                                        };
+                                        ret.push(create_inlay_hint(
+                                            i,
+                                            content.len() as u32,
+                                            format!("* {stage}"),
+                                        ));
+                                    }
+                                    GitPush::Transfer { percentage } => {
+                                        ret.push(create_inlay_hint(
+                                            i,
+                                            content.len() as u32,
+                                            format!("* Transferring data: {percentage}%"),
+                                        ));
+                                    }
+                                    GitPush::Error { message } => {
+                                        ret.push(create_inlay_hint(
+                                            i,
+                                            content.len() as u32,
+                                            format!("* Error: {message}"),
+                                        ));
+                                    }
+                                    GitPush::Done => {
+                                        ret.push(create_inlay_hint(
+                                            i,
+                                            content.len() as u32,
+                                            "Done",
+                                        ));
+                                    }
+                                },
+                                RemoteActivity::Pull => (),
+                            }
                         }
                         RootView::TagLabel => (),
                         RootView::TagMember(member) => {
@@ -491,7 +579,7 @@ impl Root {
                     ret.push(create_semantic_token(
                         delta,
                         0u32,
-                        remote.len() as u32,
+                        remote.name.len() as u32,
                         SemanticTokenList::TYPE,
                     ));
                     prev_line_token = current_line_token;
@@ -559,8 +647,8 @@ impl Root {
                                     }
                                     ret.push(CodeActionOrCommand::Command(Command {
                                         title: format!("Switch branch to {}", name),
-                                        command: MaAction::ACTION.into(),
-                                        arguments: MaAction::SwitchBranch {
+                                        command: MaAction::COMMAND.into(),
+                                        arguments: app::Command::SwitchBranch {
                                             uri: params.text_document.uri.clone(),
                                             branch: name.into(),
                                         }
@@ -573,14 +661,34 @@ impl Root {
                     }
                 }
                 RootView::RemoteLabel => (),
-                RootView::RemoteMember(_) => (),
+                RootView::RemoteMember(member) => {
+                    let remote = &self.remote[member];
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Push {} to {}", self.head_branch, &remote.name),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::PushRemote {
+                            uri: params.text_document.uri.clone(),
+                            name: *member,
+                        }
+                        .into(),
+                    }));
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Pull {} from {}", self.head_branch, &remote.name),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::PushRemote {
+                            uri: params.text_document.uri,
+                            name: *member,
+                        }
+                        .into(),
+                    }));
+                }
                 RootView::TagLabel => (),
                 RootView::TagMember(_) => (),
                 RootView::StatusLabel => {
                     ret.push(CodeActionOrCommand::Command(Command {
                         title: "Stage all".into(),
-                        command: MaAction::ACTION.into(),
-                        arguments: MaAction::StageAll {
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::StageAll {
                             uri: params.text_document.uri.clone(),
                         }
                         .into(),
@@ -588,8 +696,8 @@ impl Root {
                     if !self.status.inner().is_empty() {
                         ret.push(CodeActionOrCommand::Command(Command {
                             title: "Commit changes".into(),
-                            command: MaAction::ACTION.into(),
-                            arguments: MaAction::AttemptCommit {
+                            command: MaAction::COMMAND.into(),
+                            arguments: app::Command::AttemptCommit {
                                 uri: params.text_document.uri,
                             }
                             .into(),
@@ -608,8 +716,8 @@ impl Root {
                     if staged {
                         ret.push(CodeActionOrCommand::Command(Command {
                             title: format!("Restage {}", file.to_string_lossy()),
-                            command: MaAction::ACTION.into(),
-                            arguments: MaAction::StageFile {
+                            command: MaAction::COMMAND.into(),
+                            arguments: app::Command::StageFile {
                                 uri: params.text_document.uri.clone(),
                                 path: *path,
                             }
@@ -617,8 +725,8 @@ impl Root {
                         }));
                         ret.push(CodeActionOrCommand::Command(Command {
                             title: format!("Unstage {}", file.to_string_lossy()),
-                            command: MaAction::ACTION.into(),
-                            arguments: MaAction::UnstageFile {
+                            command: MaAction::COMMAND.into(),
+                            arguments: app::Command::UnstageFile {
                                 uri: params.text_document.uri,
                                 path: *path,
                             }
@@ -627,8 +735,8 @@ impl Root {
                     } else {
                         ret.push(CodeActionOrCommand::Command(Command {
                             title: format!("Stage {}", file.to_string_lossy()),
-                            command: MaAction::ACTION.into(),
-                            arguments: MaAction::StageFile {
+                            command: MaAction::COMMAND.into(),
+                            arguments: app::Command::StageFile {
                                 uri: params.text_document.uri,
                                 path: *path,
                             }
@@ -651,8 +759,8 @@ impl Root {
 
                 ret.push(CodeActionOrCommand::Command(Command {
                     title: "Cancel commit".into(),
-                    command: MaAction::ACTION.into(),
-                    arguments: MaAction::CancelCommit {
+                    command: MaAction::COMMAND.into(),
+                    arguments: app::Command::CancelCommit {
                         uri: params.text_document.uri,
                     }
                     .into(),
@@ -744,7 +852,7 @@ impl WorkGroup {
                     };
                     match git.wait() {
                         Ok(e) if e.success() => {
-                            conn.send(Kind::Other(MaAction::Reload { uri }));
+                            conn.send(Kind::Other(app::Command::Reload { uri }.into()));
                         }
                         _ => (),
                     }
@@ -756,6 +864,89 @@ impl WorkGroup {
         }
     }
 
+    pub fn push_remote(&mut self, toolbox: ToolBox, uri: Uri, remote_id: usize) {
+        match self {
+            WorkGroup::Root(root) => {
+                //let config = toolbox.office.repo.config().unwrap();
+                let remote_name = root.remote[remote_id].name.clone();
+                let repo_path = toolbox.office.repo.path().to_path_buf();
+                let head_branch = root.head_branch.clone();
+                let sender = toolbox.lsp_conn.clone();
+
+                spawn(move || {
+                    let pack_sender = sender;
+                    let transfer_sender = pack_sender.clone();
+                    let ending_sender = pack_sender.clone();
+                    let error_sender = pack_sender.clone();
+
+                    let pack_uri = uri;
+                    let transfer_uri = pack_uri.clone();
+                    let ending_uri = pack_uri.clone();
+                    let error_uri = pack_uri.clone();
+                    //let uri = uri.clone();
+                    let repo = Repository::open(&repo_path).unwrap();
+                    let config = repo.config().unwrap();
+                    let mut remote = repo.find_remote(&remote_name).unwrap();
+                    let mut callback = RemoteCallbacks::new();
+                    callback.credentials(|url, username, allowed| {
+                        if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+                            return git2::Cred::credential_helper(&config, url, username);
+                        }
+
+                        if allowed.contains(git2::CredentialType::SSH_KEY) {
+                            return git2::Cred::ssh_key_from_agent(username.unwrap_or("git"));
+                        }
+
+                        git2::Cred::default()
+                    });
+                    callback.pack_progress(move |stage, current, total| {
+                        let percentage = if total > 0 { current * 100 / total } else { 0 };
+                        //let uri = uri.clone();
+                        pack_sender.send(Kind::Other(MaAction::GitPushProgress {
+                            uri: pack_uri.clone(),
+                            remote_id,
+                            progress: GitPush::Packing { percentage, stage },
+                        }));
+                        //sender.send(msg)
+                    });
+                    callback.push_transfer_progress(move |current, total, _bytes| {
+                        let percentage = if total > 0 { current * 100 / total } else { 0 };
+                        transfer_sender.send(Kind::Other(MaAction::GitPushProgress {
+                            uri: transfer_uri.clone(),
+                            remote_id,
+                            progress: GitPush::Transfer { percentage },
+                        }));
+                    });
+                    callback.push_update_reference(move |_name, message| {
+                        if let Some(message) = message {
+                            error_sender.send(Kind::Other(MaAction::GitPushProgress {
+                                uri: error_uri.clone(),
+                                remote_id,
+                                progress: GitPush::Error {
+                                    message: message.into(),
+                                },
+                            }));
+                        }
+                        Ok(())
+                    });
+                    let mut options = PushOptions::new();
+                    options.remote_callbacks(callback);
+                    let refspec = format!("refs/heads/{0}:refs/heads/{0}", &head_branch);
+
+                    //spawn(|| {
+                    remote.push(&[refspec], Some(&mut options));
+                    ending_sender.send(Kind::Other(MaAction::GitPushProgress {
+                        uri: ending_uri,
+                        remote_id,
+                        progress: GitPush::Done,
+                    }));
+                    //});
+                });
+            }
+            _ => (),
+        }
+    }
+
     pub fn reload(&mut self, toolbox: ToolBox, uri: Uri) {
         match self {
             WorkGroup::Root(root) => {
@@ -763,7 +954,7 @@ impl WorkGroup {
                 root.build_view();
                 root.refresh(uri, toolbox.lsp_conn);
             }
-            WorkGroup::Diff(diff) => todo!(),
+            WorkGroup::Diff(diff) => (),
         }
     }
 
@@ -810,11 +1001,13 @@ impl WorkGroup {
                     };
                     if let Ok(_) = res {
                         root.mode = RootMode::Dashboard;
-                        toolbox.lsp_conn.send(Kind::Other(MaAction::Reload { uri }));
+                        toolbox
+                            .lsp_conn
+                            .send(Kind::Other(app::Command::Reload { uri }.into()));
                     }
                 }
             },
-            WorkGroup::Diff(diff) => todo!(),
+            WorkGroup::Diff(diff) => (),
         }
     }
 
@@ -822,19 +1015,26 @@ impl WorkGroup {
         match self {
             WorkGroup::Root(root) => {
                 root.mode = RootMode::Dashboard;
-                toolbox.lsp_conn.send(Kind::Other(MaAction::Reload { uri }));
+                toolbox
+                    .lsp_conn
+                    .send(Kind::Other(app::Command::Reload { uri }.into()));
             }
             _ => (),
         }
     }
 
-    pub fn open_diff(&mut self, oid_id: usize) -> Oid {
+    pub fn git_push_progress(&mut self, remote_id: usize, progress: GitPush, lsp_conn: &Sender<Kind<Message, MaAction>>) {
         match self {
-            WorkGroup::Root(root) => root.commits[oid_id],
-            WorkGroup::Diff(diff) => match diff.view[oid_id] {
-                DiffView::Parent { oid } => oid,
-                _ => Oid::ZERO_SHA1,
+            WorkGroup::Root(root) => {
+                let remote = &mut root.remote[remote_id];
+                remote.activity = RemoteActivity::Push(progress);
+                lsp_conn.send(Kind::Main(lsp_server::Request {
+                    id: RequestId::from(1),
+                    method: InlayHintRefreshRequest::METHOD.into(),
+                    params: to_value(()).unwrap(),
+                }.into()));
             },
+            WorkGroup::Diff(diff) => (),
         }
     }
 }
@@ -859,7 +1059,7 @@ pub enum DiffView {
         date: Length,
     },
     MessageLine(Length),
-    OldFile(Option<PathBuf>),
+    OldFile(Option<(PathBuf, Oid)>),
     //    old: Option<PathBuf>,
     //},
     NewFile {
@@ -889,23 +1089,28 @@ impl Diff {
     const DATE_LABEL: &str = "Date  : ";
     const AUTHOR_LABEL: &str = "Author: ";
     const MESSAGE_PADDING: &str = "        ";
-    pub fn new(office: &Office, commit: &Commit) -> Self {
+
+    pub fn new(office: &Office, oid: Oid) -> Self {
         Self {
             view: Container::new(),
             diff_file: Container::new(),
-            diff_dir: office
-                .repo
-                .workdir()
-                .unwrap()
-                .join(".git")
-                .join("ma")
-                .join(commit.id().to_string()),
-            oid: commit.id(),
+            diff_dir: Self::build_commit_dir(office, oid),
+            oid,
         }
     }
 
-    fn build_old_file(&self, office: &Office, path: &Path) -> Option<String> {
-        let commit = match office.repo.find_commit(self.oid) {
+    fn build_commit_dir(office: &Office, oid: Oid) -> PathBuf {
+        office
+            .repo
+            .workdir()
+            .unwrap()
+            .join(".git")
+            .join("ma")
+            .join(oid.to_string())
+    }
+
+    fn build_old_file(office: &Office, path: &Path, oid: Oid) -> Option<String> {
+        let commit = match office.repo.find_commit(oid) {
             Ok(commmit) => commmit,
             Err(_) => return None,
         };
@@ -1017,13 +1222,14 @@ impl Diff {
                     let path = file.path().unwrap();
                     from_file = diff_group.diff_file.add(path.into());
                     let old_file = match delta.old_file().path() {
-                        Some(path) => {
-                            diff_group
-                                .view
-                                .push(DiffView::OldFile(Some(path.to_path_buf())));
+                        Some(path) if commit.parent_count() == 1 => {
+                            diff_group.view.push(DiffView::OldFile(Some((
+                                path.to_path_buf(),
+                                commit.parent(0).unwrap().id(),
+                            ))));
                             &path.to_string_lossy()
                         }
-                        None => {
+                        _ => {
                             diff_group.view.push(DiffView::OldFile(None));
                             "/dev/null"
                         }
@@ -1051,33 +1257,31 @@ impl Diff {
                         });
                         format.push_str(&header);
                     }
-                    Some(_) => {
-                        match line.origin() {
-                            ' ' | '+' => {
-                                diff_group.view.push(DiffView::HunkLine {
-                                    from_diff_file: from_file,
-                                    line: hunk_line,
-                                });
-                                format.push_str(&format!(
-                                    "{} {}",
-                                    line.origin(),
-                                    String::from_utf8_lossy(line.content())
-                                ));
-                                hunk_line += 1;
-                            }
-                            '-' => {
-                                diff_group.view.push(DiffView::OldLine {
-                                    content: line.content().len(),
-                                });
-                                format.push_str(&format!(
-                                    "{} {}",
-                                    line.origin(),
-                                    String::from_utf8_lossy(line.content())
-                                ));
-                            }
-                            _ => {}
+                    Some(_) => match line.origin() {
+                        ' ' | '+' => {
+                            diff_group.view.push(DiffView::HunkLine {
+                                from_diff_file: from_file,
+                                line: hunk_line,
+                            });
+                            format.push_str(&format!(
+                                "{} {}",
+                                line.origin(),
+                                String::from_utf8_lossy(line.content())
+                            ));
+                            hunk_line += 1;
                         }
-                    }
+                        '-' => {
+                            diff_group.view.push(DiffView::OldLine {
+                                content: line.content().len(),
+                            });
+                            format.push_str(&format!(
+                                "{} {}",
+                                line.origin(),
+                                String::from_utf8_lossy(line.content())
+                            ));
+                        }
+                        _ => {}
+                    },
                     None => (),
                 }
                 true
@@ -1141,17 +1345,61 @@ impl Diff {
             DiffView::Date { date } => (),
             DiffView::MessageLine(_) => (),
             DiffView::OldFile(path_buf) => {
-                let path = match path_buf {
+                let (path, oid) = match path_buf {
                     Some(path) => path,
                     None => return,
                 };
+                let old_file = match Self::build_old_file(toolbox.office, path, *oid) {
+                    Some(old_file) => old_file,
+                    None => return,
+                };
+                let location = Self::build_commit_dir(toolbox.office, *oid).join(path);
+                fs::create_dir_all(location.parent().unwrap());
+                fs::write(&location, old_file);
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&location).unwrap(),
+                    Range {
+                        start: Position::new(0, 0),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
+                    }
+                    .into(),
+                ));
             }
-            DiffView::NewFile { from_file } => (),
+            DiffView::NewFile { from_file } => {
+                let path = &self.diff_file[from_file];
+                let content = match Self::build_old_file(toolbox.office, path, self.oid) {
+                    Some(old_file) => old_file,
+                    None => return,
+                };
+                let location = Self::build_commit_dir(toolbox.office, self.oid).join(path);
+                fs::create_dir_all(location.parent().unwrap());
+                fs::write(&location, content);
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&location).unwrap(),
+                    Range {
+                        start: Position::new(0, 0),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
+                    }
+                    .into(),
+                ));
+            }
             DiffView::HunkHeader { from_file, length } => (),
-            DiffView::Parent { .. } => {
+            DiffView::Parent { oid } => {
                 toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
                     uri: params.text_document.uri,
-                    oid: params.position.line as usize,
+                    oid: *oid,
                 }));
             }
             DiffView::Current { oid } => (),
@@ -1160,7 +1408,7 @@ impl Diff {
                 line,
             } => {
                 let path = &self.diff_file[from_diff_file];
-                let content = match self.build_old_file(toolbox.office, path) {
+                let content = match Self::build_old_file(toolbox.office, path, self.oid) {
                     Some(content) => content,
                     None => return,
                 };

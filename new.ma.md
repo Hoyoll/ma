@@ -1,9 +1,9 @@
 Current/repository/path //using inlayhint obviously
 # Head <head-branch-name> //inlay hint. code action will provide a way to change head
 # Remote 
-  <remote-name> //-> is inlayhint
+  <remote-name> * <url> * <Activity: percentage%> 
 # Tag 
-  <tag> //-> is inlayhint
+  <tag> * <message> 
 
 # Current Status
   M | M -> <src-file>
