@@ -585,7 +585,8 @@ impl App {
             Command::PullRemote { uri, name } => (),
             Command::PushRemote { uri, name } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    let office = &self.office[office_id];
+                    let office = &mut self.office[office_id];
+                    wg.push_remote(ToolBox { office: office, lsp_conn: &self.lsp_conn }, uri, name);
                     //let remote = office.repo.find_remote(&name);
                 }
             }

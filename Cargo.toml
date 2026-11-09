@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 crossbeam = "0.8.4"
-git2 = { version = "0.21.0", features = ["cred"]}
+git2 = { version = "0.21.0", features = ["https", "ssh", "cred", "vendored-openssl"]}
 lsp-server = "0.10.0"
 lsp-types = "0.97.0"
 serde = { version = "1.0.229", features = ["derive"] }

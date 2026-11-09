@@ -476,7 +476,7 @@ impl Root {
                                         ret.push(create_inlay_hint(
                                             i,
                                             content.len() as u32,
-                                            "Done",
+                                            " * Done!",
                                         ));
                                     }
                                 },
@@ -869,7 +869,7 @@ impl WorkGroup {
             WorkGroup::Root(root) => {
                 //let config = toolbox.office.repo.config().unwrap();
                 let remote_name = root.remote[remote_id].name.clone();
-                let repo_path = toolbox.office.repo.path().to_path_buf();
+                let repo_path = toolbox.office.repo.workdir().unwrap().to_path_buf();
                 let head_branch = root.head_branch.clone();
                 let sender = toolbox.lsp_conn.clone();
 
@@ -933,14 +933,14 @@ impl WorkGroup {
                     options.remote_callbacks(callback);
                     let refspec = format!("refs/heads/{0}:refs/heads/{0}", &head_branch);
 
-                    //spawn(|| {
-                    remote.push(&[refspec], Some(&mut options));
+                    if let Err(push) = remote.push(&[refspec], Some(&mut options)) {
+                        eprintln!("{}", push.to_string());
+                    }
                     ending_sender.send(Kind::Other(MaAction::GitPushProgress {
                         uri: ending_uri,
                         remote_id,
                         progress: GitPush::Done,
                     }));
-                    //});
                 });
             }
             _ => (),
