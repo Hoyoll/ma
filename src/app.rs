@@ -196,6 +196,7 @@ pub enum Command {
     CancelCommit { uri: Uri },
     PullRemote { uri: Uri, name: usize },
     PushRemote { uri: Uri, name: usize },
+    MergeBranch { uri: Uri, branch_id: usize }, //PushAll { uri: Uri },
 }
 
 impl Command {
@@ -496,7 +497,7 @@ impl App {
                 if let Some((wg, _office_id)) = self.work_group.get_mut(&uri) {
                     wg.git_push_progress(remote_id, progress, &self.lsp_conn);
                 }
-            },
+            }
         }
     }
 
@@ -586,10 +587,19 @@ impl App {
             Command::PushRemote { uri, name } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
                     let office = &mut self.office[office_id];
-                    wg.push_remote(ToolBox { office: office, lsp_conn: &self.lsp_conn }, uri, name);
+                    wg.push_remote(
+                        ToolBox {
+                            office: office,
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                        name,
+                    );
                     //let remote = office.repo.find_remote(&name);
                 }
             }
+            //Command::PushAll { uri } => (),
+            Command::MergeBranch { uri, branch_id } => todo!(),
         }
     }
 }

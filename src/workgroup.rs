@@ -15,7 +15,8 @@ use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
     InlayHint, InlayHintParams, Location, Position, Range, SemanticToken, SemanticTokens,
-    SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, Uri, request::{InlayHintRefreshRequest, Request},
+    SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, Uri,
+    request::{InlayHintRefreshRequest, Request},
 };
 use serde_json::to_value;
 
@@ -660,7 +661,23 @@ impl Root {
                         }
                     }
                 }
-                RootView::RemoteLabel => (),
+                RootView::RemoteLabel => {
+                    let mut vec = vec![];
+                    for (i, _) in self.remote.inner().iter().enumerate() {
+                        vec.push(
+                            app::Command::PushRemote {
+                                uri: params.text_document.uri.clone(),
+                                name: i,
+                            }
+                            .to_value(),
+                        );
+                    }
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Push to every remote"),
+                        command: MaAction::COMMAND.into(),
+                        arguments: Some(vec),
+                    }));
+                }
                 RootView::RemoteMember(member) => {
                     let remote = &self.remote[member];
                     ret.push(CodeActionOrCommand::Command(Command {
@@ -672,6 +689,7 @@ impl Root {
                         }
                         .into(),
                     }));
+                    return;
                     ret.push(CodeActionOrCommand::Command(Command {
                         title: format!("Pull {} from {}", self.head_branch, &remote.name),
                         command: MaAction::COMMAND.into(),
@@ -947,6 +965,63 @@ impl WorkGroup {
         }
     }
 
+    pub fn merge_branch(&mut self, toolbox: ToolBox, uri: Uri, branch: String) {
+        match self {
+            WorkGroup::Root(root) => {
+                let mut ours_branch = toolbox
+                    .office
+                    .repo
+                    .find_branch(&branch, BranchType::Local)
+                    .unwrap();
+                let ours = ours_branch.get().peel_to_commit().unwrap();
+
+                let theirs_branch = toolbox
+                    .office
+                    .repo
+                    .find_branch(&root.head_branch, BranchType::Local)
+                    .unwrap();
+                let theirs = theirs_branch.get().peel_to_commit().unwrap();
+
+                let ancestor_oid = toolbox
+                    .office
+                    .repo
+                    .merge_base(ours.id(), theirs.id())
+                    .unwrap();
+                let ancestor = toolbox.office.repo.find_commit(ancestor_oid).unwrap();
+
+                let ancestor_tree = ancestor.tree().unwrap();
+                let ours_tree = ours.tree().unwrap();
+                let theirs_tree = theirs.tree().unwrap();
+                //create the index
+                let mut index = toolbox
+                    .office
+                    .repo
+                    .merge_trees(&ancestor_tree, &ours_tree, &theirs_tree, None)
+                    .unwrap();
+                if index.has_conflicts() {
+                    return;
+                }
+
+                let tree_oid = index.write_tree_to(&toolbox.office.repo).unwrap();
+                let merged_tree = toolbox.office.repo.find_tree(tree_oid).unwrap();
+                let signature = toolbox.office.repo.signature().unwrap();
+                let commit_oid = toolbox.office.repo.commit(
+                    None,
+                    &signature,
+                    &signature,
+                    &format!("Merge branch '{}' into '{}'", &root.head_branch, &branch),
+                    &merged_tree,
+                    &[&ours, &theirs],
+                ).unwrap();
+
+                //move the ours to new commit
+                ours_branch.get_mut().set_target(commit_oid, "Merge branch");
+                //toolbox.office.repo.commit(update_ref, author, committer, message, tree, parents)
+            }
+            WorkGroup::Diff(diff) => (),
+        }
+    }
+
     pub fn reload(&mut self, toolbox: ToolBox, uri: Uri) {
         match self {
             WorkGroup::Root(root) => {
@@ -1023,17 +1098,25 @@ impl WorkGroup {
         }
     }
 
-    pub fn git_push_progress(&mut self, remote_id: usize, progress: GitPush, lsp_conn: &Sender<Kind<Message, MaAction>>) {
+    pub fn git_push_progress(
+        &mut self,
+        remote_id: usize,
+        progress: GitPush,
+        lsp_conn: &Sender<Kind<Message, MaAction>>,
+    ) {
         match self {
             WorkGroup::Root(root) => {
                 let remote = &mut root.remote[remote_id];
                 remote.activity = RemoteActivity::Push(progress);
-                lsp_conn.send(Kind::Main(lsp_server::Request {
-                    id: RequestId::from(1),
-                    method: InlayHintRefreshRequest::METHOD.into(),
-                    params: to_value(()).unwrap(),
-                }.into()));
-            },
+                lsp_conn.send(Kind::Main(
+                    lsp_server::Request {
+                        id: RequestId::from(1),
+                        method: InlayHintRefreshRequest::METHOD.into(),
+                        params: to_value(()).unwrap(),
+                    }
+                    .into(),
+                ));
+            }
             WorkGroup::Diff(diff) => (),
         }
     }
