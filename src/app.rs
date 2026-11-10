@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
 use crossbeam::channel::Sender;
-use git2::{Oid, PackBuilderStage, Repository};
+use git2::{Index, Oid, PackBuilderStage, Repository};
 use lsp_server::{Message, RequestId};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
@@ -116,11 +116,12 @@ pub fn capabilities() -> ServerCapabilities {
 
 pub struct Office {
     pub repo: Repository,
+    pub o_id: OfficeId,
 }
 
 impl Office {
     pub fn new(repo: Repository) -> Self {
-        Self { repo }
+        Self { repo, o_id: 0 }
     }
 }
 
@@ -133,6 +134,10 @@ pub struct App {
     //ma_conn: Sender<MaAction>,
 }
 
+impl App {
+    pub const NAME: &str = "ma";
+}
+
 pub enum MaAction {
     Init {
         anchor_path: Uri,
@@ -141,6 +146,11 @@ pub enum MaAction {
         url: Uri,
         content: String,
         range: Range,
+    },
+    RegisterWorkgroup {
+        key: Uri,
+        workgroup: WorkGroup,
+        office_id: OfficeId,
     },
     //Insert {url: Uri, content: String},
     OpenDiff {
@@ -411,7 +421,7 @@ impl App {
                         root.fill_root(&mut office);
                         root.build_view();
                         let office_id = self.office.add(office);
-
+                        self.office[office_id].o_id = office_id;
                         root.refresh(anchor_path.clone(), &self.lsp_conn);
                         self.work_group
                             .insert(anchor_path, (WorkGroup::Root(root), office_id));
@@ -497,6 +507,13 @@ impl App {
                 if let Some((wg, _office_id)) = self.work_group.get_mut(&uri) {
                     wg.git_push_progress(remote_id, progress, &self.lsp_conn);
                 }
+            }
+            MaAction::RegisterWorkgroup {
+                key,
+                workgroup,
+                office_id,
+            } => {
+                self.work_group.insert(key, (workgroup, office_id));
             }
         }
     }
@@ -599,7 +616,18 @@ impl App {
                 }
             }
             //Command::PushAll { uri } => (),
-            Command::MergeBranch { uri, branch_id } => todo!(),
+            Command::MergeBranch { uri, branch_id } => {
+                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
+                    wg.merge_branch(
+                        ToolBox {
+                            office: &mut self.office[office_id],
+                            lsp_conn: &self.lsp_conn,
+                        },
+                        uri,
+                        branch_id
+                    );
+                }
+            },
         }
     }
 }

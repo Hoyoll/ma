@@ -2,26 +2,29 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process,
+    str::FromStr,
     thread::spawn,
 };
 
 use crossbeam::channel::Sender;
 use git2::{
-    BranchType, Commit, IndexAddOption, Oid, PackBuilderStage, PushOptions, RemoteCallbacks,
-    Repository, Status, StatusOptions,
+    BranchType, Commit, Index, IndexAddOption, MergeAnalysis, Oid, PackBuilderStage, PushOptions,
+    RemoteCallbacks, Repository, Status, StatusOptions,
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
-    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, HoverParams,
-    InlayHint, InlayHintParams, Location, Position, Range, SemanticToken, SemanticTokens,
-    SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, Uri,
-    request::{InlayHintRefreshRequest, Request},
+    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, Diagnostic,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, InlayHint, InlayHintParams, Location, Position, Range,
+    SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult, ShowDocumentParams,
+    TextDocumentPositionParams, Uri,
+    notification::PublishDiagnostics,
+    request::{DocumentDiagnosticRequest, InlayHintRefreshRequest, Request, ShowDocument},
 };
 use serde_json::to_value;
 
 use crate::{
-    app::{self, GitPush, MaAction, Office, Progress, SemanticTokenList},
+    app::{self, App, GitPush, MaAction, Office, Progress, SemanticTokenList},
     lsp::Kind,
     util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
@@ -43,7 +46,9 @@ impl WorkGroup {
                     }
                 }
             },
-            WorkGroup::Diff(diff) => todo!(),
+            WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
     }
 
@@ -55,6 +60,8 @@ impl WorkGroup {
         match self {
             WorkGroup::Root(root) => (),
             WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
     }
 
@@ -71,6 +78,7 @@ impl WorkGroup {
             WorkGroup::Diff(diff) => {
                 diff.goto_definition(&toolbox, (id, params.text_document_position_params));
             }
+            _ => (),
         }
     }
 
@@ -81,6 +89,8 @@ impl WorkGroup {
                 root.code_action(toolbox.office, params, &mut ret);
             }
             WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
         toolbox.lsp_conn.send(Kind::Main(
             Response {
@@ -110,6 +120,8 @@ impl WorkGroup {
                     &mut ret,
                 );
             }
+
+            _ => (),
         }
 
         toolbox
@@ -158,17 +170,37 @@ const HASH_LENGTH: usize = 7;
 pub enum WorkGroup {
     Root(Root),
     Diff(Diff),
+    MergeConflict(MergeConflict),
 }
 
 pub struct Root {
     status: Container<(PathBuf, Status)>,
     head_branch: String,
+    branch: Container<Branch>,
     remote: Container<Remote>,
     //remote_activity: Container<RemoteActivity>,
     tag: Container<String>,
     commits: Container<Oid>,
     view: Container<RootView>,
     mode: RootMode,
+}
+
+pub struct Branch {
+    pub name: String,
+    pub anal: MergeAnalysis,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+impl Branch {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            anal: MergeAnalysis::empty(),
+            ahead: 0,
+            behind: 0,
+        }
+    }
 }
 
 pub struct Remote {
@@ -201,6 +233,7 @@ enum RootView {
     LineBreak,
     HeadFile,
     HeadLabel,
+    BranchMember(usize),
     RemoteLabel,
     RemoteMember(usize),
     TagLabel,
@@ -216,6 +249,7 @@ impl Root {
         Self {
             status: Container::new(),
             head_branch: "".into(),
+            branch: Container::new(),
             remote: Container::new(),
             //remote_activity: Container::new(),
             tag: Container::new(),
@@ -234,6 +268,9 @@ impl Root {
                 RootView::LineBreak | RootView::HeadFile => format.push_str("\n"),
                 RootView::HeadLabel => {
                     format.push_str("# Head\n");
+                }
+                RootView::BranchMember(member) => {
+                    format.push_str(&format!("{}\n", &self.branch[member].name));
                 }
                 RootView::RemoteLabel => {
                     format.push_str("# Remote\n");
@@ -276,6 +313,10 @@ impl Root {
         self.view.push(RootView::HeadFile);
 
         self.view.push(RootView::HeadLabel);
+        self.branch.inner().iter().enumerate().for_each(|(i, _)| {
+            self.view.push(RootView::BranchMember(i));
+        });
+
         self.view.push(RootView::RemoteLabel);
         self.remote.inner().iter().enumerate().for_each(|(i, _)| {
             self.view.push(RootView::RemoteMember(i));
@@ -313,11 +354,51 @@ impl Root {
             });
     }
 
+    pub fn fill_branch(&mut self, office: &Office) {
+        self.branch.inner_mut().clear();
+        let head_commit = office.repo.head().unwrap().peel_to_commit().unwrap();
+        office
+            .repo
+            .branches(Some(BranchType::Local))
+            .map(|branches| {
+                branches.for_each(|branch| {
+                    branch.map(|(branch, _)| {
+                        let name = branch.name().unwrap_or_default().unwrap_or_default();
+                        if name == self.head_branch {
+                            return;
+                        }
+                        let branch_ref = branch.get();
+                        let mut b = Branch::new(name);
+                        let annotated = office
+                            .repo
+                            .reference_to_annotated_commit(branch_ref)
+                            .unwrap();
+                        let (anal, _) = office.repo.merge_analysis(&[&annotated]).unwrap();
+                        b.anal = anal;
+                        office
+                            .repo
+                            .graph_ahead_behind(
+                                branch_ref.peel_to_commit().unwrap().id(),
+                                head_commit.id(),
+                            )
+                            .map(|(ahead, behind)| {
+                                b.ahead = ahead;
+                                b.behind = behind;
+                            });
+                        self.branch.push(b);
+                    });
+                });
+            });
+    }
+
     pub fn fill_root(&mut self, office: &mut Office) {
         let head = office.repo.head().unwrap();
 
         self.head_branch = head.shorthand().unwrap().to_string();
         self.remote.inner_mut().clear();
+
+        self.fill_branch(office);
+
         office.repo.remotes().map(|remotes| {
             for name in remotes.iter().flatten() {
                 if let Some(name) = name {
@@ -369,6 +450,7 @@ impl Root {
             RootView::RemoteLabel => (),
             RootView::RemoteMember(_) => (),
             RootView::TagLabel => (),
+            RootView::BranchMember(_) => (),
             RootView::TagMember(member) => {
                 let tag = &self.tag[member];
                 let reference = match toolbox
@@ -432,6 +514,16 @@ impl Root {
                         }
                         RootView::HeadLabel => {
                             ret.push(create_inlay_hint(i, 7, format!(" {}", &self.head_branch)));
+                        }
+                        RootView::BranchMember(member) => {
+                            let branch = &self.branch[member];
+                            ret.push(create_inlay_hint(i, 0, "  "));
+                            ret.push(create_inlay_hint(
+                                i,
+                                branch.name.len() as u32,
+                                format!(" * {}, {}", branch.ahead, branch.behind),
+                            ));
+                            //let head = office.repo.head().unwrap().peel_to_commit().unwrap();
                         }
                         RootView::RemoteLabel => (),
                         RootView::RemoteMember(member) => {
@@ -573,6 +665,18 @@ impl Root {
                 | RootView::HeadLabel
                 | RootView::RemoteLabel
                 | RootView::TagLabel => (),
+                RootView::BranchMember(member) => {
+                    let branch = &self.branch[member];
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        branch.name.len() as u32,
+                        SemanticTokenList::NAMESPACE,
+                    ));
+                    prev_line_token = current_line_token;
+                }
                 RootView::RemoteMember(member) => {
                     let remote = &self.remote[member];
                     current_line_token = line as u32;
@@ -634,32 +738,27 @@ impl Root {
             RootMode::Dashboard => match &self.view[params.range.start.line as usize] {
                 RootView::LineBreak => (),
                 RootView::HeadFile => (),
-                RootView::HeadLabel => {
-                    let branch = match office.repo.branches(Some(BranchType::Local)) {
-                        Ok(branch) => branch,
-                        Err(_) => return,
-                    };
-                    for b in branch {
-                        match b {
-                            Ok((branch, _)) => {
-                                if let Ok(Some(name)) = branch.name() {
-                                    if name == self.head_branch {
-                                        continue;
-                                    }
-                                    ret.push(CodeActionOrCommand::Command(Command {
-                                        title: format!("Switch branch to {}", name),
-                                        command: MaAction::COMMAND.into(),
-                                        arguments: app::Command::SwitchBranch {
-                                            uri: params.text_document.uri.clone(),
-                                            branch: name.into(),
-                                        }
-                                        .into(),
-                                    }));
-                                }
-                            }
-                            Err(_) => continue,
+                RootView::HeadLabel => (),
+                RootView::BranchMember(member) => {
+                    let branch = &self.branch[member];
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Switch branch to {}", &branch.name),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::SwitchBranch {
+                            uri: params.text_document.uri.clone(),
+                            branch: branch.name.clone(),
                         }
-                    }
+                        .into(),
+                    }));
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: format!("Merge {} with HEAD", &branch.name),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::MergeBranch {
+                            uri: params.text_document.uri,
+                            branch_id: *member,
+                        }
+                        .into(),
+                    }));
                 }
                 RootView::RemoteLabel => {
                     let mut vec = vec![];
@@ -808,7 +907,8 @@ impl WorkGroup {
 
                 root.refresh(uri, toolbox.lsp_conn);
             }
-            WorkGroup::Diff(diff) => todo!(),
+            WorkGroup::Diff(diff) => (),
+            _ => (),
         }
     }
 
@@ -827,7 +927,8 @@ impl WorkGroup {
 
                 root.refresh(uri, toolbox.lsp_conn);
             }
-            WorkGroup::Diff(diff) => todo!(),
+            WorkGroup::Diff(diff) => (),
+            _ => (),
         }
     }
 
@@ -847,6 +948,8 @@ impl WorkGroup {
                 root.refresh(uri, toolbox.lsp_conn);
             }
             WorkGroup::Diff(diff) => todo!(),
+
+            _ => (),
         }
     }
 
@@ -879,6 +982,8 @@ impl WorkGroup {
                 root.refresh(url, toolbox.lsp_conn);
             }
             WorkGroup::Diff(diff) => todo!(),
+
+            _ => (),
         }
     }
 
@@ -965,13 +1070,13 @@ impl WorkGroup {
         }
     }
 
-    pub fn merge_branch(&mut self, toolbox: ToolBox, uri: Uri, branch: String) {
+    pub fn merge_branch(&mut self, toolbox: ToolBox, uri: Uri, branch_id: usize) {
         match self {
             WorkGroup::Root(root) => {
                 let mut ours_branch = toolbox
                     .office
                     .repo
-                    .find_branch(&branch, BranchType::Local)
+                    .find_branch(&root.branch[branch_id].name, BranchType::Local)
                     .unwrap();
                 let ours = ours_branch.get().peel_to_commit().unwrap();
 
@@ -980,7 +1085,8 @@ impl WorkGroup {
                     .repo
                     .find_branch(&root.head_branch, BranchType::Local)
                     .unwrap();
-                let theirs = theirs_branch.get().peel_to_commit().unwrap();
+                let theirs_ref = theirs_branch.get();
+                let theirs = theirs_ref.peel_to_commit().unwrap();
 
                 let ancestor_oid = toolbox
                     .office
@@ -999,26 +1105,54 @@ impl WorkGroup {
                     .merge_trees(&ancestor_tree, &ours_tree, &theirs_tree, None)
                     .unwrap();
                 if index.has_conflicts() {
+                    //index.conflicts();
+                    let url = MergeConflict::build(index, (&ours, &theirs, &ancestor), &toolbox);
+                    toolbox.lsp_conn.send(Kind::Main(
+                        lsp_server::Request {
+                            id: RequestId::from(1),
+                            method: ShowDocument::METHOD.into(),
+                            params: to_value(ShowDocumentParams {
+                                uri: url,
+                                external: None,
+                                take_focus: Some(true),
+                                selection: None,
+                            })
+                            .unwrap(),
+                        }
+                        .into(),
+                    ));
+                    //toolbox.lsp_conn.send(Kind::Main())
                     return;
                 }
 
+                //
                 let tree_oid = index.write_tree_to(&toolbox.office.repo).unwrap();
                 let merged_tree = toolbox.office.repo.find_tree(tree_oid).unwrap();
                 let signature = toolbox.office.repo.signature().unwrap();
-                let commit_oid = toolbox.office.repo.commit(
-                    None,
-                    &signature,
-                    &signature,
-                    &format!("Merge branch '{}' into '{}'", &root.head_branch, &branch),
-                    &merged_tree,
-                    &[&ours, &theirs],
-                ).unwrap();
+                let commit_oid = toolbox
+                    .office
+                    .repo
+                    .commit(
+                        None,
+                        &signature,
+                        &signature,
+                        &format!(
+                            "Merge branch '{}' into '{}'",
+                            &root.head_branch, &root.branch[branch_id].name
+                        ),
+                        &merged_tree,
+                        &[&ours, &theirs],
+                    )
+                    .unwrap();
 
                 //move the ours to new commit
                 ours_branch.get_mut().set_target(commit_oid, "Merge branch");
+                toolbox.lsp_conn.send(Kind::Other(MaAction::Command { command: app::Command::Reload { uri } }));
                 //toolbox.office.repo.commit(update_ref, author, committer, message, tree, parents)
             }
             WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
     }
 
@@ -1030,6 +1164,8 @@ impl WorkGroup {
                 root.refresh(uri, toolbox.lsp_conn);
             }
             WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
     }
 
@@ -1083,6 +1219,8 @@ impl WorkGroup {
                 }
             },
             WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
     }
 
@@ -1118,6 +1256,8 @@ impl WorkGroup {
                 ));
             }
             WorkGroup::Diff(diff) => (),
+
+            _ => (),
         }
     }
 }
@@ -1183,13 +1323,7 @@ impl Diff {
     }
 
     fn build_commit_dir(office: &Office, oid: Oid) -> PathBuf {
-        office
-            .repo
-            .workdir()
-            .unwrap()
-            .join(".git")
-            .join("ma")
-            .join(oid.to_string())
+        office.repo.path().join(App::NAME).join(oid.to_string())
     }
 
     fn build_old_file(office: &Office, path: &Path, oid: Oid) -> Option<String> {
@@ -1514,4 +1648,190 @@ impl Diff {
             DiffView::OldLine { content } => (),
         }
     }
+}
+
+pub struct MergeConflict {
+    view: Container<ConflictView>,
+    format: String,
+}
+
+impl MergeConflict {
+    fn new() -> Self {
+        Self {
+            view: Container::new(),
+            format: String::new(),
+        }
+    }
+
+    fn build(
+        index: Index,
+        (ours, theirs, ancestor_commit): (&Commit, &Commit, &Commit),
+        toolbox: &ToolBox,
+    ) -> Uri {
+        let mut mc = Self::new();
+        mc.view.push(ConflictView::CommitOid {
+            oid: ancestor_commit.id(),
+        });
+        mc.format
+            .push_str(&format!("^ {}\n", ancestor_commit.id().to_string()));
+
+        mc.view.push(ConflictView::CommitOid { oid: ours.id() });
+        mc.format
+            .push_str(&format!("< {}\n", ours.id().to_string()));
+
+        mc.view.push(ConflictView::CommitOid { oid: theirs.id() });
+        mc.format
+            .push_str(&format!("> {}\n", theirs.id().to_string()));
+        //index.path()
+        for conf in index.conflicts().unwrap() {
+            let conflict = match conf {
+                Ok(conf) => conf,
+                Err(_) => continue,
+            };
+
+            mc.view.push(ConflictView::LineBreak);
+            mc.format.push_str("\n");
+
+            match (conflict.ancestor, conflict.our, conflict.their) {
+                (Some(ancestor), Some(our), Some(their)) => {
+                    let anc_path =
+                        PathBuf::from(String::from_utf8_lossy(&ancestor.path).to_string());
+                    mc.format
+                        .push_str(&format!("^ {}\n", anc_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: ancestor_commit.id(),
+                        path: anc_path,
+                    });
+                    let merge_result = toolbox
+                        .office
+                        .repo
+                        .merge_file_from_index(&ancestor, &our, &their, None)
+                        .unwrap();
+                    for line in merge_result.content().split(|&b| b == b'\n') {
+                        match line {
+                            _ if line.starts_with(b"<<<<<<<") => {
+                                let path =
+                                    PathBuf::from(String::from_utf8_lossy(&our.path).to_string());
+                                mc.format
+                                    .push_str(&format!("<<<<<<< {}\n", path.to_string_lossy()));
+                                mc.view.push(ConflictView::ConflictHeader {
+                                    oid: ours.id(),
+                                    path,
+                                });
+                            }
+                            _ if line.starts_with(b">>>>>>>") => {
+                                let path =
+                                    PathBuf::from(String::from_utf8_lossy(&our.path).to_string());
+                                mc.format
+                                    .push_str(&format!(">>>>>>> {}\n", path.to_string_lossy()));
+                                mc.view.push(ConflictView::ConflictHeader {
+                                    oid: ours.id(),
+                                    path,
+                                });
+                            }
+                            _ => {
+                                mc.view.push(ConflictView::ConflictLine);
+                                mc.format
+                                    .push_str(&format!("{}\n", String::from_utf8_lossy(line)));
+                            }
+                        }
+                    }
+                }
+                (Some(ancestor), Some(our), None) => {
+                    let anc_path =
+                        PathBuf::from(String::from_utf8_lossy(&ancestor.path).to_string());
+                    mc.format
+                        .push_str(&format!("^ {}\n", anc_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: ancestor_commit.id(),
+                        path: anc_path,
+                    });
+
+                    let our_path = PathBuf::from(String::from_utf8_lossy(&our.path).to_string());
+                    mc.format
+                        .push_str(&format!("< {}\n", our_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: ours.id(),
+                        path: our_path,
+                    });
+
+                    mc.view.push(ConflictView::MissingFile);
+                    mc.format.push_str("> ?\n");
+                }
+                (Some(ancestor), None, Some(their)) => {
+                    let anc_path =
+                        PathBuf::from(String::from_utf8_lossy(&ancestor.path).to_string());
+                    mc.format
+                        .push_str(&format!("^ {}\n", anc_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: ancestor_commit.id(),
+                        path: anc_path,
+                    });
+
+                    mc.view.push(ConflictView::MissingFile);
+                    mc.format.push_str("< ?\n");
+
+                    let their_path =
+                        PathBuf::from(String::from_utf8_lossy(&their.path).to_string());
+                    mc.format
+                        .push_str(&format!("> {}\n", their_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: theirs.id(),
+                        path: their_path,
+                    });
+                }
+                (None, Some(our), Some(their)) => {
+                    mc.view.push(ConflictView::MissingFile);
+                    mc.format.push_str("^ ?\n");
+
+                    let our_path = PathBuf::from(String::from_utf8_lossy(&our.path).to_string());
+                    mc.format
+                        .push_str(&format!("< {}\n", our_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: ours.id(),
+                        path: our_path,
+                    });
+
+                    let their_path =
+                        PathBuf::from(String::from_utf8_lossy(&their.path).to_string());
+                    mc.format
+                        .push_str(&format!("> {}\n", their_path.to_string_lossy()));
+                    mc.view.push(ConflictView::ConflictHeader {
+                        oid: theirs.id(),
+                        path: their_path,
+                    });
+                }
+                _ => (),
+            }
+        }
+
+        let path = toolbox
+            .office
+            .repo
+            .path()
+            .to_path_buf()
+            .join(App::NAME)
+            .join(ours.id().to_string())
+            .join("conflict.diff");
+        fs::create_dir_all(&path.parent().unwrap());
+        //let path =
+        fs::write(&path, &mc.format);
+        let url = name_to_url(&path).unwrap();
+        toolbox
+            .lsp_conn
+            .send(Kind::Other(MaAction::RegisterWorkgroup {
+                key: url.clone(),
+                workgroup: WorkGroup::MergeConflict(mc),
+                office_id: toolbox.office.o_id,
+            }));
+        url
+    }
+}
+
+pub enum ConflictView {
+    LineBreak,
+    ConflictLine,
+    ConflictHeader { oid: Oid, path: PathBuf },
+    CommitOid { oid: Oid },
+    MissingFile,
 }
