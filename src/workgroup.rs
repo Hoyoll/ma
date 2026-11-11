@@ -21,6 +21,7 @@ use lsp_types::{
     notification::PublishDiagnostics,
     request::{DocumentDiagnosticRequest, InlayHintRefreshRequest, Request, ShowDocument},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::to_value;
 
 use crate::{
@@ -34,15 +35,71 @@ impl WorkGroup {
         match self {
             WorkGroup::Root(root) => match &mut root.mode {
                 RootMode::Dashboard => (),
-                RootMode::Input { message } => {
-                    if let Some(text) = params.text {
-                        *message = text;
+                RootMode::CommitInput => {
+                    let author = toolbox.office.repo.author_from_env().unwrap();
+                    let committer = toolbox.office.repo.committer_from_env().unwrap();
+                    let mut index = toolbox.office.repo.index().unwrap();
+                    let tree_id = index.write_tree().unwrap();
+                    let tree = toolbox.office.repo.find_tree(tree_id).unwrap();
+                    let res = match toolbox.office.repo.head().ok() {
+                        Some(head) => {
+                            let parent = head.peel_to_commit().unwrap();
+                            // Existing commit
+                            toolbox.office.repo.commit(
+                                Some("HEAD"),
+                                &author,
+                                &committer,
+                                params.text.unwrap_or_default().trim_start(),
+                                &tree,
+                                &[&parent],
+                            )
+                        }
+                        None => toolbox.office.repo.commit(
+                            Some("HEAD"),
+                            &author,
+                            &committer,
+                            params.text.unwrap_or_default().as_ref(),
+                            &tree,
+                            &[],
+                        ),
+                    };
+                    if let Ok(_) = res {
+                        //root.mode = RootMode::Dashboard;
                         toolbox.lsp_conn.send(Kind::Other(
-                            app::Command::AttemptCommit {
+                            app::Command::ChangeRootMode {
                                 uri: params.text_document.uri,
+                                mode: RootMode::Dashboard,
                             }
                             .into(),
                         ));
+                    }
+                }
+                RootMode::TagInput { oid } => {
+                    let input = match params.text {
+                        Some(text) => text,
+                        None => return,
+                    };
+                    let mut line = input.lines();
+                    let name = match line.next() {
+                        Some(name) => name,
+                        None => return,
+                    };
+                    let message = line.collect::<Vec<_>>().join("\n");
+                    let oid = root.commits[oid];
+                    let commit = toolbox.office.repo.find_commit(oid).unwrap();
+                    let signature = toolbox.office.repo.signature().unwrap();
+                    if let Ok(_) = toolbox.office.repo.tag(
+                        name,
+                        commit.as_object(),
+                        &signature,
+                        &message,
+                        false,
+                    ) {
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::Command {
+                            command: app::Command::Reload {
+                                uri: params.text_document.uri,
+                            },
+                        }));
                     }
                 }
             },
@@ -223,10 +280,11 @@ impl Remote {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub enum RootMode {
     Dashboard,
-    Input { message: String },
+    CommitInput,
+    TagInput { oid: usize },
 }
 
 enum RootView {
@@ -496,7 +554,7 @@ impl Root {
     ) {
         //eprintln!("hint!");
         match &self.mode {
-            RootMode::Input { .. } => {
+            RootMode::CommitInput => {
                 //eprintln!("it's impossible to be here!");
                 ret.push(create_inlay_hint(0, 0, "Waiting for commit message"));
             }
@@ -647,6 +705,10 @@ impl Root {
                     });
                 }
             }
+            RootMode::TagInput { .. } => {
+                ret.push(create_inlay_hint(0, 0, "Tag name: "));
+                ret.push(create_inlay_hint(1, 0, "Tag message "));
+            },
         }
     }
 
@@ -737,7 +799,16 @@ impl Root {
         match &self.mode {
             RootMode::Dashboard => match &self.view[params.range.start.line as usize] {
                 RootView::LineBreak => (),
-                RootView::HeadFile => (),
+                RootView::HeadFile => {
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: "Reload".into(),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::Reload {
+                            uri: params.text_document.uri,
+                        }
+                        .into(),
+                    }));
+                }
                 RootView::HeadLabel => (),
                 RootView::BranchMember(member) => {
                     let branch = &self.branch[member];
@@ -805,10 +876,7 @@ impl Root {
                             arguments: app::Command::PushRemote {
                                 uri: params.text_document.uri.clone(),
                                 remote_id,
-                                refspec: format!(
-                                    "refs/tags/{0}:refs/tags/{0}",
-                                    tag
-                                ),
+                                refspec: format!("refs/tags/{0}:refs/tags/{0}", tag),
                             }
                             .into(),
                         }));
@@ -827,8 +895,9 @@ impl Root {
                         ret.push(CodeActionOrCommand::Command(Command {
                             title: "Commit changes".into(),
                             command: MaAction::COMMAND.into(),
-                            arguments: app::Command::AttemptCommit {
+                            arguments: app::Command::ChangeRootMode {
                                 uri: params.text_document.uri,
+                                mode: RootMode::CommitInput,
                             }
                             .into(),
                         }));
@@ -875,27 +944,30 @@ impl Root {
                     }
                 }
                 RootView::CommitLabel => (),
-                RootView::CommitMember(_) => (),
+                RootView::CommitMember(member) => {
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: "Add tag".into(),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::ChangeRootMode {
+                            uri: params.text_document.uri,
+                            mode: RootMode::TagInput { oid: *member },
+                        }
+                        .into(),
+                    }));
+                }
             },
-            RootMode::Input { .. } => {
-                //ret.push(CodeActionOrCommand::Command(Command {
-                //    title: "Commit".into(),
-                //    command: MaAction::ACTION.into(),
-                //    arguments: MaAction::AttemptCommit {
-                //        uri: params.text_document.uri.clone(),
-                //    }
-                //    .into(),
-                //}));
-
+            RootMode::CommitInput => {
                 ret.push(CodeActionOrCommand::Command(Command {
                     title: "Cancel commit".into(),
                     command: MaAction::COMMAND.into(),
-                    arguments: app::Command::CancelCommit {
+                    arguments: app::Command::ChangeRootMode {
                         uri: params.text_document.uri,
+                        mode: RootMode::Dashboard,
                     }
                     .into(),
                 }));
             }
+            RootMode::TagInput { oid } => (),
         }
     }
 }
@@ -1184,55 +1256,34 @@ impl WorkGroup {
         }
     }
 
-    pub fn attempt_commit(&mut self, toolbox: ToolBox, uri: Uri) {
+    pub fn change_root_mode(&mut self, toolbox: ToolBox, uri: Uri, root_mode: RootMode) {
         match self {
-            WorkGroup::Root(root) => match &root.mode {
-                RootMode::Dashboard => {
-                    root.mode = RootMode::Input {
-                        message: String::new(),
-                    };
-                    toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
-                        url: uri,
-                        content: "\n\n".into(),
-                        range: Range::new(Position::new(0, 0), Position::new(1000, 0)),
-                    }));
-                }
-                RootMode::Input { message, .. } => {
-                    let author = toolbox.office.repo.author_from_env().unwrap();
-                    let committer = toolbox.office.repo.committer_from_env().unwrap();
-                    let mut index = toolbox.office.repo.index().unwrap();
-                    let tree_id = index.write_tree().unwrap();
-                    let tree = toolbox.office.repo.find_tree(tree_id).unwrap();
-                    let res = match toolbox.office.repo.head().ok() {
-                        Some(head) => {
-                            let parent = head.peel_to_commit().unwrap();
-                            // Existing commit
-                            toolbox.office.repo.commit(
-                                Some("HEAD"),
-                                &author,
-                                &committer,
-                                message.trim_start(),
-                                &tree,
-                                &[&parent],
-                            )
-                        }
-                        None => toolbox.office.repo.commit(
-                            Some("HEAD"),
-                            &author,
-                            &committer,
-                            message.as_ref(),
-                            &tree,
-                            &[],
-                        ),
-                    };
-                    if let Ok(_) = res {
-                        root.mode = RootMode::Dashboard;
-                        toolbox
-                            .lsp_conn
-                            .send(Kind::Other(app::Command::Reload { uri }.into()));
+            WorkGroup::Root(root) => {
+                root.mode = root_mode;
+                match &root.mode {
+                    RootMode::Dashboard => {
+                        //root.mode = ro
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::Command {
+                            command: app::Command::Reload { uri },
+                        }));
+                        return;
+                    }
+                    RootMode::CommitInput => {
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                            url: uri,
+                            content: "\n\n".into(),
+                            range: Range::new(Position::new(0, 0), Position::new(1000, 0)),
+                        }));
+                    }
+                    RootMode::TagInput { .. } => {
+                        toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                            url: uri,
+                            content: "\n\n".into(),
+                            range: Range::new(Position::new(0, 0), Position::new(1000, 0)),
+                        }));
                     }
                 }
-            },
+            }
             WorkGroup::Diff(diff) => (),
 
             _ => (),

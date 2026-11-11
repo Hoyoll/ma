@@ -25,7 +25,7 @@ use serde_json::{Value, from_value, to_value};
 use crate::{
     lsp::Kind,
     util::{self, Container, name_to_url},
-    workgroup::{Diff, DiffView, Root, ToolBox, WorkGroup},
+    workgroup::{Diff, DiffView, Root, RootMode, ToolBox, WorkGroup},
 };
 #[repr(u32)]
 pub enum SemanticTokenList {
@@ -215,11 +215,9 @@ pub enum Command {
     Reload {
         uri: Uri,
     },
-    AttemptCommit {
+    ChangeRootMode {
         uri: Uri,
-    },
-    CancelCommit {
-        uri: Uri,
+        mode: RootMode,
     },
     PullRemote {
         uri: Uri,
@@ -605,25 +603,15 @@ impl App {
                     );
                 }
             }
-            Command::AttemptCommit { uri } => {
+            Command::ChangeRootMode { uri, mode } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.attempt_commit(
+                    wg.change_root_mode(
                         ToolBox {
                             office: &mut self.office[office_id],
                             lsp_conn: &self.lsp_conn,
                         },
                         uri,
-                    );
-                }
-            }
-            Command::CancelCommit { uri } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.cancel_commit(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
+                        mode,
                     );
                 }
             }
