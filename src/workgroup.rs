@@ -766,7 +766,11 @@ impl Root {
                         vec.push(
                             app::Command::PushRemote {
                                 uri: params.text_document.uri.clone(),
-                                name: i,
+                                remote_id: i,
+                                refspec: format!(
+                                    "refs/heads/{0}:refs/heads/{0}",
+                                    &self.head_branch
+                                ),
                             }
                             .to_value(),
                         );
@@ -784,23 +788,32 @@ impl Root {
                         command: MaAction::COMMAND.into(),
                         arguments: app::Command::PushRemote {
                             uri: params.text_document.uri.clone(),
-                            name: *member,
+                            remote_id: *member,
+                            refspec: format!("refs/heads/{0}:refs/heads/{0}", &self.head_branch),
                         }
                         .into(),
                     }));
-                    return;
-                    ret.push(CodeActionOrCommand::Command(Command {
-                        title: format!("Pull {} from {}", self.head_branch, &remote.name),
-                        command: MaAction::COMMAND.into(),
-                        arguments: app::Command::PushRemote {
-                            uri: params.text_document.uri,
-                            name: *member,
-                        }
-                        .into(),
-                    }));
+                    //return;
                 }
                 RootView::TagLabel => (),
-                RootView::TagMember(_) => (),
+                RootView::TagMember(member) => {
+                    let tag = &self.tag[member];
+                    for (remote_id, remote) in self.remote.inner().iter().enumerate() {
+                        ret.push(CodeActionOrCommand::Command(Command {
+                            title: format!("Push tag {} to {}", tag, &remote.name),
+                            command: MaAction::COMMAND.into(),
+                            arguments: app::Command::PushRemote {
+                                uri: params.text_document.uri.clone(),
+                                remote_id,
+                                refspec: format!(
+                                    "refs/tags/{0}:refs/tags/{0}",
+                                    tag
+                                ),
+                            }
+                            .into(),
+                        }));
+                    }
+                }
                 RootView::StatusLabel => {
                     ret.push(CodeActionOrCommand::Command(Command {
                         title: "Stage all".into(),
@@ -987,13 +1000,13 @@ impl WorkGroup {
         }
     }
 
-    pub fn push_remote(&mut self, toolbox: ToolBox, uri: Uri, remote_id: usize) {
+    pub fn push_remote(&mut self, toolbox: ToolBox, uri: Uri, remote_id: usize, refspec: String) {
         match self {
             WorkGroup::Root(root) => {
                 //let config = toolbox.office.repo.config().unwrap();
                 let remote_name = root.remote[remote_id].name.clone();
                 let repo_path = toolbox.office.repo.workdir().unwrap().to_path_buf();
-                let head_branch = root.head_branch.clone();
+                //let head_branch = root.head_branch.clone();
                 let sender = toolbox.lsp_conn.clone();
 
                 spawn(move || {
@@ -1054,7 +1067,7 @@ impl WorkGroup {
                     });
                     let mut options = PushOptions::new();
                     options.remote_callbacks(callback);
-                    let refspec = format!("refs/heads/{0}:refs/heads/{0}", &head_branch);
+                    //let refspec = format!("refs/heads/{0}:refs/heads/{0}", &head_branch);
 
                     if let Err(push) = remote.push(&[refspec], Some(&mut options)) {
                         eprintln!("{}", push.to_string());
@@ -1147,7 +1160,9 @@ impl WorkGroup {
 
                 //move the ours to new commit
                 ours_branch.get_mut().set_target(commit_oid, "Merge branch");
-                toolbox.lsp_conn.send(Kind::Other(MaAction::Command { command: app::Command::Reload { uri } }));
+                toolbox.lsp_conn.send(Kind::Other(MaAction::Command {
+                    command: app::Command::Reload { uri },
+                }));
                 //toolbox.office.repo.commit(update_ref, author, committer, message, tree, parents)
             }
             WorkGroup::Diff(diff) => (),

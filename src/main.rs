@@ -8,7 +8,7 @@ mod util;
 mod workgroup;
 
 fn main() {
-    run(); 
+    run();
 }
 
 fn run() {

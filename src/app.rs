@@ -197,16 +197,43 @@ pub enum GitPush {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
-    StageAll { uri: Uri },
-    StageFile { uri: Uri, path: usize },
-    UnstageFile { uri: Uri, path: usize },
-    SwitchBranch { uri: Uri, branch: String },
-    Reload { uri: Uri },
-    AttemptCommit { uri: Uri },
-    CancelCommit { uri: Uri },
-    PullRemote { uri: Uri, name: usize },
-    PushRemote { uri: Uri, name: usize },
-    MergeBranch { uri: Uri, branch_id: usize }, //PushAll { uri: Uri },
+    StageAll {
+        uri: Uri,
+    },
+    StageFile {
+        uri: Uri,
+        path: usize,
+    },
+    UnstageFile {
+        uri: Uri,
+        path: usize,
+    },
+    SwitchBranch {
+        uri: Uri,
+        branch: String,
+    },
+    Reload {
+        uri: Uri,
+    },
+    AttemptCommit {
+        uri: Uri,
+    },
+    CancelCommit {
+        uri: Uri,
+    },
+    PullRemote {
+        uri: Uri,
+        name: usize,
+    },
+    PushRemote {
+        uri: Uri,
+        remote_id: usize,
+        refspec: String,
+    },
+    MergeBranch {
+        uri: Uri,
+        branch_id: usize,
+    }, //PushAll { uri: Uri },
 }
 
 impl Command {
@@ -601,7 +628,11 @@ impl App {
                 }
             }
             Command::PullRemote { uri, name } => (),
-            Command::PushRemote { uri, name } => {
+            Command::PushRemote {
+                uri,
+                remote_id,
+                refspec,
+            } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
                     let office = &mut self.office[office_id];
                     wg.push_remote(
@@ -610,9 +641,9 @@ impl App {
                             lsp_conn: &self.lsp_conn,
                         },
                         uri,
-                        name,
+                        remote_id,
+                        refspec,
                     );
-                    //let remote = office.repo.find_remote(&name);
                 }
             }
             //Command::PushAll { uri } => (),
@@ -624,10 +655,10 @@ impl App {
                             lsp_conn: &self.lsp_conn,
                         },
                         uri,
-                        branch_id
+                        branch_id,
                     );
                 }
-            },
+            }
         }
     }
 }
