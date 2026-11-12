@@ -25,7 +25,7 @@ use serde_json::{Value, from_value, to_value};
 use crate::{
     lsp::Kind,
     util::{self, Container, name_to_url},
-    workgroup::{Diff, DiffView, Root, ToolBox, WorkGroup},
+    workgroup::{Diff, DiffView, Root, RootMode, ToolBox, WorkGroup},
 };
 #[repr(u32)]
 pub enum SemanticTokenList {
@@ -197,16 +197,41 @@ pub enum GitPush {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
-    StageAll { uri: Uri },
-    StageFile { uri: Uri, path: usize },
-    UnstageFile { uri: Uri, path: usize },
-    SwitchBranch { uri: Uri, branch: String },
-    Reload { uri: Uri },
-    AttemptCommit { uri: Uri },
-    CancelCommit { uri: Uri },
-    PullRemote { uri: Uri, name: usize },
-    PushRemote { uri: Uri, name: usize },
-    MergeBranch { uri: Uri, branch_id: usize }, //PushAll { uri: Uri },
+    StageAll {
+        uri: Uri,
+    },
+    StageFile {
+        uri: Uri,
+        path: usize,
+    },
+    UnstageFile {
+        uri: Uri,
+        path: usize,
+    },
+    SwitchBranch {
+        uri: Uri,
+        branch: String,
+    },
+    Reload {
+        uri: Uri,
+    },
+    ChangeRootMode {
+        uri: Uri,
+        mode: RootMode,
+    },
+    PullRemote {
+        uri: Uri,
+        name: usize,
+    },
+    PushRemote {
+        uri: Uri,
+        remote_id: usize,
+        refspec: String,
+    },
+    MergeBranch {
+        uri: Uri,
+        branch_id: usize,
+    }, //PushAll { uri: Uri },
 }
 
 impl Command {
@@ -578,30 +603,24 @@ impl App {
                     );
                 }
             }
-            Command::AttemptCommit { uri } => {
+            Command::ChangeRootMode { uri, mode } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.attempt_commit(
+                    wg.change_root_mode(
                         ToolBox {
                             office: &mut self.office[office_id],
                             lsp_conn: &self.lsp_conn,
                         },
                         uri,
-                    );
-                }
-            }
-            Command::CancelCommit { uri } => {
-                if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
-                    wg.cancel_commit(
-                        ToolBox {
-                            office: &mut self.office[office_id],
-                            lsp_conn: &self.lsp_conn,
-                        },
-                        uri,
+                        mode,
                     );
                 }
             }
             Command::PullRemote { uri, name } => (),
-            Command::PushRemote { uri, name } => {
+            Command::PushRemote {
+                uri,
+                remote_id,
+                refspec,
+            } => {
                 if let Some((wg, office_id)) = self.work_group.get_mut(&uri) {
                     let office = &mut self.office[office_id];
                     wg.push_remote(
@@ -610,9 +629,9 @@ impl App {
                             lsp_conn: &self.lsp_conn,
                         },
                         uri,
-                        name,
+                        remote_id,
+                        refspec,
                     );
-                    //let remote = office.repo.find_remote(&name);
                 }
             }
             //Command::PushAll { uri } => (),
@@ -624,10 +643,10 @@ impl App {
                             lsp_conn: &self.lsp_conn,
                         },
                         uri,
-                        branch_id
+                        branch_id,
                     );
                 }
-            },
+            }
         }
     }
 }
