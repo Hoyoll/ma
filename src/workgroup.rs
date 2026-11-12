@@ -96,8 +96,9 @@ impl WorkGroup {
                         false,
                     ) {
                         toolbox.lsp_conn.send(Kind::Other(MaAction::Command {
-                            command: app::Command::Reload {
+                            command: app::Command::ChangeRootMode {
                                 uri: params.text_document.uri,
+                                mode: RootMode::Dashboard
                             },
                         }));
                     }
