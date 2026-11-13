@@ -35,6 +35,7 @@ pub enum SemanticTokenList {
     KEYWORD,
     STRUCT,
     TYPE,
+    COMMENT,
 }
 
 impl SemanticTokenList {
@@ -46,6 +47,7 @@ impl SemanticTokenList {
             SemanticTokenType::KEYWORD,
             SemanticTokenType::STRUCT,
             SemanticTokenType::TYPE,
+            SemanticTokenType::COMMENT,
         ]
     }
 }
@@ -116,12 +118,19 @@ pub fn capabilities() -> ServerCapabilities {
 
 pub struct Office {
     pub repo: Repository,
+    pub hunk_filter: HunkFilter,
     pub o_id: OfficeId,
 }
 
+pub type HunkFilter = HashMap<PathBuf, HashMap<u32, bool>>;
+
 impl Office {
     pub fn new(repo: Repository) -> Self {
-        Self { repo, o_id: 0 }
+        Self {
+            repo,
+            hunk_filter: HashMap::new(),
+            o_id: 0,
+        }
     }
 }
 
