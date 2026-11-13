@@ -1,5 +1,3 @@
-//This should not be committed
-
 use std::{
     io::{self, stdin, stdout},
     thread,

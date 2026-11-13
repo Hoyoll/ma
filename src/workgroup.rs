@@ -88,7 +88,10 @@ impl WorkGroup {
                                                 .hunk_filter
                                                 .get(&*current_delta.borrow())
                                             {
-                                                Some(h) => h.get(&hunk_id).is_some(),
+                                                Some(h) => match h.get(&hunk_id) {
+                                                    Some(active) => *active,
+                                                    None => false,
+                                                },
                                                 None => false,
                                             }
                                         }
