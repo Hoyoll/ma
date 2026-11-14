@@ -122,7 +122,9 @@ pub struct Office {
     pub o_id: OfficeId,
 }
 
-pub type HunkFilter = HashMap<PathBuf, HashMap<u32, bool>>;
+pub type HunkFilter = HashMap<PathBuf, HashMap<HunkId, bool>>;
+
+pub type HunkId = (u32, u32);
 
 impl Office {
     pub fn new(repo: Repository) -> Self {

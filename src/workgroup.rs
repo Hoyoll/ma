@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::to_value;
 
 use crate::{
-    app::{self, App, GitPush, HunkFilter, MaAction, Office, Progress, SemanticTokenList},
+    app::{self, App, GitPush, HunkFilter, HunkId, MaAction, Office, Progress, SemanticTokenList},
     lsp::Kind,
     util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
@@ -82,7 +82,7 @@ impl WorkGroup {
                                     //let current_delta = current_delta.clone();
                                     let ret = match hunk {
                                         Some(hunk) => {
-                                            let hunk_id = hunk.new_start();
+                                            let hunk_id = (hunk.new_start(), hunk.old_start());
                                             match toolbox
                                                 .office
                                                 .hunk_filter
@@ -1649,45 +1649,52 @@ impl Diff {
         format: &mut String,
     ) {
         //diff.map(|diff| {
-        let mut file_id = Oid::ZERO_SHA1;
+        let mut new_file_id = Oid::ZERO_SHA1;
+        let mut old_file_id = Oid::ZERO_SHA1;
         let mut from_file = 0usize;
-        let mut hunk_id = 0u32;
+        let mut hunk_id = (0u32, 0u32);
         let mut hunk_line = 0u32;
         diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
             //eprintln!("{}", String::from_utf8_lossy(line.content()));
-            let file = delta.new_file();
-            let new_file = file.id() != file_id;
-            if new_file {
-                file_id = file.id();
-                hunk_id = 0;
-                let path = file.path().unwrap();
-                from_file = diff_file.add(path.into());
-                let old_file = match delta.status() {
-                    Delta::Added => {
+            let new_file = delta.new_file();
+            let old_file = delta.old_file();
+            let new_delta = new_file.id() != new_file_id || old_file.id() != old_file_id;
+
+            if new_delta {
+                new_file_id = new_file.id();
+                old_file_id = old_file.id();
+                hunk_id = (0,0);
+
+                match (old_file.path(),new_file.path()) { 
+                    (None, Some(new)) => {
+                        from_file = diff_file.add(new.to_path_buf());
                         view.push(DiffView::LineBreak);
-                        "/dev/null"
-                    }
-                    _ => match delta.old_file().path() {
-                        Some(path) => {
-                            view.push(DiffView::OldFile(path.to_path_buf()));
-                            &path.to_string_lossy()
-                        }
-                        None => {
-                            view.push(DiffView::LineBreak);
-                            "/dev/null"
-                        }
+                        view.push(DiffView::NewFile{from_file});
+                        let content = format!("--- /dev/null\n+++ {}\n", new.to_string_lossy());
+                        format.push_str(&content);
                     },
-                };
+                    (Some(old), None) => {
+                        view.push(DiffView::OldFile(old.to_path_buf()));
+                        view.push(DiffView::LineBreak);
+                        let content = format!("--- {}\n+++ /dev/null\n", old.to_string_lossy());
+                        format.push_str(&content);
+                    },
+                    (Some(old), Some(new)) => {
+                        from_file = diff_file.add(new.to_path_buf());
 
-                let content = format!("--- {}\n+++ {}\n", old_file, path.to_string_lossy());
-                format.push_str(&content);
-
-                view.push(DiffView::NewFile { from_file });
+                        view.push(DiffView::OldFile(old.to_path_buf()));
+                        view.push(DiffView::NewFile { from_file });
+                        let content = format!("--- {}\n+++ {}\n", old.to_string_lossy(), new.to_string_lossy());
+                        format.push_str(&content);
+                    },
+                    _ => ()
+                }
             }
 
             match hunk {
-                Some(hunk) if hunk_id != hunk.new_start() => {
-                    hunk_id = hunk.new_start();
+                Some(hunk) if hunk_id != (hunk.new_start(),hunk.old_start()) => {
+                    //let a = hunk.header() == hunk.header();
+                    hunk_id = (hunk.new_start(), hunk.old_start());
                     hunk_line = hunk.new_start() - 1;
                     let header = format!(
                         "@@ -{},{} +{},{} @@\n",
@@ -2086,54 +2093,62 @@ impl DiffIndex {
     pub fn build(&mut self, diff: &git2::Diff, filter: &mut HunkFilter) -> String {
         filter.clear();
         let mut format = String::new();
-        let mut file_id = Oid::ZERO_SHA1;
+        
+        let mut new_file_id = Oid::ZERO_SHA1;
+        let mut old_file_id = Oid::ZERO_SHA1;
+        let mut hunk_id = (0u32, 0u32);
+
         let mut from_file = 0usize;
         let mut from_old_file = 0usize;
-        let mut hunk_id = 0u32;
-        let mut hunk_line = 0u32;
+        //let mut hunk_id = 0u32;
+        //let mut hunk_line = 0u32;
         let mut new_line = 0u32;
         let mut old_line = 0u32;
         let mut current_delta = PathBuf::new();
         diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-            let file = delta.new_file();
-            let new_file = file.id() != file_id;
-            if new_file {
-                file_id = file.id();
-                hunk_id = 0;
-                current_delta = file.path().unwrap().into();
-                from_file = self.new_file.add(current_delta.clone());
-                filter.insert(current_delta.clone(), HashMap::new());
-                let old_file = match delta.status() {
-                    Delta::Added => {
+            let new_file = delta.new_file();
+            let old_file = delta.old_file();
+            let new_delta = new_file.id() != new_file_id || old_file.id() != old_file_id;
+
+            if new_delta {
+                new_file_id = new_file.id();
+                old_file_id = old_file.id();
+                hunk_id = (0,0);
+
+                match (old_file.path(),new_file.path()) { 
+                    (None, Some(new)) => {
+                        from_file = self.new_file.add(new.to_path_buf());
+                        current_delta = new.to_path_buf();
                         self.view.push(IndexView::LineBreak);
-                        "/dev/null"
-                    }
-                    _ => match delta.old_file().path() {
-                        Some(path) => {
-                            from_old_file = self.old_file.add(path.to_path_buf());
-                            self.view.push(IndexView::OldFile { from_old_file });
-                            &path.to_string_lossy()
-                        }
-                        None => {
-                            self.view.push(IndexView::LineBreak);
-                            "/dev/null"
-                        }
+                        self.view.push(IndexView::NewFile{from_file});
+                        let content = format!("--- /dev/null\n+++ {}\n", new.to_string_lossy());
+                        format.push_str(&content);
                     },
-                };
-
-                let content = format!(
-                    "--- {}\n+++ {}\n",
-                    old_file,
-                    current_delta.to_string_lossy()
-                );
-                format.push_str(&content);
-
-                self.view.push(IndexView::NewFile { from_file });
+                    (Some(old), None) => {
+                        from_old_file = self.old_file.add(old.to_path_buf());
+                        current_delta = old.to_path_buf();
+                        self.view.push(IndexView::OldFile{from_old_file});
+                        self.view.push(IndexView::LineBreak);
+                        let content = format!("--- {}\n+++ /dev/null\n", old.to_string_lossy());
+                        format.push_str(&content);
+                    },
+                    (Some(old), Some(new)) => {
+                        from_file = self.new_file.add(new.to_path_buf());
+                        from_old_file = self.old_file.add(old.to_path_buf());
+                        current_delta = new.to_path_buf();
+                        self.view.push(IndexView::OldFile {from_old_file});
+                        self.view.push(IndexView::NewFile { from_file });
+                        let content = format!("--- {}\n+++ {}\n", old.to_string_lossy(), new.to_string_lossy());
+                        format.push_str(&content);
+                    },
+                    _ => ()
+                }
+                filter.insert(current_delta.clone(), HashMap::new());
             }
 
             match hunk {
-                Some(hunk) if hunk_id != hunk.new_start() => {
-                    hunk_id = hunk.new_start();
+                Some(hunk) if hunk_id != (hunk.new_start(), hunk.old_start()) => {
+                    hunk_id = (hunk.new_start(), hunk.old_start());
                     filter.get_mut(&current_delta).map(|filter| {
                         filter.insert(hunk_id, true);
                     });
@@ -2148,7 +2163,7 @@ impl DiffIndex {
                     );
                     self.view.push(IndexView::HunkHeader {
                         from_file,
-                        hunk_id,
+                        hunk_id: hunk_id,
                         length: header.len(),
                     });
                     format.push_str(&header);
@@ -2157,9 +2172,9 @@ impl DiffIndex {
                     match line.origin() {
                         ' ' => {
                             //new_line = hunk_line;
-                            self.view.push(IndexView::ContexLine {
+                            self.view.push(IndexView::ContextLine {
                                 from_file,
-                                line: hunk_line,
+                                line: new_line,
                             });
                             format.push_str(&format!(
                                 "{} {}",
@@ -2190,15 +2205,18 @@ impl DiffIndex {
                         }
                         '-' => {
                             //hunk_line += 1;
-                            self.view.push(IndexView::OldLine {
-                                from_old_file,
-                                line: old_line,
-                            });
-                            format.push_str(&format!(
+                            let content = format!(
                                 "{} {}",
                                 line.origin(),
                                 String::from_utf8_lossy(line.content())
-                            ));
+                            );
+                            self.view.push(IndexView::OldLine {
+                                from_old_file,
+                                from_hunk_id: hunk_id,
+                                line: old_line,
+                                length: content.len()
+                            });
+                            format.push_str(&content);
                             old_line += 1;
                         }
                         _ => (),
@@ -2219,16 +2237,16 @@ pub enum IndexView {
     },
     HunkHeader {
         from_file: usize,
-        hunk_id: u32,
+        hunk_id: HunkId,
         length: Length,
     },
     NewLine {
         from_file: usize,
-        from_hunk_id: u32,
+        from_hunk_id: HunkId,
         line: u32,
         length: Length,
     },
-    ContexLine {
+    ContextLine {
         from_file: usize,
         line: u32,
     },
@@ -2238,7 +2256,9 @@ pub enum IndexView {
     },
     OldLine {
         from_old_file: usize,
+        from_hunk_id: HunkId,
         line: u32,
+        length: Length
     },
 }
 
@@ -2265,11 +2285,13 @@ impl DiffIndex {
                     line,
                     length,
                 } => (),
-                IndexView::ContexLine { from_file, line } => (),
+                IndexView::ContextLine { from_file, line } => (),
                 IndexView::OldFile { from_old_file } => (),
                 IndexView::OldLine {
                     from_old_file,
+                    from_hunk_id,
                     line,
+                    length
                 } => (),
             }
         }
@@ -2331,7 +2353,7 @@ impl DiffIndex {
                     .into(),
                 ));
             }
-            IndexView::ContexLine { from_file, line } => {
+            IndexView::ContextLine { from_file, line } => {
                 let path = toolbox
                     .office
                     .repo
@@ -2378,7 +2400,9 @@ impl DiffIndex {
             }
             IndexView::OldLine {
                 from_old_file,
+                from_hunk_id,
                 line,
+                length
             } => {
                 let path = &self.old_file[from_old_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
@@ -2418,9 +2442,12 @@ impl DiffIndex {
                     length,
                 } => {
                     let path = &self.new_file[from_file];
+                    //eprintln!("first step");
+                    //eprintln!("{}", path.to_string_lossy());
                     match toolbox.office.hunk_filter.get(path) {
                         Some(hs) => match hs.get(hunk_id) {
                             Some(active) => {
+                                eprintln!("last step");
                                 let sm = if *active {
                                     SemanticTokenList::KEYWORD
                                 } else {
@@ -2431,9 +2458,13 @@ impl DiffIndex {
                                 ret.push(create_semantic_token(delta, 0u32, *length as u32, sm));
                                 prev_line_token = current_line_token;
                             }
-                            None => {}
+                            None => {
+                                eprintln!("missed {:?}", hunk_id);
+                            }
                         },
-                        None => {}
+                        None => {
+                            eprintln!("missed! {}", path.to_string_lossy());
+                        }
                     }
                 }
                 IndexView::NewLine {
@@ -2462,11 +2493,13 @@ impl DiffIndex {
                     }
                     //ret.push(create_semantic_token(delta_line, delta_start, length, token_type));
                 }
-                IndexView::ContexLine { from_file, line } => (),
+                IndexView::ContextLine { from_file, line } => (),
                 IndexView::OldFile { from_old_file } => (),
                 IndexView::OldLine {
                     from_old_file,
+                    from_hunk_id,
                     line,
+                    length,
                 } => (),
             }
         }
