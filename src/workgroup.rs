@@ -1663,36 +1663,40 @@ impl Diff {
             if new_delta {
                 new_file_id = new_file.id();
                 old_file_id = old_file.id();
-                hunk_id = (0,0);
+                hunk_id = (0, 0);
 
-                match (old_file.path(),new_file.path()) { 
+                match (old_file.path(), new_file.path()) {
                     (None, Some(new)) => {
                         from_file = diff_file.add(new.to_path_buf());
                         view.push(DiffView::LineBreak);
-                        view.push(DiffView::NewFile{from_file});
+                        view.push(DiffView::NewFile { from_file });
                         let content = format!("--- /dev/null\n+++ {}\n", new.to_string_lossy());
                         format.push_str(&content);
-                    },
+                    }
                     (Some(old), None) => {
                         view.push(DiffView::OldFile(old.to_path_buf()));
                         view.push(DiffView::LineBreak);
                         let content = format!("--- {}\n+++ /dev/null\n", old.to_string_lossy());
                         format.push_str(&content);
-                    },
+                    }
                     (Some(old), Some(new)) => {
                         from_file = diff_file.add(new.to_path_buf());
 
                         view.push(DiffView::OldFile(old.to_path_buf()));
                         view.push(DiffView::NewFile { from_file });
-                        let content = format!("--- {}\n+++ {}\n", old.to_string_lossy(), new.to_string_lossy());
+                        let content = format!(
+                            "--- {}\n+++ {}\n",
+                            old.to_string_lossy(),
+                            new.to_string_lossy()
+                        );
                         format.push_str(&content);
-                    },
-                    _ => ()
+                    }
+                    _ => (),
                 }
             }
 
             match hunk {
-                Some(hunk) if hunk_id != (hunk.new_start(),hunk.old_start()) => {
+                Some(hunk) if hunk_id != (hunk.new_start(), hunk.old_start()) => {
                     //let a = hunk.header() == hunk.header();
                     hunk_id = (hunk.new_start(), hunk.old_start());
                     hunk_line = hunk.new_start() - 1;
@@ -2073,8 +2077,8 @@ pub enum ConflictView {
 
 pub struct DiffIndex {
     pub view: Container<IndexView>,
-    pub new_file: Container<PathBuf>,
-    pub old_file: Container<PathBuf>,
+    pub paths: Container<PathBuf>,
+    //pub old_file: Container<PathBuf>,
     pub parent_oid: Oid,
     //pub filter: HashMap<PathBuf, HashMap<u32, bool>>,
 }
@@ -2083,8 +2087,8 @@ impl DiffIndex {
     pub fn new(parent_oid: Oid) -> Self {
         Self {
             view: Container::new(),
-            new_file: Container::new(),
-            old_file: Container::new(),
+            paths: Container::new(),
+            //old_file: Container::new(),
             parent_oid,
             //       filter: HashMap::new(),
         }
@@ -2093,7 +2097,7 @@ impl DiffIndex {
     pub fn build(&mut self, diff: &git2::Diff, filter: &mut HunkFilter) -> String {
         filter.clear();
         let mut format = String::new();
-        
+
         let mut new_file_id = Oid::ZERO_SHA1;
         let mut old_file_id = Oid::ZERO_SHA1;
         let mut hunk_id = (0u32, 0u32);
@@ -2113,35 +2117,39 @@ impl DiffIndex {
             if new_delta {
                 new_file_id = new_file.id();
                 old_file_id = old_file.id();
-                hunk_id = (0,0);
+                hunk_id = (0, 0);
 
-                match (old_file.path(),new_file.path()) { 
+                match (old_file.path(), new_file.path()) {
                     (None, Some(new)) => {
-                        from_file = self.new_file.add(new.to_path_buf());
+                        from_file = self.paths.add(new.to_path_buf());
                         current_delta = new.to_path_buf();
                         self.view.push(IndexView::LineBreak);
-                        self.view.push(IndexView::NewFile{from_file});
+                        self.view.push(IndexView::NewFile { from_file });
                         let content = format!("--- /dev/null\n+++ {}\n", new.to_string_lossy());
                         format.push_str(&content);
-                    },
+                    }
                     (Some(old), None) => {
-                        from_old_file = self.old_file.add(old.to_path_buf());
+                        from_file = self.paths.add(old.to_path_buf());
                         current_delta = old.to_path_buf();
-                        self.view.push(IndexView::OldFile{from_old_file});
+                        self.view.push(IndexView::OldFile { from_file });
                         self.view.push(IndexView::LineBreak);
                         let content = format!("--- {}\n+++ /dev/null\n", old.to_string_lossy());
                         format.push_str(&content);
-                    },
+                    }
                     (Some(old), Some(new)) => {
-                        from_file = self.new_file.add(new.to_path_buf());
-                        from_old_file = self.old_file.add(old.to_path_buf());
+                        from_file = self.paths.add(new.to_path_buf());
+                        //from_old_file = self.old_file.add(old.to_path_buf());
                         current_delta = new.to_path_buf();
-                        self.view.push(IndexView::OldFile {from_old_file});
+                        self.view.push(IndexView::OldFile { from_file });
                         self.view.push(IndexView::NewFile { from_file });
-                        let content = format!("--- {}\n+++ {}\n", old.to_string_lossy(), new.to_string_lossy());
+                        let content = format!(
+                            "--- {}\n+++ {}\n",
+                            old.to_string_lossy(),
+                            new.to_string_lossy()
+                        );
                         format.push_str(&content);
-                    },
-                    _ => ()
+                    }
+                    _ => (),
                 }
                 filter.insert(current_delta.clone(), HashMap::new());
             }
@@ -2211,10 +2219,10 @@ impl DiffIndex {
                                 String::from_utf8_lossy(line.content())
                             );
                             self.view.push(IndexView::OldLine {
-                                from_old_file,
+                                from_file,
                                 from_hunk_id: hunk_id,
                                 line: old_line,
-                                length: content.len()
+                                length: content.len(),
                             });
                             format.push_str(&content);
                             old_line += 1;
@@ -2251,14 +2259,14 @@ pub enum IndexView {
         line: u32,
     },
     OldFile {
-        from_old_file: usize,
+        from_file: usize,
         //parent: Oid,
     },
     OldLine {
-        from_old_file: usize,
+        from_file: usize,
         from_hunk_id: HunkId,
         line: u32,
-        length: Length
+        length: Length,
     },
 }
 
@@ -2276,7 +2284,7 @@ impl DiffIndex {
                     ret.push(create_inlay_hint(
                         line,
                         length as u32,
-                        format!(" * {}", &self.new_file[from_file].to_string_lossy()),
+                        format!(" * {}", &self.paths[from_file].to_string_lossy()),
                     ));
                 }
                 IndexView::NewLine {
@@ -2286,12 +2294,12 @@ impl DiffIndex {
                     length,
                 } => (),
                 IndexView::ContextLine { from_file, line } => (),
-                IndexView::OldFile { from_old_file } => (),
+                IndexView::OldFile { from_file } => (),
                 IndexView::OldLine {
-                    from_old_file,
+                    from_file,
                     from_hunk_id,
                     line,
-                    length
+                    length,
                 } => (),
             }
         }
@@ -2307,7 +2315,7 @@ impl DiffIndex {
                 hunk_id,
                 length: _,
             } => {
-                let path = &self.new_file[from_file];
+                let path = &self.paths[from_file];
                 match toolbox.office.hunk_filter.get_mut(path) {
                     Some(hunk) => match hunk.get_mut(&hunk_id) {
                         Some(active) => {
@@ -2337,7 +2345,7 @@ impl DiffIndex {
                     .repo
                     .workdir()
                     .unwrap()
-                    .join(&self.new_file[from_file]);
+                    .join(&self.paths[from_file]);
                 let response = GotoDefinitionResponse::Scalar(Location::new(
                     name_to_url(&path).unwrap(),
                     Range {
@@ -2359,7 +2367,7 @@ impl DiffIndex {
                     .repo
                     .workdir()
                     .unwrap()
-                    .join(&self.new_file[from_file]);
+                    .join(&self.paths[from_file]);
                 let response = GotoDefinitionResponse::Scalar(Location::new(
                     name_to_url(&path).unwrap(),
                     Range {
@@ -2375,13 +2383,17 @@ impl DiffIndex {
                     .into(),
                 ));
             }
-            IndexView::OldFile { from_old_file } => {
-                let path = &self.old_file[from_old_file];
+            IndexView::OldFile { from_file } => {
+                let path = &self.paths[from_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
+                    eprintln!("{content}");
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
-                    fs::create_dir_all(&dir);
+                    
                     let file_path = dir.join(path);
+                    fs::create_dir_all(&file_path.parent().unwrap());
                     fs::write(&file_path, content);
+                        //eprintln!("{}", write.to_string());
+                        //eprintln!("{}", file_path.to_string_lossy());
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
                         Range {
@@ -2399,16 +2411,20 @@ impl DiffIndex {
                 });
             }
             IndexView::OldLine {
-                from_old_file,
+                from_file,
                 from_hunk_id,
                 line,
-                length
+                length,
             } => {
-                let path = &self.old_file[from_old_file];
+                let path = &self.paths[from_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
-                    fs::create_dir_all(&dir);
+                    //fs::create_dir_all(&dir);
                     let file_path = dir.join(path);
+                    
+                    fs::create_dir_all(&file_path.parent().unwrap());
+                    //eprintln!("path: {}", path.to_string_lossy());
+                    //eprintln!("line: {}", line);
                     fs::write(&file_path, content);
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
@@ -2441,13 +2457,13 @@ impl DiffIndex {
                     hunk_id,
                     length,
                 } => {
-                    let path = &self.new_file[from_file];
+                    let path = &self.paths[from_file];
                     //eprintln!("first step");
                     //eprintln!("{}", path.to_string_lossy());
                     match toolbox.office.hunk_filter.get(path) {
                         Some(hs) => match hs.get(hunk_id) {
                             Some(active) => {
-                                eprintln!("last step");
+                                //eprintln!("last step");
                                 let sm = if *active {
                                     SemanticTokenList::KEYWORD
                                 } else {
@@ -2459,11 +2475,11 @@ impl DiffIndex {
                                 prev_line_token = current_line_token;
                             }
                             None => {
-                                eprintln!("missed {:?}", hunk_id);
+                                //eprintln!("missed {:?}", hunk_id);
                             }
                         },
                         None => {
-                            eprintln!("missed! {}", path.to_string_lossy());
+                            //eprintln!("missed! {}", path.to_string_lossy());
                         }
                     }
                 }
@@ -2472,20 +2488,28 @@ impl DiffIndex {
                     from_hunk_id,
                     line: _,
                     length,
+                }
+                | IndexView::OldLine {
+                    from_file,
+                    from_hunk_id,
+                    line: _,
+                    length,
                 } => {
-                    let path = &self.new_file[from_file];
+                    let path = &self.paths[from_file];
                     match toolbox.office.hunk_filter.get(path) {
                         Some(hs) => match hs.get(from_hunk_id) {
                             Some(active) => {
-                                let sm = if *active {
-                                    SemanticTokenList::STRUCT
-                                } else {
-                                    SemanticTokenList::COMMENT
-                                };
-                                current_line_token = line as u32;
-                                let delta = current_line_token - prev_line_token;
-                                ret.push(create_semantic_token(delta, 0u32, *length as u32, sm));
-                                prev_line_token = current_line_token;
+                                if !*active {
+                                    current_line_token = line as u32;
+                                    let delta = current_line_token - prev_line_token;
+                                    ret.push(create_semantic_token(
+                                        delta,
+                                        0u32,
+                                        *length as u32,
+                                        SemanticTokenList::COMMENT,
+                                    ));
+                                    prev_line_token = current_line_token;
+                                }
                             }
                             None => {}
                         },
@@ -2494,13 +2518,7 @@ impl DiffIndex {
                     //ret.push(create_semantic_token(delta_line, delta_start, length, token_type));
                 }
                 IndexView::ContextLine { from_file, line } => (),
-                IndexView::OldFile { from_old_file } => (),
-                IndexView::OldLine {
-                    from_old_file,
-                    from_hunk_id,
-                    line,
-                    length,
-                } => (),
+                IndexView::OldFile { from_file } => (), 
             }
         }
     }

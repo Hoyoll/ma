@@ -5,10 +5,7 @@ use std::{
 
 use chrono::{FixedOffset, TimeZone};
 use git2::Time;
-use lsp_types::{
-    InlayHint, InlayHintKind, InlayHintLabel, Position, SemanticToken, Uri,
-};
-
+use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, Position, SemanticToken, Uri};
 
 pub struct Container<T> {
     inner: Vec<T>,
