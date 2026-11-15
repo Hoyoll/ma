@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process,
@@ -8,8 +10,8 @@ use std::{
 
 use crossbeam::channel::Sender;
 use git2::{
-    BranchType, Commit, Index, IndexAddOption, MergeAnalysis, Oid, PackBuilderStage, PushOptions,
-    RemoteCallbacks, Repository, Status, StatusOptions,
+    ApplyOptions, BranchType, Commit, Delta, Index, IndexAddOption, MergeAnalysis, Oid,
+    PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Status, StatusOptions,
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
@@ -19,13 +21,16 @@ use lsp_types::{
     SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult, ShowDocumentParams,
     TextDocumentPositionParams, Uri,
     notification::PublishDiagnostics,
-    request::{DocumentDiagnosticRequest, InlayHintRefreshRequest, Request, ShowDocument},
+    request::{
+        DocumentDiagnosticRequest, InlayHintRefreshRequest, Request, SemanticTokensRefresh,
+        ShowDocument,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_value;
 
 use crate::{
-    app::{self, App, GitPush, MaAction, Office, Progress, SemanticTokenList},
+    app::{self, App, GitPush, HunkFilter, HunkId, MaAction, Office, Progress, SemanticTokenList},
     lsp::Kind,
     util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
@@ -36,23 +41,81 @@ impl WorkGroup {
             WorkGroup::Root(root) => match &mut root.mode {
                 RootMode::Dashboard => (),
                 RootMode::CommitInput => {
+                    //ApplyOptions::new()
+                    //toolbox.office.repo.apply_to_tree(tree, diff, options)
                     let author = toolbox.office.repo.author_from_env().unwrap();
                     let committer = toolbox.office.repo.committer_from_env().unwrap();
                     let mut index = toolbox.office.repo.index().unwrap();
                     let tree_id = index.write_tree().unwrap();
                     let tree = toolbox.office.repo.find_tree(tree_id).unwrap();
+                    let mut current_delta = RefCell::new(PathBuf::new());
+
                     let res = match toolbox.office.repo.head().ok() {
                         Some(head) => {
                             let parent = head.peel_to_commit().unwrap();
                             // Existing commit
-                            toolbox.office.repo.commit(
-                                Some("HEAD"),
-                                &author,
-                                &committer,
-                                params.text.unwrap_or_default().trim_start(),
-                                &tree,
-                                &[&parent],
-                            )
+                            if toolbox.office.hunk_filter.is_empty() {
+                                toolbox.office.repo.commit(
+                                    Some("HEAD"),
+                                    &author,
+                                    &committer,
+                                    params.text.unwrap_or_default().trim_start(),
+                                    &tree,
+                                    &[&parent],
+                                )
+                            } else {
+                                let head_tree = head.peel_to_tree().unwrap();
+                                let diff = toolbox
+                                    .office
+                                    .repo
+                                    .diff_tree_to_index(Some(&head_tree), None, None)
+                                    .unwrap();
+                                let mut opts = ApplyOptions::new();
+                                opts.delta_callback(|delta| {
+                                    if let Some(delta) = delta {
+                                        *current_delta.borrow_mut() =
+                                            delta.new_file().path().unwrap().to_path_buf();
+                                    }
+                                    true
+                                });
+                                opts.hunk_callback(|hunk| {
+                                    //let current_delta = current_delta.clone();
+                                    let ret = match hunk {
+                                        Some(hunk) => {
+                                            let hunk_id = (hunk.new_start(), hunk.old_start());
+                                            match toolbox
+                                                .office
+                                                .hunk_filter
+                                                .get(&*current_delta.borrow())
+                                            {
+                                                Some(h) => match h.get(&hunk_id) {
+                                                    Some(active) => *active,
+                                                    None => false,
+                                                },
+                                                None => false,
+                                            }
+                                        }
+                                        None => false,
+                                    };
+                                    ret
+                                });
+                                let mut new_index = toolbox
+                                    .office
+                                    .repo
+                                    .apply_to_tree(&head_tree, &diff, Some(&mut opts))
+                                    .unwrap();
+                                let tree_oid =
+                                    new_index.write_tree_to(&toolbox.office.repo).unwrap();
+                                let new_tree = toolbox.office.repo.find_tree(tree_oid).unwrap();
+                                toolbox.office.repo.commit(
+                                    Some("HEAD"),
+                                    &author,
+                                    &committer,
+                                    params.text.unwrap_or_default().trim_start(),
+                                    &new_tree,
+                                    &[&parent],
+                                )
+                            }
                         }
                         None => toolbox.office.repo.commit(
                             Some("HEAD"),
@@ -84,6 +147,7 @@ impl WorkGroup {
                         Some(name) => name,
                         None => return,
                     };
+                    //Commit::amend(&self, update_ref, author, committer, message_encoding, message, tree)
                     let message = line.collect::<Vec<_>>().join("\n");
                     let oid = root.commits[oid];
                     let commit = toolbox.office.repo.find_commit(oid).unwrap();
@@ -98,7 +162,7 @@ impl WorkGroup {
                         toolbox.lsp_conn.send(Kind::Other(MaAction::Command {
                             command: app::Command::ChangeRootMode {
                                 uri: params.text_document.uri,
-                                mode: RootMode::Dashboard
+                                mode: RootMode::Dashboard,
                             },
                         }));
                     }
@@ -125,16 +189,19 @@ impl WorkGroup {
 
     pub fn goto_definition(
         &mut self,
-        toolbox: ToolBox,
+        mut toolbox: ToolBox,
         id: RequestId,
         params: GotoDefinitionParams,
     ) {
         match self {
             WorkGroup::Root(root) => {
-                root.goto_definition(&toolbox, params.text_document_position_params);
+                root.goto_definition(&mut toolbox, params.text_document_position_params);
             }
             WorkGroup::Diff(diff) => {
                 diff.goto_definition(&toolbox, (id, params.text_document_position_params));
+            }
+            WorkGroup::DiffIndex(diff_index) => {
+                diff_index.goto_definition(toolbox, params, id);
             }
             _ => (),
         }
@@ -178,7 +245,9 @@ impl WorkGroup {
                     &mut ret,
                 );
             }
-
+            WorkGroup::DiffIndex(diff_index) => {
+                diff_index.inlay_hint((params.range.start.line, params.range.end.line), &mut ret);
+            }
             _ => (),
         }
 
@@ -201,6 +270,9 @@ impl WorkGroup {
         match self {
             WorkGroup::Root(root) => {
                 root.semantic_token(&mut data);
+            }
+            WorkGroup::DiffIndex(diff_index) => {
+                diff_index.semantic_token(&toolbox, &mut data);
             }
             _ => (),
         }
@@ -229,6 +301,9 @@ pub enum WorkGroup {
     Root(Root),
     Diff(Diff),
     MergeConflict(MergeConflict),
+    DiffIndex(DiffIndex),
+    //BranchInfo(BranchInfo)
+    //TagInfo(TagInfo)
 }
 
 pub struct Root {
@@ -320,6 +395,8 @@ impl Root {
 
     pub fn format(&self) -> String {
         let mut format = String::new();
+        //let mut opt = ApplyOptions::new();
+
         self.view
             .inner()
             .iter()
@@ -501,7 +578,7 @@ impl Root {
 }
 
 impl Root {
-    fn goto_definition(&self, toolbox: &ToolBox, params: TextDocumentPositionParams) {
+    fn goto_definition(&self, toolbox: &mut ToolBox, params: TextDocumentPositionParams) {
         match &self.view[params.position.line as usize] {
             RootView::LineBreak => (),
             RootView::HeadFile => (),
@@ -535,7 +612,79 @@ impl Root {
                     _ => (),
                 }
             }
-            RootView::StatusLabel => (),
+            RootView::StatusLabel => {
+                let index = match toolbox.office.repo.index() {
+                    Ok(index) => {
+                        if index.is_empty() {
+                            return;
+                        }
+                        index
+                    }
+                    Err(_) => return,
+                };
+                let commit_head = match toolbox.office.repo.head() {
+                    Ok(head) => match head.peel_to_commit() {
+                        Ok(commit) => commit,
+                        Err(_) => return,
+                    },
+                    Err(_) => return,
+                };
+                let tree = commit_head.tree().ok();
+                let diff =
+                    match toolbox
+                        .office
+                        .repo
+                        .diff_tree_to_index(tree.as_ref(), Some(&index), None)
+                    {
+                        Ok(diff) => diff,
+                        Err(_) => return,
+                    };
+                if diff.deltas().len() == 0 {
+                    return;
+                }
+                let mut diff_index = DiffIndex::new(commit_head.id());
+                //diff_index.parent_oid
+                //let mut format = String::new();
+                let path = toolbox
+                    .office
+                    .repo
+                    .path()
+                    .join(App::NAME)
+                    .join(&self.head_branch)
+                    .join("index.diff");
+                let format = diff_index.build(&diff, &mut toolbox.office.hunk_filter);
+                if let Err(e) = fs::create_dir_all(path.parent().unwrap()) {
+                    eprintln!("{}", e.to_string());
+                    return;
+                }
+                if let Err(e) = fs::write(&path, &format) {
+                    eprintln!("{}", e.to_string());
+                    return;
+                }
+                let workgroup = WorkGroup::DiffIndex(diff_index);
+                let uri = name_to_url(&path).unwrap();
+                toolbox
+                    .lsp_conn
+                    .send(Kind::Other(MaAction::RegisterWorkgroup {
+                        key: uri.clone(),
+                        workgroup,
+                        office_id: toolbox.office.o_id,
+                    }));
+                toolbox.lsp_conn.send(Kind::Main(
+                    lsp_server::Request {
+                        id: RequestId::from(1),
+                        method: ShowDocument::METHOD.into(),
+                        params: to_value(ShowDocumentParams {
+                            uri,
+                            external: None,
+                            take_focus: Some(true),
+                            selection: None,
+                        })
+                        .unwrap(),
+                    }
+                    .into(),
+                ));
+            }
             RootView::StatusMember(_) => (),
             RootView::CommitLabel => (),
             RootView::CommitMember(member) => {
@@ -708,8 +857,8 @@ impl Root {
             }
             RootMode::TagInput { .. } => {
                 ret.push(create_inlay_hint(0, 0, "Tag name: "));
-                ret.push(create_inlay_hint(1, 0, "Tag message "));
-            },
+                ret.push(create_inlay_hint(1, 0, "Tag message: "));
+            }
         }
     }
 
@@ -1291,18 +1440,6 @@ impl WorkGroup {
         }
     }
 
-    pub fn cancel_commit(&mut self, toolbox: ToolBox, uri: Uri) {
-        match self {
-            WorkGroup::Root(root) => {
-                root.mode = RootMode::Dashboard;
-                toolbox
-                    .lsp_conn
-                    .send(Kind::Other(app::Command::Reload { uri }.into()));
-            }
-            _ => (),
-        }
-    }
-
     pub fn git_push_progress(
         &mut self,
         remote_id: usize,
@@ -1334,6 +1471,7 @@ pub struct Diff {
     pub diff_file: Container<PathBuf>,
     pub diff_dir: PathBuf,
     pub oid: Oid,
+    pub parent_oid: Option<Oid>,
 }
 
 pub type Length = usize;
@@ -1349,7 +1487,7 @@ pub enum DiffView {
         date: Length,
     },
     MessageLine(Length),
-    OldFile(Option<(PathBuf, Oid)>),
+    OldFile(PathBuf),
     //    old: Option<PathBuf>,
     //},
     NewFile {
@@ -1386,6 +1524,7 @@ impl Diff {
             diff_file: Container::new(),
             diff_dir: Self::build_commit_dir(office, oid),
             oid,
+            parent_oid: None,
         }
     }
 
@@ -1452,7 +1591,7 @@ impl Diff {
             });
         });
         let current_tree = commit.tree().ok();
-
+        //office.repo.diff_tree_to_index(old_tree, index, opts)
         format.push_str("\n");
         diff_group.view.push(DiffView::LineBreak);
 
@@ -1469,7 +1608,7 @@ impl Diff {
                 let parent_tree = office.repo.find_commit(parent_oid).unwrap().tree().ok();
                 format.push_str(&format!("- {}\n", parent_oid.to_string()));
                 diff_group.view.push(DiffView::Parent { oid: parent_oid });
-
+                diff_group.parent_oid = Some(parent_oid);
                 format.push_str(&format!("+ {}\n", commit.id().to_string()));
                 diff_group.view.push(DiffView::Current { oid: commit.id() });
 
@@ -1493,85 +1632,117 @@ impl Diff {
             format.push_str("\n");
             diff_group.view.push(DiffView::LineBreak);
 
-            let mut file_id = Oid::ZERO_SHA1;
-            let mut from_file = 0usize;
-            let mut hunk_id = 0u32;
-            let mut hunk_line = 0u32;
-            diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-                let file = delta.new_file();
-                let new_file = file.id() != file_id;
-                if new_file {
-                    file_id = file.id();
-                    hunk_id = 0;
-                    let path = file.path().unwrap();
-                    from_file = diff_group.diff_file.add(path.into());
-                    let old_file = match delta.old_file().path() {
-                        Some(path) if commit.parent_count() == 1 => {
-                            diff_group.view.push(DiffView::OldFile(Some((
-                                path.to_path_buf(),
-                                commit.parent(0).unwrap().id(),
-                            ))));
-                            &path.to_string_lossy()
-                        }
-                        _ => {
-                            diff_group.view.push(DiffView::OldFile(None));
-                            "/dev/null"
-                        }
-                    };
-                    let content = format!("--- {}\n+++ {}\n", old_file, path.to_string_lossy());
-                    format.push_str(&content);
-
-                    diff_group.view.push(DiffView::NewFile { from_file });
-                }
-
-                match hunk {
-                    Some(hunk) if hunk_id != hunk.new_start() => {
-                        hunk_id = hunk.new_start();
-                        hunk_line = hunk.new_start() - 1;
-                        let header = format!(
-                            "@@ -{},{} +{},{} @@\n",
-                            hunk.old_start(),
-                            hunk.old_lines(),
-                            hunk.new_start(),
-                            hunk.new_lines()
-                        );
-                        diff_group.view.push(DiffView::HunkHeader {
-                            from_file,
-                            length: header.len(),
-                        });
-                        format.push_str(&header);
-                    }
-                    Some(_) => match line.origin() {
-                        ' ' | '+' => {
-                            diff_group.view.push(DiffView::HunkLine {
-                                from_diff_file: from_file,
-                                line: hunk_line,
-                            });
-                            format.push_str(&format!(
-                                "{} {}",
-                                line.origin(),
-                                String::from_utf8_lossy(line.content())
-                            ));
-                            hunk_line += 1;
-                        }
-                        '-' => {
-                            diff_group.view.push(DiffView::OldLine {
-                                content: line.content().len(),
-                            });
-                            format.push_str(&format!(
-                                "{} {}",
-                                line.origin(),
-                                String::from_utf8_lossy(line.content())
-                            ));
-                        }
-                        _ => {}
-                    },
-                    None => (),
-                }
-                true
-            });
+            Self::fill_view(
+                &diff,
+                &mut diff_group.diff_file,
+                &mut diff_group.view,
+                &mut format,
+            );
         });
         format
+    }
+
+    pub fn fill_view(
+        diff: &git2::Diff,
+        diff_file: &mut Container<PathBuf>,
+        view: &mut Container<DiffView>,
+        format: &mut String,
+    ) {
+        //diff.map(|diff| {
+        let mut new_file_id = Oid::ZERO_SHA1;
+        let mut old_file_id = Oid::ZERO_SHA1;
+        let mut from_file = 0usize;
+        let mut hunk_id = (0u32, 0u32);
+        let mut hunk_line = 0u32;
+        diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
+            //eprintln!("{}", String::from_utf8_lossy(line.content()));
+            let new_file = delta.new_file();
+            let old_file = delta.old_file();
+            let new_delta = new_file.id() != new_file_id || old_file.id() != old_file_id;
+
+            if new_delta {
+                new_file_id = new_file.id();
+                old_file_id = old_file.id();
+                hunk_id = (0, 0);
+
+                match (old_file.path(), new_file.path()) {
+                    (None, Some(new)) => {
+                        from_file = diff_file.add(new.to_path_buf());
+                        view.push(DiffView::LineBreak);
+                        view.push(DiffView::NewFile { from_file });
+                        let content = format!("--- /dev/null\n+++ {}\n", new.to_string_lossy());
+                        format.push_str(&content);
+                    }
+                    (Some(old), None) => {
+                        view.push(DiffView::OldFile(old.to_path_buf()));
+                        view.push(DiffView::LineBreak);
+                        let content = format!("--- {}\n+++ /dev/null\n", old.to_string_lossy());
+                        format.push_str(&content);
+                    }
+                    (Some(old), Some(new)) => {
+                        from_file = diff_file.add(new.to_path_buf());
+
+                        view.push(DiffView::OldFile(old.to_path_buf()));
+                        view.push(DiffView::NewFile { from_file });
+                        let content = format!(
+                            "--- {}\n+++ {}\n",
+                            old.to_string_lossy(),
+                            new.to_string_lossy()
+                        );
+                        format.push_str(&content);
+                    }
+                    _ => (),
+                }
+            }
+
+            match hunk {
+                Some(hunk) if hunk_id != (hunk.new_start(), hunk.old_start()) => {
+                    //let a = hunk.header() == hunk.header();
+                    hunk_id = (hunk.new_start(), hunk.old_start());
+                    hunk_line = hunk.new_start() - 1;
+                    let header = format!(
+                        "@@ -{},{} +{},{} @@\n",
+                        hunk.old_start(),
+                        hunk.old_lines(),
+                        hunk.new_start(),
+                        hunk.new_lines()
+                    );
+                    view.push(DiffView::HunkHeader {
+                        from_file,
+                        length: header.len(),
+                    });
+                    format.push_str(&header);
+                }
+                Some(_) => match line.origin() {
+                    ' ' | '+' => {
+                        view.push(DiffView::HunkLine {
+                            from_diff_file: from_file,
+                            line: hunk_line,
+                        });
+                        format.push_str(&format!(
+                            "{} {}",
+                            line.origin(),
+                            String::from_utf8_lossy(line.content())
+                        ));
+                        hunk_line += 1;
+                    }
+                    '-' => {
+                        view.push(DiffView::OldLine {
+                            content: line.content().len(),
+                        });
+                        format.push_str(&format!(
+                            "{} {}",
+                            line.origin(),
+                            String::from_utf8_lossy(line.content())
+                        ));
+                    }
+                    _ => {}
+                },
+                None => (),
+            }
+            true
+        });
+        //});
     }
 
     pub fn write_diff(&self, format: &str) -> PathBuf {
@@ -1629,15 +1800,16 @@ impl Diff {
             DiffView::Date { date } => (),
             DiffView::MessageLine(_) => (),
             DiffView::OldFile(path_buf) => {
-                let (path, oid) = match path_buf {
-                    Some(path) => path,
-                    None => return,
-                };
-                let old_file = match Self::build_old_file(toolbox.office, path, *oid) {
+                let old_file = match Self::build_old_file(
+                    toolbox.office,
+                    path_buf,
+                    self.parent_oid.unwrap(),
+                ) {
                     Some(old_file) => old_file,
                     None => return,
                 };
-                let location = Self::build_commit_dir(toolbox.office, *oid).join(path);
+                let location =
+                    Self::build_commit_dir(toolbox.office, self.parent_oid.unwrap()).join(path_buf);
                 fs::create_dir_all(location.parent().unwrap());
                 fs::write(&location, old_file);
                 let response = GotoDefinitionResponse::Scalar(Location::new(
@@ -1901,4 +2073,453 @@ pub enum ConflictView {
     ConflictHeader { oid: Oid, path: PathBuf },
     CommitOid { oid: Oid },
     MissingFile,
+}
+
+pub struct DiffIndex {
+    pub view: Container<IndexView>,
+    pub paths: Container<PathBuf>,
+    //pub old_file: Container<PathBuf>,
+    pub parent_oid: Oid,
+    //pub filter: HashMap<PathBuf, HashMap<u32, bool>>,
+}
+
+impl DiffIndex {
+    pub fn new(parent_oid: Oid) -> Self {
+        Self {
+            view: Container::new(),
+            paths: Container::new(),
+            //old_file: Container::new(),
+            parent_oid,
+            //       filter: HashMap::new(),
+        }
+    }
+
+    pub fn build(&mut self, diff: &git2::Diff, filter: &mut HunkFilter) -> String {
+        filter.clear();
+        let mut format = String::new();
+
+        let mut new_file_id = Oid::ZERO_SHA1;
+        let mut old_file_id = Oid::ZERO_SHA1;
+        let mut hunk_id = (0u32, 0u32);
+
+        let mut from_file = 0usize;
+        let mut from_old_file = 0usize;
+        //let mut hunk_id = 0u32;
+        //let mut hunk_line = 0u32;
+        let mut new_line = 0u32;
+        let mut old_line = 0u32;
+        let mut current_delta = PathBuf::new();
+        diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
+            let new_file = delta.new_file();
+            let old_file = delta.old_file();
+            let new_delta = new_file.id() != new_file_id || old_file.id() != old_file_id;
+
+            if new_delta {
+                new_file_id = new_file.id();
+                old_file_id = old_file.id();
+                hunk_id = (0, 0);
+
+                match (old_file.path(), new_file.path()) {
+                    (None, Some(new)) => {
+                        from_file = self.paths.add(new.to_path_buf());
+                        current_delta = new.to_path_buf();
+                        self.view.push(IndexView::LineBreak);
+                        self.view.push(IndexView::NewFile { from_file });
+                        let content = format!("--- /dev/null\n+++ {}\n", new.to_string_lossy());
+                        format.push_str(&content);
+                    }
+                    (Some(old), None) => {
+                        from_file = self.paths.add(old.to_path_buf());
+                        current_delta = old.to_path_buf();
+                        self.view.push(IndexView::OldFile { from_file });
+                        self.view.push(IndexView::LineBreak);
+                        let content = format!("--- {}\n+++ /dev/null\n", old.to_string_lossy());
+                        format.push_str(&content);
+                    }
+                    (Some(old), Some(new)) => {
+                        from_file = self.paths.add(new.to_path_buf());
+                        //from_old_file = self.old_file.add(old.to_path_buf());
+                        current_delta = new.to_path_buf();
+                        self.view.push(IndexView::OldFile { from_file });
+                        self.view.push(IndexView::NewFile { from_file });
+                        let content = format!(
+                            "--- {}\n+++ {}\n",
+                            old.to_string_lossy(),
+                            new.to_string_lossy()
+                        );
+                        format.push_str(&content);
+                    }
+                    _ => (),
+                }
+                filter.insert(current_delta.clone(), HashMap::new());
+            }
+
+            match hunk {
+                Some(hunk) if hunk_id != (hunk.new_start(), hunk.old_start()) => {
+                    hunk_id = (hunk.new_start(), hunk.old_start());
+                    filter.get_mut(&current_delta).map(|filter| {
+                        filter.insert(hunk_id, true);
+                    });
+                    new_line = hunk.new_start() - 1;
+                    old_line = hunk.old_start() - 1;
+                    let header = format!(
+                        "@@ -{},{} +{},{} @@\n",
+                        hunk.old_start(),
+                        hunk.old_lines(),
+                        hunk.new_start(),
+                        hunk.new_lines()
+                    );
+                    self.view.push(IndexView::HunkHeader {
+                        from_file,
+                        hunk_id: hunk_id,
+                        length: header.len(),
+                    });
+                    format.push_str(&header);
+                }
+                Some(_) => {
+                    match line.origin() {
+                        ' ' => {
+                            //new_line = hunk_line;
+                            self.view.push(IndexView::ContextLine {
+                                from_file,
+                                line: new_line,
+                            });
+                            format.push_str(&format!(
+                                "{} {}",
+                                line.origin(),
+                                String::from_utf8_lossy(line.content())
+                            ));
+                            new_line += 1;
+                            old_line += 1;
+                            //forward()
+                        }
+                        '+' => {
+                            //hunk_line += 1;
+                            //hunk_line = new_line;
+                            let content = format!(
+                                "{} {}",
+                                line.origin(),
+                                String::from_utf8_lossy(line.content())
+                            );
+                            format.push_str(&content);
+
+                            self.view.push(IndexView::NewLine {
+                                from_file,
+                                from_hunk_id: hunk_id,
+                                line: new_line,
+                                length: content.len(),
+                            });
+                            new_line += 1;
+                        }
+                        '-' => {
+                            //hunk_line += 1;
+                            let content = format!(
+                                "{} {}",
+                                line.origin(),
+                                String::from_utf8_lossy(line.content())
+                            );
+                            self.view.push(IndexView::OldLine {
+                                from_file,
+                                from_hunk_id: hunk_id,
+                                line: old_line,
+                                length: content.len(),
+                            });
+                            format.push_str(&content);
+                            old_line += 1;
+                        }
+                        _ => (),
+                    }
+                }
+                None => (),
+            }
+            true
+        });
+        format
+    }
+}
+
+pub enum IndexView {
+    LineBreak,
+    NewFile {
+        from_file: usize,
+    },
+    HunkHeader {
+        from_file: usize,
+        hunk_id: HunkId,
+        length: Length,
+    },
+    NewLine {
+        from_file: usize,
+        from_hunk_id: HunkId,
+        line: u32,
+        length: Length,
+    },
+    ContextLine {
+        from_file: usize,
+        line: u32,
+    },
+    OldFile {
+        from_file: usize,
+        //parent: Oid,
+    },
+    OldLine {
+        from_file: usize,
+        from_hunk_id: HunkId,
+        line: u32,
+        length: Length,
+    },
+}
+
+impl DiffIndex {
+    fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
+        for line in start_line..end_line {
+            match self.view[line as usize] {
+                IndexView::LineBreak => (),
+                IndexView::NewFile { from_file } => (),
+                IndexView::HunkHeader {
+                    from_file,
+                    hunk_id,
+                    length,
+                } => {
+                    ret.push(create_inlay_hint(
+                        line,
+                        length as u32,
+                        format!(" * {}", &self.paths[from_file].to_string_lossy()),
+                    ));
+                }
+                IndexView::NewLine {
+                    from_file,
+                    from_hunk_id,
+                    line,
+                    length,
+                } => (),
+                IndexView::ContextLine { from_file, line } => (),
+                IndexView::OldFile { from_file } => (),
+                IndexView::OldLine {
+                    from_file,
+                    from_hunk_id,
+                    line,
+                    length,
+                } => (),
+            }
+        }
+    }
+
+    fn goto_definition(&self, mut toolbox: ToolBox, params: GotoDefinitionParams, id: RequestId) {
+        let line = params.text_document_position_params.position.line as usize;
+        match &self.view[line] {
+            IndexView::LineBreak => (),
+            IndexView::NewFile { from_file } => (),
+            IndexView::HunkHeader {
+                from_file,
+                hunk_id,
+                length: _,
+            } => {
+                let path = &self.paths[from_file];
+                match toolbox.office.hunk_filter.get_mut(path) {
+                    Some(hunk) => match hunk.get_mut(&hunk_id) {
+                        Some(active) => {
+                            *active = !*active;
+                            toolbox.lsp_conn.send(Kind::Main(
+                                lsp_server::Request {
+                                    id: RequestId::from(1),
+                                    method: SemanticTokensRefresh::METHOD.into(),
+                                    params: ().into(),
+                                }
+                                .into(),
+                            ));
+                        }
+                        None => return,
+                    },
+                    None => return,
+                }
+            }
+            IndexView::NewLine {
+                from_file,
+                from_hunk_id,
+                line,
+                length,
+            } => {
+                let path = toolbox
+                    .office
+                    .repo
+                    .workdir()
+                    .unwrap()
+                    .join(&self.paths[from_file]);
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&path).unwrap(),
+                    Range {
+                        start: Position::new(*line, 0),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
+                    }
+                    .into(),
+                ));
+            }
+            IndexView::ContextLine { from_file, line } => {
+                let path = toolbox
+                    .office
+                    .repo
+                    .workdir()
+                    .unwrap()
+                    .join(&self.paths[from_file]);
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&path).unwrap(),
+                    Range {
+                        start: Position::new(*line, 0),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
+                    }
+                    .into(),
+                ));
+            }
+            IndexView::OldFile { from_file } => {
+                let path = &self.paths[from_file];
+                Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
+                    eprintln!("{content}");
+                    let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
+                    
+                    let file_path = dir.join(path);
+                    fs::create_dir_all(&file_path.parent().unwrap());
+                    fs::write(&file_path, content);
+                        //eprintln!("{}", write.to_string());
+                        //eprintln!("{}", file_path.to_string_lossy());
+                    let response = GotoDefinitionResponse::Scalar(Location::new(
+                        name_to_url(&file_path).unwrap(),
+                        Range {
+                            start: Position::new(0, 0),
+                            ..Default::default()
+                        },
+                    ));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        Response {
+                            id,
+                            response_result: Ok(to_value(response).unwrap()),
+                        }
+                        .into(),
+                    ));
+                });
+            }
+            IndexView::OldLine {
+                from_file,
+                from_hunk_id,
+                line,
+                length,
+            } => {
+                let path = &self.paths[from_file];
+                Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
+                    let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
+                    //fs::create_dir_all(&dir);
+                    let file_path = dir.join(path);
+                    
+                    fs::create_dir_all(&file_path.parent().unwrap());
+                    //eprintln!("path: {}", path.to_string_lossy());
+                    //eprintln!("line: {}", line);
+                    fs::write(&file_path, content);
+                    let response = GotoDefinitionResponse::Scalar(Location::new(
+                        name_to_url(&file_path).unwrap(),
+                        Range {
+                            start: Position::new(*line, 0),
+                            ..Default::default()
+                        },
+                    ));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        Response {
+                            id,
+                            response_result: Ok(to_value(response).unwrap()),
+                        }
+                        .into(),
+                    ));
+                });
+            }
+        }
+    }
+
+    fn semantic_token(&self, toolbox: &ToolBox, ret: &mut Vec<SemanticToken>) {
+        let mut current_line_token = 0u32;
+        let mut prev_line_token = 0u32;
+        for (line, iv) in self.view.inner().iter().enumerate() {
+            match iv {
+                IndexView::LineBreak => (),
+                IndexView::NewFile { from_file } => (),
+                IndexView::HunkHeader {
+                    from_file,
+                    hunk_id,
+                    length,
+                } => {
+                    let path = &self.paths[from_file];
+                    //eprintln!("first step");
+                    //eprintln!("{}", path.to_string_lossy());
+                    match toolbox.office.hunk_filter.get(path) {
+                        Some(hs) => match hs.get(hunk_id) {
+                            Some(active) => {
+                                //eprintln!("last step");
+                                let sm = if *active {
+                                    SemanticTokenList::KEYWORD
+                                } else {
+                                    SemanticTokenList::COMMENT
+                                };
+                                current_line_token = line as u32;
+                                let delta = current_line_token - prev_line_token;
+                                ret.push(create_semantic_token(delta, 0u32, *length as u32, sm));
+                                prev_line_token = current_line_token;
+                            }
+                            None => {
+                                //eprintln!("missed {:?}", hunk_id);
+                            }
+                        },
+                        None => {
+                            //eprintln!("missed! {}", path.to_string_lossy());
+                        }
+                    }
+                }
+                IndexView::NewLine {
+                    from_file,
+                    from_hunk_id,
+                    line: _,
+                    length,
+                }
+                | IndexView::OldLine {
+                    from_file,
+                    from_hunk_id,
+                    line: _,
+                    length,
+                } => {
+                    let path = &self.paths[from_file];
+                    match toolbox.office.hunk_filter.get(path) {
+                        Some(hs) => match hs.get(from_hunk_id) {
+                            Some(active) => {
+                                if !*active {
+                                    current_line_token = line as u32;
+                                    let delta = current_line_token - prev_line_token;
+                                    ret.push(create_semantic_token(
+                                        delta,
+                                        0u32,
+                                        *length as u32,
+                                        SemanticTokenList::COMMENT,
+                                    ));
+                                    prev_line_token = current_line_token;
+                                }
+                            }
+                            None => {}
+                        },
+                        None => {}
+                    }
+                    //ret.push(create_semantic_token(delta_line, delta_start, length, token_type));
+                }
+                IndexView::ContextLine { from_file, line } => (),
+                IndexView::OldFile { from_file } => (), 
+            }
+        }
+    }
 }
