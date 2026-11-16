@@ -842,14 +842,14 @@ impl Root {
                                         ret.push(create_inlay_hint(
                                             i,
                                             content.len() as u32,
-                                            format!("* Transferring data: {percentage}%"),
+                                            format!(" * Transferring data: {percentage}%"),
                                         ));
                                     }
                                     GitPush::Error { message } => {
                                         ret.push(create_inlay_hint(
                                             i,
                                             content.len() as u32,
-                                            format!("* Error: {message}"),
+                                            format!(" * Error: {message}"),
                                         ));
                                     }
                                     GitPush::Done => {
