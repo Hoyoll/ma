@@ -11,7 +11,7 @@ use std::{
 use crossbeam::channel::Sender;
 use git2::{
     ApplyOptions, BranchType, Commit, Delta, Index, IndexAddOption, MergeAnalysis, Oid,
-    PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Status, StatusOptions,
+    PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Sort, Status, StatusOptions,
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
@@ -203,6 +203,9 @@ impl WorkGroup {
             WorkGroup::DiffIndex(diff_index) => {
                 diff_index.goto_definition(toolbox, params, id);
             }
+            WorkGroup::BranchList(bl) => {
+                bl.goto_definition(&toolbox, params.text_document_position_params);
+            }
             _ => (),
         }
     }
@@ -248,6 +251,9 @@ impl WorkGroup {
             WorkGroup::DiffIndex(diff_index) => {
                 diff_index.inlay_hint((params.range.start.line, params.range.end.line), &mut ret);
             }
+            WorkGroup::BranchList(bl) => {
+                bl.inlay_hint((params.range.start.line, params.range.end.line), &mut ret); 
+            }
             _ => (),
         }
 
@@ -273,6 +279,9 @@ impl WorkGroup {
             }
             WorkGroup::DiffIndex(diff_index) => {
                 diff_index.semantic_token(&toolbox, &mut data);
+            }
+            WorkGroup::BranchList(bl) => {
+                bl.semantic_token(&toolbox, &mut data);
             }
             _ => (),
         }
@@ -302,8 +311,8 @@ pub enum WorkGroup {
     Diff(Diff),
     MergeConflict(MergeConflict),
     DiffIndex(DiffIndex),
-    //BranchInfo(BranchInfo)
-    //TagInfo(TagInfo)
+    BranchList(BranchList), //BranchInfo(BranchInfo)
+                            //TagInfo(TagInfo)
 }
 
 pub struct Root {
@@ -582,11 +591,81 @@ impl Root {
         match &self.view[params.position.line as usize] {
             RootView::LineBreak => (),
             RootView::HeadFile => (),
-            RootView::HeadLabel => (),
             RootView::RemoteLabel => (),
             RootView::RemoteMember(_) => (),
             RootView::TagLabel => (),
-            RootView::BranchMember(_) => (),
+            RootView::HeadLabel => {
+                BranchList::new(&self.head_branch, toolbox.office).map(|(bl, path, format)| {
+                    if let Err(e) = fs::create_dir_all(path.parent().unwrap()) {
+                        eprintln!("{}", e.to_string());
+                        return;
+                    }
+                    if let Err(e) = fs::write(&path, &format) {
+                        eprintln!("{}", e.to_string());
+                        return;
+                    }
+                    let workgroup = WorkGroup::BranchList(bl);
+                    let uri = name_to_url(&path).unwrap();
+                    toolbox
+                        .lsp_conn
+                        .send(Kind::Other(MaAction::RegisterWorkgroup {
+                            key: uri.clone(),
+                            workgroup,
+                            office_id: toolbox.office.o_id,
+                        }));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        lsp_server::Request {
+                            id: RequestId::from(1),
+                            method: ShowDocument::METHOD.into(),
+                            params: to_value(ShowDocumentParams {
+                                uri,
+                                external: None,
+                                take_focus: Some(true),
+                                selection: None,
+                            })
+                            .unwrap(),
+                        }
+                        .into(),
+                    ));
+                });
+            }
+            RootView::BranchMember(member) => {
+                BranchList::new(&self.branch[member].name, toolbox.office).map(
+                    |(bl, path, format)| {
+                        if let Err(e) = fs::create_dir_all(path.parent().unwrap()) {
+                            eprintln!("{}", e.to_string());
+                            return;
+                        }
+                        if let Err(e) = fs::write(&path, &format) {
+                            eprintln!("{}", e.to_string());
+                            return;
+                        }
+                        let workgroup = WorkGroup::BranchList(bl);
+                        let uri = name_to_url(&path).unwrap();
+                        toolbox
+                            .lsp_conn
+                            .send(Kind::Other(MaAction::RegisterWorkgroup {
+                                key: uri.clone(),
+                                workgroup,
+                                office_id: toolbox.office.o_id,
+                            }));
+                        toolbox.lsp_conn.send(Kind::Main(
+                            lsp_server::Request {
+                                id: RequestId::from(1),
+                                method: ShowDocument::METHOD.into(),
+                                params: to_value(ShowDocumentParams {
+                                    uri,
+                                    external: None,
+                                    take_focus: Some(true),
+                                    selection: None,
+                                })
+                                .unwrap(),
+                            }
+                            .into(),
+                        ));
+                    },
+                );
+            }
             RootView::TagMember(member) => {
                 let tag = &self.tag[member];
                 let reference = match toolbox
@@ -835,7 +914,7 @@ impl Root {
                             ret.push(create_inlay_hint(
                                 i,
                                 0,
-                                format!("  {} | {} -> ", staged, unstaged),
+                                format!("  {} │ {} -> ", staged, unstaged),
                             ));
                         }
                         RootView::CommitLabel => (),
@@ -2271,7 +2350,7 @@ pub enum IndexView {
 }
 
 impl DiffIndex {
-    fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
+    fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) { 
         for line in start_line..end_line {
             match self.view[line as usize] {
                 IndexView::LineBreak => (),
@@ -2388,12 +2467,12 @@ impl DiffIndex {
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
                     eprintln!("{content}");
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
-                    
+
                     let file_path = dir.join(path);
                     fs::create_dir_all(&file_path.parent().unwrap());
                     fs::write(&file_path, content);
-                        //eprintln!("{}", write.to_string());
-                        //eprintln!("{}", file_path.to_string_lossy());
+                    //eprintln!("{}", write.to_string());
+                    //eprintln!("{}", file_path.to_string_lossy());
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
                         Range {
@@ -2421,7 +2500,7 @@ impl DiffIndex {
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
                     //fs::create_dir_all(&dir);
                     let file_path = dir.join(path);
-                    
+
                     fs::create_dir_all(&file_path.parent().unwrap());
                     //eprintln!("path: {}", path.to_string_lossy());
                     //eprintln!("line: {}", line);
@@ -2518,7 +2597,161 @@ impl DiffIndex {
                     //ret.push(create_semantic_token(delta_line, delta_start, length, token_type));
                 }
                 IndexView::ContextLine { from_file, line } => (),
-                IndexView::OldFile { from_file } => (), 
+                IndexView::OldFile { from_file } => (),
+            }
+        }
+    }
+}
+
+pub struct BranchList {
+    branch_name: String,
+    commit: Container<Oid>,
+    view: Container<BranchView>,
+}
+
+pub enum BranchView {
+    LineBreak,
+    Header,
+    CommitHeader {
+        oid: usize,
+        commiter: Length,
+        email: Length,
+        date: Length,
+    },
+    MessageLine {
+        from_oid: usize,
+        length: Length,
+    },
+}
+
+impl BranchList {
+    pub fn new(branch: &str, office: &Office) -> Option<(Self, PathBuf, String)> {
+        let br = match office.repo.find_branch(branch, BranchType::Local) {
+            Ok(br) => br,
+            Err(_) => return None,
+        };
+        let mut this = Self {
+            branch_name: branch.into(),
+            commit: Container::new(),
+            view: Container::new(),
+        };
+        let branch_commit = br.get().peel_to_commit().unwrap();
+        let mut revwalk = office.repo.revwalk().unwrap();
+        revwalk.push(branch_commit.id());
+        revwalk.set_sorting(Sort::TIME);
+        for oid in revwalk {
+            oid.map(|oid| {
+                this.commit.push(oid);
+            });
+        }
+
+        let format = this.format(office);
+        let path = office
+            .repo
+            .path()
+            .join(App::NAME)
+            .join(format!("{}.md", this.branch_name));
+        Some((this, path, format))
+    }
+
+    fn format(&mut self, office: &Office) -> String {
+        let mut format = String::new();
+
+        format.push_str(&format!("# {}\n\n", self.branch_name));
+        self.view.push(BranchView::Header);
+        self.view.push(BranchView::LineBreak);
+
+        for (idx, oid) in self.commit.inner().iter().enumerate() {
+            let commit = office.repo.find_commit(*oid).unwrap();
+            let signature = commit.author();
+            let commit_str = &oid.to_string()[0..HASH_LENGTH];
+            let name = signature.name().unwrap_or_default();
+            let email = signature.email().unwrap_or_default();
+            let date = util::format_git_time(signature.when()).unwrap_or_default();
+
+            self.view.push(BranchView::CommitHeader {
+                oid: idx,
+                commiter: name.len(),
+                email: email.len(),
+                date: date.len(),
+            });
+
+            format.push_str(&format!("{} {} {} {}\n", commit_str, name, email, date));
+
+            let message = commit.message().unwrap_or_default().lines();
+            for message_line in message {
+                let message = format!("{message_line}\n");
+                self.view.push(BranchView::MessageLine {
+                    from_oid: idx,
+                    length: message.len(),
+                });
+                format.push_str(&message);
+            }
+        }
+
+        format
+    }
+}
+
+impl BranchList {
+    const HEADER_GUTTER: [&str;2] = ["◯", "@"];
+    const MESSAGE_GUTTER: &str = "│";
+    fn goto_definition(&self, toolbox: &ToolBox, params: TextDocumentPositionParams) {
+        match &self.view[params.position.line as usize] {
+            BranchView::LineBreak => (),
+            BranchView::Header => (),
+            BranchView::CommitHeader { oid, commiter, email, date } => {
+                toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
+                    uri: params.text_document.uri,
+                    oid: self.commit[oid],
+                }));
+            },
+            BranchView::MessageLine { from_oid, length } => (),
+        }
+    }
+
+    fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
+        let lines = start_line..end_line; 
+        let mut gutter_line = 1;
+        for line in lines {
+            match self.view[line as usize] {
+                BranchView::LineBreak => (),
+                BranchView::Header => (),
+                BranchView::CommitHeader { .. } => {
+                    let gutter = Self::HEADER_GUTTER[gutter_line % 2];
+                    gutter_line += 1;
+                    ret.push(create_inlay_hint(line, 0, format!("{gutter} ")));
+                    //commit_header_count +=
+                },
+                BranchView::MessageLine { from_oid, length } => {
+                    ret.push(create_inlay_hint(line, 0, format!("{} ", Self::MESSAGE_GUTTER)));
+                },
+            }
+        }
+    }
+
+    fn semantic_token(&self, toolbox: &ToolBox, ret: &mut Vec<SemanticToken>) {
+        let mut current_line_token = 0u32;
+        let mut prev_line_token = 0u32;
+        for (line, bv) in self.view.inner().iter().enumerate() {
+            match bv {
+                BranchView::LineBreak => (),
+                BranchView::Header => (),
+                BranchView::CommitHeader { oid, commiter, email, date } => {
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(delta, 0u32, HASH_LENGTH as u32, SemanticTokenList::STRUCT));
+                    ret.push(create_semantic_token(0u32, (HASH_LENGTH + 1) as u32, *commiter as u32, SemanticTokenList::KEYWORD));
+                    ret.push(create_semantic_token(0u32,  (commiter + 1) as u32, *email as u32, SemanticTokenList::COMMENT));
+                    //ret.push(create_semantic_token(0u32, (email + 1) as u32, *date as u32, SemanticTokenList::COMMENT));
+                    prev_line_token = current_line_token;
+                },
+                BranchView::MessageLine { from_oid, length } => {
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(delta, 0u32, *length as u32, SemanticTokenList::STRING));
+                    prev_line_token = current_line_token;
+                },
             }
         }
     }

@@ -36,6 +36,8 @@ pub enum SemanticTokenList {
     STRUCT,
     TYPE,
     COMMENT,
+    STRING,
+    NUMBER
 }
 
 impl SemanticTokenList {
@@ -48,6 +50,8 @@ impl SemanticTokenList {
             SemanticTokenType::STRUCT,
             SemanticTokenType::TYPE,
             SemanticTokenType::COMMENT,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER
         ]
     }
 }
