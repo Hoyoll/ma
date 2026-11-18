@@ -3,7 +3,10 @@ use git2::{
     ApplyOptions, BranchType, Commit, Delta, Index, IndexAddOption, MergeAnalysis, Oid,
     PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Sort, Status, StatusOptions,
 };
-use grep::searcher::Sink;
+use grep::{
+    regex::RegexMatcher,
+    searcher::{BinaryDetection, SearcherBuilder, Sink},
+};
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, Diagnostic,
@@ -169,8 +172,17 @@ impl WorkGroup {
                     }
                 }
             },
-            WorkGroup::Diff(diff) => (),
-
+            WorkGroup::TaskList(tl) => {
+                let format = tl.rebuild();
+                toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                    url: params.text_document.uri,
+                    content: format,
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(1000, 0),
+                    },
+                }));
+            }
             _ => (),
         }
     }
@@ -321,7 +333,7 @@ pub enum WorkGroup {
     Diff(Diff),
     MergeConflict(MergeConflict),
     DiffIndex(DiffIndex),
-    TaskList(TaskList),
+    TaskList(TodoList),
     BranchList(BranchList), //BranchInfo(BranchInfo)
                             //TagInfo(TagInfo)
 }
@@ -514,8 +526,8 @@ impl Root {
         }
     }
     pub fn fill_status(&mut self, office: &Office) {
-        self.fill_status_new(office);
-        return;
+        //self.fill_status_new(office);
+        //return;
         self.status.inner_mut().clear();
         //office.repo.status_file(path)
 
@@ -799,15 +811,7 @@ impl Root {
                     .into(),
                 ));
             }
-            RootView::StatusMember(member) => {
-                let (path, _) = &self.status[member];
-                toolbox
-                    .lsp_conn
-                    .send(Kind::Other(MaAction::OpenTask {
-                        office_id: toolbox.office.o_id,
-                        path: path.to_path_buf(),
-                    }));
-            }
+            RootView::StatusMember(_) => (),
             RootView::CommitLabel => (),
             RootView::CommitMember(member) => {
                 toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
@@ -2834,235 +2838,184 @@ impl BranchList {
     }
 }
 
-pub struct TaskList {
-    ///this path is absolute
-    pub path: PathBuf,
-    pub todo: Container<Task>,
-    pub issue: Container<Task>,
-    pub view: Container<TaskView>,
+pub struct TodoList {
+    root: PathBuf,
+    pub todo: Container<Todo>,
+    pub view: Container<(usize, usize)>,
 }
 
-impl TaskList {
-    pub fn new(path: &Path) -> Self {
+impl TodoList {
+    pub fn new(root: &Path) -> Self {
         Self {
-            path: path.to_path_buf(),
+            root: root.to_path_buf(),
             todo: Container::new(),
-            issue: Container::new(),
             view: Container::new(),
         }
     }
 
+    pub fn rebuild(&mut self) -> String {
+        self.todo.inner_mut().clear();
+        self.view.inner_mut().clear();
+        self.build()
+    }
     pub fn build(&mut self) -> String {
         let mut format = String::new();
+        let walker = ignore::WalkBuilder::new(&self.root).build();
 
-        self.view.push(TaskView::HeadLabel);
-        format.push_str(&format!("# {}\n\n", self.path.to_string_lossy()));
-        self.view.push(TaskView::LineBreak);
-
-        for (idx, task) in self.todo.inner().iter().enumerate() {
-            self.view.push(TaskView::TodoHeader(idx));
-            match &task.extra {
-                Some(extra) => {
-                    format.push_str(&format!("{}{}\n", &task.title, extra.to_string_lossy()));
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
+        let matcher = RegexMatcher::new(Todo::NEEDLE).unwrap();
+        // [] :: Hook it up!
+        // "" :: Lorem ipsum dorma
+        // "" :: Askdalskd
+        for entry in walker {
+            entry.map(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    return;
                 }
-                None => {
-                    format.push_str(&format!("{}\n", task.title));
+
+                if entry.file_name() == "ma.md"
+                    || entry.file_name() == "todo.md"
+                    || entry.file_name() == "issue.md"
+                {
+                    return;
+                }
+                let path = entry.path().strip_prefix(&self.root).unwrap();
+                let mut todo = Todo::new(path);
+                //eprintln!("{}", entry.path().to_string_lossy());
+                searcher.search_path(&matcher, entry.path(), &mut todo);
+                if !todo.is_empty() {
+                    self.todo.push(todo);
+                }
+            });
+        }
+        for (todo_idx, todo) in self.todo.inner().iter().enumerate() {
+            for (line_idx, line_kind) in todo.lines.inner().iter().enumerate() {
+                self.view.push((todo_idx, line_idx));
+                match line_kind {
+                    LineKind::Title { content, .. } | LineKind::Desc { content, .. } => {
+                        format.push_str(&format!("{content}\n"));
+                    }
                 }
             }
         }
-        if !self.issue.inner().is_empty() {
-            self.view.push(TaskView::LineBreak);
-            self.view.push(TaskView::LineBreak);
-            format.push_str("\n\n");
-        }
-        
-        for (idx, task) in self.issue.inner().iter().enumerate() {
-            self.view.push(TaskView::IssueHeader(idx));
-            match &task.extra {
-                Some(extra) => {
-                    format.push_str(&format!("{}{}\n", &task.title, extra.to_string_lossy()));
-                }
-                None => {
-                    format.push_str(&format!("{}\n", task.title));
-                }
-            }
-        }
-
         format
     }
 }
 
-pub struct Task {
-    title: String,
-    location: u32,
-    extra: Option<PathBuf>,
-}
+impl TodoList {
+    fn goto_definition(&self, toolbox: ToolBox, id: RequestId, params: GotoDefinitionParams) {
+        let line = params.text_document_position_params.position.line;
+        let (from_todo, from_line) = self.view[line as usize];
+        let todo = &self.todo[from_todo];
 
-pub enum TaskView {
-    HeadLabel,
-    LineBreak,
-    TodoHeader(usize),
-    //TodoExtra(usize),
-    IssueHeader(usize),
-    //IssueExtra(usize),
-}
-
-impl TaskList {
-    pub const ISSUE_NEEDLE: &str = r"!!::|!! ::";
-    pub const TODO_NEEDLE: &str = r"\[\]::|\[\] ::";
-    pub const EXTENSION: &str = "issue.md";
-    const PREFIX_DELIMITER: &str = "::";
-    const POSTFIX_DELIMITER: &str = ":";
-}
-
-impl TaskList {
-    fn goto_definition(&self, mut toolbox: ToolBox, id: RequestId, params: GotoDefinitionParams) {
-        match &self.view[params.text_document_position_params.position.line as usize] {
-            TaskView::HeadLabel => (),
-            TaskView::LineBreak => (),
-            TaskView::TodoHeader(member) => {
-                let todo = &self.todo[member];
-                match &todo.extra {
-                    Some(extra)
-                        if params.text_document_position_params.position.character as usize
-                            > todo.title.len() =>
-                    {
-                        let response = GotoDefinitionResponse::Scalar(Location::new(
-                            name_to_url(&toolbox.office.repo.workdir().unwrap().join(extra)).unwrap(),
-                            Range {
-                                start: Position::new(0, 0),
-                                ..Default::default()
-                            },
-                        ));
-                        toolbox.lsp_conn.send(Kind::Main(
-                            Response {
-                                id,
-                                response_result: Ok(to_value(response).unwrap()),
-                            }
-                            .into(),
-                        ));
+        match &todo.lines[from_line] {
+            LineKind::Title { content, line } | LineKind::Desc { content, line } => {
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&toolbox.office.repo.workdir().unwrap().join(&todo.path)).unwrap(),
+                    Range {
+                        start: Position::new(*line, 0),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
                     }
-                    _ => {
-                        let response = GotoDefinitionResponse::Scalar(Location::new(
-                            name_to_url(&self.path).unwrap(),
-                            Range {
-                                start: Position::new(todo.location, 0),
-                                ..Default::default()
-                            },
-                        ));
-                        toolbox.lsp_conn.send(Kind::Main(
-                            Response {
-                                id,
-                                response_result: Ok(to_value(response).unwrap()),
-                            }
-                            .into(),
-                        ));
-                    }
+                    .into(),
+                ));
+            }
+        }
+    }
+    fn semantic_token(&self, ret: &mut Vec<SemanticToken>) {
+        let mut current_line_token = 0u32;
+        let mut prev_line_token = 0u32;
+        for (line, (todo, todo_line)) in self.view.inner().iter().enumerate() {
+            let todo = &self.todo[todo];
+            let todo_line = &todo.lines[todo_line];
+            current_line_token = line as u32;
+            let delta = current_line_token - prev_line_token;
+
+            match todo_line {
+                LineKind::Title { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::STRUCT,
+                    ));
+                }
+                LineKind::Desc { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::STRING,
+                    ));
                 }
             }
-            TaskView::IssueHeader(member) => {
-                let issue = &self.issue[member];
-                //              let todo = &self.todo[member];
-                match &issue.extra {
-                    Some(extra)
-                        if params.text_document_position_params.position.character as usize
-                            > issue.title.len() =>
-                    {
-                        let response = GotoDefinitionResponse::Scalar(Location::new(
-                            name_to_url(&toolbox.office.repo.workdir().unwrap().join(extra)).unwrap(),
-                            Range {
-                                start: Position::new(0, 0),
-                                ..Default::default()
-                            },
-                        ));
-                        toolbox.lsp_conn.send(Kind::Main(
-                            Response {
-                                id,
-                                response_result: Ok(to_value(response).unwrap()),
-                            }
-                            .into(),
-                        ));
-                    }
-                    _ => {
-                        let response = GotoDefinitionResponse::Scalar(Location::new(
-                            name_to_url(&self.path).unwrap(),
-                            Range {
-                                start: Position::new(issue.location, 0),
-                                ..Default::default()
-                            },
-                        ));
-                        toolbox.lsp_conn.send(Kind::Main(
-                            Response {
-                                id,
-                                response_result: Ok(to_value(response).unwrap()),
-                            }
-                            .into(),
-                        ));
-                    }
-                }
-            }
+            prev_line_token = current_line_token;
         }
     }
 
     fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
-        //eprintln!("{start_line}..{end_line}");
         for line in start_line..end_line {
-            match &self.view[line as usize] {
-                TaskView::HeadLabel => (),
-                TaskView::LineBreak => (),
-                TaskView::TodoHeader(member) => {
-                    let todo = &self.todo[member];
+            let (from_todo, from_line) = &self.view[line as usize];
+            let todo = &self.todo[from_todo];
+            let line_kind = &todo.lines[from_line];
+            match line_kind {
+                LineKind::Title { content, .. } => {
                     ret.push(create_inlay_hint(line, 0, "[] "));
-                    if let Some(path_buf) = &todo.extra {
-                        ret.push(create_inlay_hint(line, todo.title.len() as u32, " * "));
-                    }
+                    ret.push(create_inlay_hint(
+                        line,
+                        content.len() as u32,
+                        format!(" * {}", todo.path.to_string_lossy()),
+                    ));
                 }
-                TaskView::IssueHeader(member) => {
-                    let issue = &self.issue[member];
-                    ret.push(create_inlay_hint(line, 0, ":: "));
-                    if let Some(path_buf) = &issue.extra {
-                        ret.push(create_inlay_hint(line, issue.title.len() as u32, " * "));
-                    }
+                LineKind::Desc { content, .. } => {
+                    let label = if *from_line == todo.lines.inner().len() - 1 {
+                        "│└ "
+                    } else {
+                        "││ "
+                    };
+                    ret.push(create_inlay_hint(line, 0, label));
                 }
-            }
-        }
-    }
-
-    fn semantic_token(&self, ret: &mut Vec<SemanticToken>) {
-        let mut current_line_token = 0u32;
-        let mut prev_line_token = 0u32;
-        for (line, tv) in self.view.inner().iter().enumerate() {
-            match tv {
-                TaskView::HeadLabel => (),
-                TaskView::LineBreak => (),
-                TaskView::TodoHeader(member) => {
-                    let todo = &self.todo[member];
-                    current_line_token = line as u32;
-                    let delta = current_line_token - prev_line_token;
-                    ret.push(create_semantic_token(delta, 0u32, todo.title.len() as u32, SemanticTokenList::STRUCT));
-                    if let Some(path_buf) = &todo.extra {
-                        ret.push(create_semantic_token(delta, todo.title.len() as u32 + 1, path_buf.to_string_lossy().len() as u32, SemanticTokenList::KEYWORD));
-
-                    }
-                    prev_line_token = current_line_token;
-                },
-                TaskView::IssueHeader(member) => {
-                    let issue = &self.issue[member];
-                    current_line_token = line as u32;
-                    let delta = current_line_token - prev_line_token;
-                    ret.push(create_semantic_token(delta, 0u32, issue.title.len() as u32, SemanticTokenList::STRUCT));
-                    if let Some(path_buf) = &issue.extra {
-                        ret.push(create_semantic_token(delta, issue.title.len() as u32 + 1, path_buf.to_string_lossy().len() as u32, SemanticTokenList::KEYWORD));
-
-                    }
-                    prev_line_token = current_line_token;
-                },
             }
         }
     }
 }
 
-impl Sink for Container<Task> {
+pub struct Todo {
+    path: PathBuf,
+    lines: Container<LineKind>,
+}
+
+pub enum LineKind {
+    Title { content: String, line: u32 },
+    Desc { content: String, line: u32 },
+}
+
+impl Todo {
+    //pub const NEEDLE: &str = r#"\[\]::|\[\] ::|""::|"" ::"#;
+    pub const NEEDLE: &str = r#"(\[\]|"")\s*::"#;
+    const TITLE: &str = "[]";
+    const DESC: &str = r#""""#;
+
+    pub fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            lines: Container::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.inner().is_empty()
+    }
+}
+
+impl Sink for Todo {
     type Error = io::Error;
 
     fn matched(
@@ -3070,23 +3023,30 @@ impl Sink for Container<Task> {
         _searcher: &grep::searcher::Searcher,
         mat: &grep::searcher::SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
-        let string = String::from_utf8_lossy(mat.bytes());
-        let (_, pre_title) = string.split_once(TaskList::PREFIX_DELIMITER).unwrap();
-        let location = mat.line_number().unwrap() as u32 - 1;
-        let task = match pre_title.split_once(TaskList::POSTFIX_DELIMITER) {
-            Some((title, path)) => Task {
-                title: title.trim_start().trim_end().to_string(),
-                location,
-                extra: Some(PathBuf::from(path.trim_start().trim_end())),
-            },
-            None => Task {
-                title: pre_title.trim_start().trim_end().to_string(),
-                location,
-                extra: None,
-            },
-        };
-        self.push(task);
+        let line = String::from_utf8_lossy(mat.bytes());
+        eprintln!("{line}");
+        let (prefix, content) = line.split_once("::").unwrap();
+        let kind = prefix.trim();
+        let line = mat.line_number().unwrap() as u32 - 1;
+        //eprintln!("kind: {kind}");
+        match kind {
+            _ if kind.contains(Self::TITLE) => {
+                //eprintln!("title: {content}");
+                self.lines.push(LineKind::Title {
+                    content: content.trim().to_string(),
+                    line,
+                });
+            }
+            _ if kind.contains(Self::DESC) => {
+                //eprintln!("desc: {content}");
+                self.lines.push(LineKind::Desc {
+                    content: content.trim().to_string(),
+                    line,
+                });
+            }
+            _ => (),
+        }
+
         Ok(true)
-        //todo!()
     }
 }

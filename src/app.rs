@@ -11,8 +11,8 @@ use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
     DiagnosticServerCapabilities, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFilter, ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams, HoverParams,
-    HoverProviderCapability, InlayHintParams, OneOf, Range, SaveOptions, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    HoverProviderCapability, InlayHintParams, OneOf, Position, Range, SaveOptions,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities,
     ShowDocumentParams, StaticRegistrationOptions, TextDocumentRegistrationOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
@@ -29,7 +29,7 @@ use serde_json::{Value, from_value, to_value};
 use crate::{
     lsp::Kind,
     util::{self, Container, name_to_url},
-    workgroup::{Diff, DiffView, Root, RootMode, TaskList, ToolBox, WorkGroup},
+    workgroup::{Diff, DiffView, Root, RootMode, Todo, TodoList, ToolBox, WorkGroup},
 };
 #[repr(u32)]
 pub enum SemanticTokenList {
@@ -175,10 +175,6 @@ pub enum MaAction {
     OpenDiff {
         uri: Uri,
         oid: Oid,
-    },
-    OpenTask {
-        office_id: OfficeId,
-        path: PathBuf,
     },
     //OpenTree {
     //    uri: Uri,
@@ -474,6 +470,29 @@ impl App {
                         self.work_group
                             .insert(anchor_path, (WorkGroup::Root(root), office_id));
                     }
+                    Some("todo.md") => {
+                        let root = path.parent().unwrap().strip_prefix("/").unwrap();
+                        let mut office = match Repository::open(root) {
+                            Ok(repo) => Office::new(repo),
+                            Err(_) => return,
+                        };
+                        let office_id = self.office.add(office);
+                        self.office[office_id].o_id = office_id;
+                        //let walker = ignore::WalkBuilder::new(root).build();
+                        let mut list = TodoList::new(root);
+                        let format = list.build();
+                        self.work_group
+                            .insert(anchor_path.clone(), (WorkGroup::TaskList(list), office_id));
+                        self.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                            url: anchor_path,
+                            content: format,
+                            range: Range {
+                                start: Position::new(0, 0),
+                                end: Position::new(1000, 0),
+                            },
+                        }));
+                    }
+                    Some("issue.md") => {}
                     _ => (),
                 });
             }
@@ -562,54 +581,6 @@ impl App {
                 office_id,
             } => {
                 self.work_group.insert(key, (workgroup, office_id));
-            }
-            MaAction::OpenTask {
-                office_id,
-                mut path,
-            } => {
-                let office = &self.office[office_id];
-                let abs_path = office.repo.workdir().unwrap().join(&path);
-                let mut task_list = TaskList::new(&abs_path);
-                let mut searcher = SearcherBuilder::new()
-                    .binary_detection(BinaryDetection::quit(b'\x00'))
-                    .build();
-                if let Ok(todo_matcher) = RegexMatcher::new(TaskList::TODO_NEEDLE) {
-                    searcher.search_path(&todo_matcher, &task_list.path, &mut task_list.todo);
-                }
-
-                if let Ok(issue_matcher) = RegexMatcher::new(TaskList::ISSUE_NEEDLE) {
-                    searcher.search_path(&issue_matcher, &task_list.path, &mut task_list.issue);
-                }
-
-                if task_list.todo.inner().is_empty() && task_list.issue.inner().is_empty() {
-                    return; 
-                }
-
-                let format = task_list.build();
-                path.set_extension(TaskList::EXTENSION);
-                let location = office.repo.path().join(App::NAME).join(&path);
-                fs::create_dir_all(location.parent().unwrap());
-                fs::write(&location, &format);
-                let url = name_to_url(&location).unwrap();
-                //self.lsp_conn.send(Kind::Main())
-                self.work_group
-                    .insert(url.clone(), (WorkGroup::TaskList(task_list), office_id));
-                self.lsp_conn.send(Kind::Main(
-                    lsp_server::Request {
-                        id: RequestId::from(1),
-                        method: ShowDocument::METHOD.into(),
-                        params: to_value(ShowDocumentParams {
-                            uri: url,
-                            external: None,
-                            take_focus: Some(true),
-                            selection: None,
-                        })
-                        .unwrap(),
-                    }
-                    .into(),
-                ));
-                //searcher.search_path(matcher, path, write_to)
-                //let issue_m = RegexMatcher::new("!! ::");
             }
         }
     }
