@@ -81,7 +81,14 @@ impl<T> Index<&usize> for Container<T> {
     }
 }
 
+fn new_name_to_url(path: &Path) -> Option<lsp_types::Uri> {
+    let url = url::Url::from_file_path(path).ok()?;
+    let uri = url.as_str().parse().ok()?;
+    Some(uri)
+}
+
 pub fn name_to_url(path: &Path) -> Option<Uri> {
+    return new_name_to_url(path);
     //let path = Path::new(name);
     if !path.is_absolute() {
         return None;
@@ -108,106 +115,6 @@ pub fn name_to_url(path: &Path) -> Option<Uri> {
         }
     }
     raw.parse().ok()
-}
-
-pub fn markdown_language(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        // Systems
-        Some("rs") => "rust",
-        Some("c") => "c",
-        Some("h") => "c",
-        Some("cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx") => "cpp",
-        Some("m") => "objective-c",
-        Some("mm") => "objective-cpp",
-        Some("zig") => "zig",
-        Some("asm" | "s") => "asm",
-
-        // JVM
-        Some("java") => "java",
-        Some("kt" | "kts") => "kotlin",
-        Some("scala") => "scala",
-        Some("groovy") => "groovy",
-
-        // .NET
-        Some("cs") => "csharp",
-        Some("fs" | "fsx" | "fsi") => "fsharp",
-        Some("vb") => "vbnet",
-
-        // JavaScript / TypeScript
-        Some("js" | "mjs" | "cjs") => "javascript",
-        Some("jsx") => "jsx",
-        Some("ts") => "typescript",
-        Some("tsx") => "tsx",
-
-        // Python / scripting
-        Some("py" | "pyw" | "pyi") => "python",
-        Some("rb") => "ruby",
-        Some("php") => "php",
-        Some("pl" | "pm") => "perl",
-        Some("lua") => "lua",
-        Some("r") => "r",
-        Some("dart") => "dart",
-        Some("ex" | "exs") => "elixir",
-        Some("erl" | "hrl") => "erlang",
-        Some("clj" | "cljs" | "cljc") => "clojure",
-        Some("groovy") => "groovy",
-
-        // Go / functional
-        Some("go") => "go",
-        Some("hs" | "lhs") => "haskell",
-        Some("ml" | "mli") => "ocaml",
-        Some("fs" | "fsx") => "fsharp",
-        Some("swift") => "swift",
-
-        // Web
-        Some("html" | "htm") => "html",
-        Some("css") => "css",
-        Some("scss") => "scss",
-        Some("sass") => "sass",
-        Some("less") => "less",
-        Some("vue") => "vue",
-        Some("svelte") => "svelte",
-        Some("astro") => "astro",
-
-        // Data / config
-        Some("json" | "jsonc") => "json",
-        Some("yaml" | "yml") => "yaml",
-        Some("toml") => "toml",
-        Some("xml") => "xml",
-        Some("ini") => "ini",
-        Some("csv") => "csv",
-
-        // Shell
-        Some("sh" | "bash") => "bash",
-        Some("zsh") => "zsh",
-        Some("fish") => "fish",
-        Some("ps1" | "psm1") => "powershell",
-        Some("bat" | "cmd") => "bat",
-
-        // SQL
-        Some("sql") => "sql",
-
-        // Mobile
-        Some("swift") => "swift",
-        Some("m") => "objective-c",
-        Some("dart") => "dart",
-
-        // Functional / misc
-        Some("clj" | "cljs" | "cljc") => "clojure",
-        Some("lisp" | "lsp" | "cl") => "lisp",
-        Some("sol") => "solidity",
-        Some("asm" | "s") => "asm",
-        Some("v") => "verilog",
-        Some("vhd" | "vhdl") => "vhdl",
-
-        // Documentation / markup
-        Some("md" | "markdown" | "mdx") => "markdown",
-        Some("rst") => "rst",
-        Some("tex") => "latex",
-
-        // Default
-        _ => "text",
-    }
 }
 
 pub fn format_git_time(time: Time) -> Option<String> {
@@ -246,5 +153,3 @@ pub fn create_semantic_token(
         token_modifiers_bitset: 0,
     }
 }
-
-pub fn create_code_action() {}

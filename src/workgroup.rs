@@ -2910,8 +2910,11 @@ impl TodoList {
             LineKind::List { content, line }
             | LineKind::Title { content, line }
             | LineKind::Desc { content, line } => {
-                let response = GotoDefinitionResponse::Scalar(Location::new(
-                    name_to_url(&toolbox.office.repo.workdir().unwrap().join(&todo.path)).unwrap(),
+                //eprintln!("{}", &toolbox.office.repo.workdir().unwrap().join(&todo.path).to_string_lossy());
+                
+                name_to_url(&toolbox.office.repo.workdir().unwrap().join(&todo.path)).map(|uri| {
+                    let response = GotoDefinitionResponse::Scalar(Location::new(
+                    uri,
                     Range {
                         start: Position::new(*line, 0),
                         ..Default::default()
@@ -2924,6 +2927,8 @@ impl TodoList {
                     }
                     .into(),
                 ));
+                });
+                
             }
 
             LineKind::Anchor { location } => {
@@ -3052,13 +3057,13 @@ pub enum LineKind {
 }
 
 impl Todo {
-    //pub const NEEDLE: &str = r#"\[\]::|\[\] ::|""::|"" ::"#;
-    pub const NEEDLE: &str = r#"(\[\]|\|\|)\s*:"#;
-    const TITLE: &str = "[]";
-    const DESC: &str = "||";
-    const DELIMITER: &str = ":";
+    pub const NEEDLE: &str = r#"(\[\]|\+|li|a)\s*::"#;
+    const TAG_TITLE: &str = "[]";
+    const TAG_DESC: &str = "+";
     const TAG_LIST: &str = "li";
     const TAG_ANCHOR: &str = "a";
+    const DELIMITER: &str = "::";
+    
     pub fn new(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -3080,46 +3085,27 @@ impl Sink for Todo {
         mat: &grep::searcher::SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         let line = String::from_utf8_lossy(mat.bytes());
-
         let (prefix, content) = line.split_once(Self::DELIMITER).unwrap();
         let kind = prefix.trim();
         let line = mat.line_number().unwrap() as u32 - 1;
         match kind {
-            _ if kind.contains(Self::TITLE) => {
+            _ if kind.contains(Self::TAG_TITLE) => {
                 self.lines.push(LineKind::Title {
                     content: content.trim().to_string(),
                     line,
                 });
             }
-            _ if kind.contains(Self::DESC) => {
-                let clean = content.trim();
-                match clean.split_once(Self::DELIMITER) {
-                    Some((tag, payload)) => match tag {
-                        Self::TAG_ANCHOR => {
-                            self.lines.push(LineKind::Anchor {
-                                location: PathBuf::from(payload.trim()),
-                            });
-                        }
-                        Self::TAG_LIST => {
-                            self.lines.push(LineKind::List {
-                                content: payload.trim().to_string(),
-                                line,
-                            });
-                        }
-                        _ => {
-                            self.lines.push(LineKind::Desc {
-                                content: clean.to_string(),
-                                line,
-                            });
-                        }
-                    },
-                    None => {
-                        self.lines.push(LineKind::Desc {
-                            content: clean.to_string(),
-                            line,
-                        });
-                    }
-                }
+            _ if kind.contains(Self::TAG_DESC) => {
+                self.lines.push(LineKind::Desc {
+                    content: content.trim().to_string(),
+                    line,
+                }); 
+            }
+            _ if kind.contains(Self::TAG_LIST) => {
+                self.lines.push(LineKind::List { content: content.trim().to_string(), line });
+            }
+            _ if kind.contains(Self::TAG_ANCHOR) => {
+                self.lines.push(LineKind::Anchor { location: PathBuf::from(content.trim()) });
             }
             _ => (),
         }
