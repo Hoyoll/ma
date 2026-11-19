@@ -1081,6 +1081,11 @@ impl Root {
                     }));
                 }
                 RootView::HeadLabel => (),
+                // []:: Branch Extravaganza
+                // li:: Delete
+                //  +:: Add mechanism to delete a branch, duh!
+                // li:: Rename
+                //  +:: Add mechanism to rename a branch, duh!
                 RootView::BranchMember(member) => {
                     let branch = &self.branch[member];
                     ret.push(CodeActionOrCommand::Command(Command {
@@ -1123,6 +1128,13 @@ impl Root {
                         arguments: Some(vec),
                     }));
                 }
+                // []:: Remote Extravaganza!
+                // li:: Register
+                //  +:: Add a way to register new remote with name etc
+                // li:: Remove
+                //  +:: Add a way to remove a chosen remote
+                // li:: Mutate
+                //  +:: A way to change it's name or url it point to!
                 RootView::RemoteMember(member) => {
                     let remote = &self.remote[member];
                     ret.push(CodeActionOrCommand::Command(Command {
@@ -1138,6 +1150,13 @@ impl Root {
                     //return;
                 }
                 RootView::TagLabel => (),
+                
+                // []:: Tag Extravaganza
+                // li:: Remove
+                //  +:: Add a way to remove a tag!
+                // li :: Mutate
+                // +:: Add a way to change tag name
+                // +:: or description or commit it points to
                 RootView::TagMember(member) => {
                     let tag = &self.tag[member];
                     for (remote_id, remote) in self.remote.inner().iter().enumerate() {
@@ -1238,6 +1257,8 @@ impl Root {
                     .into(),
                 }));
             }
+            // []:: Tag Input Cancel Mechanism
+            //  +:: Add a way to cancel tagging a commit 
             RootMode::TagInput { oid } => (),
         }
     }
@@ -1763,6 +1784,9 @@ impl Diff {
         format
     }
 
+    // [] :: Diff bullshit,
+    //  + :: Find a way so you can use `-` section of the diff 
+    //  + :: to go the the past file too
     pub fn fill_view(
         diff: &git2::Diff,
         diff_file: &mut Container<PathBuf>,
