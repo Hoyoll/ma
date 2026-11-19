@@ -1,17 +1,11 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-    process,
-    str::FromStr,
-    thread::spawn,
-};
-
 use crossbeam::channel::Sender;
 use git2::{
     ApplyOptions, BranchType, Commit, Delta, Index, IndexAddOption, MergeAnalysis, Oid,
-    PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Status, StatusOptions,
+    PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Sort, Status, StatusOptions,
+};
+use grep::{
+    regex::RegexMatcher,
+    searcher::{BinaryDetection, SearcherBuilder, Sink},
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
@@ -28,6 +22,16 @@ use lsp_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_value;
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs,
+    io::{self, BufRead},
+    path::{Path, PathBuf},
+    process,
+    str::FromStr,
+    thread::spawn,
+};
 
 use crate::{
     app::{self, App, GitPush, HunkFilter, HunkId, MaAction, Office, Progress, SemanticTokenList},
@@ -168,8 +172,17 @@ impl WorkGroup {
                     }
                 }
             },
-            WorkGroup::Diff(diff) => (),
-
+            WorkGroup::TaskList(tl) => {
+                let format = tl.rebuild();
+                toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                    url: params.text_document.uri,
+                    content: format,
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(1000, 0),
+                    },
+                }));
+            }
             _ => (),
         }
     }
@@ -203,6 +216,12 @@ impl WorkGroup {
             WorkGroup::DiffIndex(diff_index) => {
                 diff_index.goto_definition(toolbox, params, id);
             }
+            WorkGroup::BranchList(bl) => {
+                bl.goto_definition(&toolbox, params.text_document_position_params);
+            }
+            WorkGroup::TaskList(tl) => {
+                tl.goto_definition(toolbox, id, params);
+            }
             _ => (),
         }
     }
@@ -228,10 +247,8 @@ impl WorkGroup {
 
     pub fn inlay_hint(&mut self, toolbox: ToolBox, id: RequestId, params: InlayHintParams) {
         let mut ret = Vec::<InlayHint>::new();
-        //eprintln!("here!");
         match self {
             WorkGroup::Root(root) => {
-                //eprintln!("{:?}", params.range);
                 root.inlay_hint(
                     (params.range.start.line, params.range.end.line),
                     toolbox.office,
@@ -247,6 +264,12 @@ impl WorkGroup {
             }
             WorkGroup::DiffIndex(diff_index) => {
                 diff_index.inlay_hint((params.range.start.line, params.range.end.line), &mut ret);
+            }
+            WorkGroup::BranchList(bl) => {
+                bl.inlay_hint((params.range.start.line, params.range.end.line), &mut ret);
+            }
+            WorkGroup::TaskList(tl) => {
+                tl.inlay_hint((params.range.start.line, params.range.end.line), &mut ret);
             }
             _ => (),
         }
@@ -273,6 +296,12 @@ impl WorkGroup {
             }
             WorkGroup::DiffIndex(diff_index) => {
                 diff_index.semantic_token(&toolbox, &mut data);
+            }
+            WorkGroup::BranchList(bl) => {
+                bl.semantic_token(&toolbox, &mut data);
+            }
+            WorkGroup::TaskList(tl) => {
+                tl.semantic_token(&mut data);
             }
             _ => (),
         }
@@ -302,8 +331,9 @@ pub enum WorkGroup {
     Diff(Diff),
     MergeConflict(MergeConflict),
     DiffIndex(DiffIndex),
-    //BranchInfo(BranchInfo)
-    //TagInfo(TagInfo)
+    TaskList(TodoList),
+    BranchList(BranchList), //BranchInfo(BranchInfo)
+                            //TagInfo(TagInfo)
 }
 
 pub struct Root {
@@ -425,7 +455,7 @@ impl Root {
                     format.push_str("\n");
                 }
                 RootView::StatusLabel => {
-                    format.push_str("# Current Status\n");
+                    format.push_str("# Worktree\n");
                 }
                 RootView::StatusMember(i) => {
                     let (member, _) = &self.status[*i];
@@ -473,8 +503,32 @@ impl Root {
         });
     }
 
-    pub fn fill_status(&mut self, office: &Office) {
+    fn fill_status_new(&mut self, office: &Office) {
         self.status.inner_mut().clear();
+        let root = office.repo.workdir().unwrap();
+        let walker = ignore::WalkBuilder::new(root).build();
+        for entry in walker {
+            entry.map(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    return;
+                }
+
+                if entry.file_name() == "ma.md" {
+                    return;
+                }
+                let path = entry.path().strip_prefix(root).unwrap();
+                office.repo.status_file(path).map(|status| {
+                    self.status.push((path.to_path_buf(), status));
+                });
+            });
+        }
+    }
+    pub fn fill_status(&mut self, office: &Office) {
+        //self.fill_status_new(office);
+        //return;
+        self.status.inner_mut().clear();
+        //office.repo.status_file(path)
+
         office
             .repo
             .statuses(Some(
@@ -582,11 +636,81 @@ impl Root {
         match &self.view[params.position.line as usize] {
             RootView::LineBreak => (),
             RootView::HeadFile => (),
-            RootView::HeadLabel => (),
             RootView::RemoteLabel => (),
             RootView::RemoteMember(_) => (),
             RootView::TagLabel => (),
-            RootView::BranchMember(_) => (),
+            RootView::HeadLabel => {
+                BranchList::new(&self.head_branch, toolbox.office).map(|(bl, path, format)| {
+                    if let Err(e) = fs::create_dir_all(path.parent().unwrap()) {
+                        eprintln!("{}", e.to_string());
+                        return;
+                    }
+                    if let Err(e) = fs::write(&path, &format) {
+                        eprintln!("{}", e.to_string());
+                        return;
+                    }
+                    let workgroup = WorkGroup::BranchList(bl);
+                    let uri = name_to_url(&path).unwrap();
+                    toolbox
+                        .lsp_conn
+                        .send(Kind::Other(MaAction::RegisterWorkgroup {
+                            key: uri.clone(),
+                            workgroup,
+                            office_id: toolbox.office.o_id,
+                        }));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        lsp_server::Request {
+                            id: RequestId::from(1),
+                            method: ShowDocument::METHOD.into(),
+                            params: to_value(ShowDocumentParams {
+                                uri,
+                                external: None,
+                                take_focus: Some(true),
+                                selection: None,
+                            })
+                            .unwrap(),
+                        }
+                        .into(),
+                    ));
+                });
+            }
+            RootView::BranchMember(member) => {
+                BranchList::new(&self.branch[member].name, toolbox.office).map(
+                    |(bl, path, format)| {
+                        if let Err(e) = fs::create_dir_all(path.parent().unwrap()) {
+                            eprintln!("{}", e.to_string());
+                            return;
+                        }
+                        if let Err(e) = fs::write(&path, &format) {
+                            eprintln!("{}", e.to_string());
+                            return;
+                        }
+                        let workgroup = WorkGroup::BranchList(bl);
+                        let uri = name_to_url(&path).unwrap();
+                        toolbox
+                            .lsp_conn
+                            .send(Kind::Other(MaAction::RegisterWorkgroup {
+                                key: uri.clone(),
+                                workgroup,
+                                office_id: toolbox.office.o_id,
+                            }));
+                        toolbox.lsp_conn.send(Kind::Main(
+                            lsp_server::Request {
+                                id: RequestId::from(1),
+                                method: ShowDocument::METHOD.into(),
+                                params: to_value(ShowDocumentParams {
+                                    uri,
+                                    external: None,
+                                    take_focus: Some(true),
+                                    selection: None,
+                                })
+                                .unwrap(),
+                            }
+                            .into(),
+                        ));
+                    },
+                );
+            }
             RootView::TagMember(member) => {
                 let tag = &self.tag[member];
                 let reference = match toolbox
@@ -702,15 +826,12 @@ impl Root {
         office: &Office,
         ret: &mut Vec<InlayHint>,
     ) {
-        //eprintln!("hint!");
         match &self.mode {
             RootMode::CommitInput => {
-                //eprintln!("it's impossible to be here!");
                 ret.push(create_inlay_hint(0, 0, "Waiting for commit message"));
             }
             RootMode::Dashboard => {
                 for i in start_line..end_line {
-                    //eprintln!("{i}");
                     self.view.get(i as usize).map(|view| match view {
                         RootView::LineBreak => (),
                         RootView::HeadFile => {
@@ -763,14 +884,14 @@ impl Root {
                                         ret.push(create_inlay_hint(
                                             i,
                                             content.len() as u32,
-                                            format!("* Transferring data: {percentage}%"),
+                                            format!(" * Transferring data: {percentage}%"),
                                         ));
                                     }
                                     GitPush::Error { message } => {
                                         ret.push(create_inlay_hint(
                                             i,
                                             content.len() as u32,
-                                            format!("* Error: {message}"),
+                                            format!(" * Error: {message}"),
                                         ));
                                     }
                                     GitPush::Done => {
@@ -820,7 +941,7 @@ impl Root {
                             };
 
                             let unstaged = if status.contains(Status::WT_NEW) {
-                                "?"
+                                "A"
                             } else if status.contains(Status::WT_MODIFIED) {
                                 "M"
                             } else if status.contains(Status::WT_DELETED) {
@@ -835,7 +956,7 @@ impl Root {
                             ret.push(create_inlay_hint(
                                 i,
                                 0,
-                                format!("  {} | {} -> ", staged, unstaged),
+                                format!("  {} │ {} * ", staged, unstaged),
                             ));
                         }
                         RootView::CommitLabel => (),
@@ -1648,14 +1769,12 @@ impl Diff {
         view: &mut Container<DiffView>,
         format: &mut String,
     ) {
-        //diff.map(|diff| {
         let mut new_file_id = Oid::ZERO_SHA1;
         let mut old_file_id = Oid::ZERO_SHA1;
         let mut from_file = 0usize;
         let mut hunk_id = (0u32, 0u32);
         let mut hunk_line = 0u32;
         diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-            //eprintln!("{}", String::from_utf8_lossy(line.content()));
             let new_file = delta.new_file();
             let old_file = delta.old_file();
             let new_delta = new_file.id() != new_file_id || old_file.id() != old_file_id;
@@ -2386,14 +2505,11 @@ impl DiffIndex {
             IndexView::OldFile { from_file } => {
                 let path = &self.paths[from_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
-                    eprintln!("{content}");
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
-                    
+
                     let file_path = dir.join(path);
                     fs::create_dir_all(&file_path.parent().unwrap());
                     fs::write(&file_path, content);
-                        //eprintln!("{}", write.to_string());
-                        //eprintln!("{}", file_path.to_string_lossy());
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
                         Range {
@@ -2419,12 +2535,9 @@ impl DiffIndex {
                 let path = &self.paths[from_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
-                    //fs::create_dir_all(&dir);
                     let file_path = dir.join(path);
-                    
+
                     fs::create_dir_all(&file_path.parent().unwrap());
-                    //eprintln!("path: {}", path.to_string_lossy());
-                    //eprintln!("line: {}", line);
                     fs::write(&file_path, content);
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
@@ -2458,28 +2571,20 @@ impl DiffIndex {
                     length,
                 } => {
                     let path = &self.paths[from_file];
-                    //eprintln!("first step");
-                    //eprintln!("{}", path.to_string_lossy());
                     match toolbox.office.hunk_filter.get(path) {
                         Some(hs) => match hs.get(hunk_id) {
                             Some(active) => {
-                                //eprintln!("last step");
-                                let sm = if *active {
-                                    SemanticTokenList::KEYWORD
-                                } else {
-                                    SemanticTokenList::COMMENT
-                                };
-                                current_line_token = line as u32;
-                                let delta = current_line_token - prev_line_token;
-                                ret.push(create_semantic_token(delta, 0u32, *length as u32, sm));
-                                prev_line_token = current_line_token;
+                                if !*active {
+                                    current_line_token = line as u32;
+                                    let delta = current_line_token - prev_line_token;
+                                    ret.push(create_semantic_token(delta, 0u32, *length as u32, SemanticTokenList::COMMENT));
+                                    prev_line_token = current_line_token;     
+                                } 
                             }
                             None => {
-                                //eprintln!("missed {:?}", hunk_id);
                             }
                         },
                         None => {
-                            //eprintln!("missed! {}", path.to_string_lossy());
                         }
                     }
                 }
@@ -2518,8 +2623,480 @@ impl DiffIndex {
                     //ret.push(create_semantic_token(delta_line, delta_start, length, token_type));
                 }
                 IndexView::ContextLine { from_file, line } => (),
-                IndexView::OldFile { from_file } => (), 
+                IndexView::OldFile { from_file } => (),
             }
         }
+    }
+}
+
+pub struct BranchList {
+    branch_name: String,
+    commit: Container<Oid>,
+    view: Container<BranchView>,
+}
+
+pub enum BranchView {
+    LineBreak,
+    Header,
+    CommitHeader {
+        oid: usize,
+        commiter: Length,
+        email: Length,
+        date: Length,
+    },
+    MessageLine {
+        from_oid: usize,
+        length: Length,
+    },
+}
+
+impl BranchList {
+    pub fn new(branch: &str, office: &Office) -> Option<(Self, PathBuf, String)> {
+        let br = match office.repo.find_branch(branch, BranchType::Local) {
+            Ok(br) => br,
+            Err(_) => return None,
+        };
+        let mut this = Self {
+            branch_name: branch.into(),
+            commit: Container::new(),
+            view: Container::new(),
+        };
+        let branch_commit = br.get().peel_to_commit().unwrap();
+        let mut revwalk = office.repo.revwalk().unwrap();
+        revwalk.push(branch_commit.id());
+        revwalk.set_sorting(Sort::TIME);
+        for oid in revwalk {
+            oid.map(|oid| {
+                this.commit.push(oid);
+            });
+        }
+
+        let format = this.format(office);
+        let path = office
+            .repo
+            .path()
+            .join(App::NAME)
+            .join(format!("{}.md", this.branch_name));
+        Some((this, path, format))
+    }
+
+    fn format(&mut self, office: &Office) -> String {
+        let mut format = String::new();
+
+        format.push_str(&format!("# {}\n\n", self.branch_name));
+        self.view.push(BranchView::Header);
+        self.view.push(BranchView::LineBreak);
+
+        for (idx, oid) in self.commit.inner().iter().enumerate() {
+            let commit = office.repo.find_commit(*oid).unwrap();
+            let signature = commit.author();
+            let commit_str = &oid.to_string()[0..HASH_LENGTH];
+            let name = signature.name().unwrap_or_default();
+            let email = signature.email().unwrap_or_default();
+            let date = util::format_git_time(signature.when()).unwrap_or_default();
+
+            self.view.push(BranchView::CommitHeader {
+                oid: idx,
+                commiter: name.len(),
+                email: email.len(),
+                date: date.len(),
+            });
+
+            format.push_str(&format!("{} {} {} {}\n", commit_str, name, email, date));
+
+            let message = commit.message().unwrap_or_default().lines();
+            for message_line in message {
+                let message = format!("{message_line}\n");
+                self.view.push(BranchView::MessageLine {
+                    from_oid: idx,
+                    length: message.len(),
+                });
+                format.push_str(&message);
+            }
+        }
+
+        format
+    }
+}
+
+impl BranchList {
+    const HEADER_GUTTER: [&str; 2] = ["◯", "@"];
+    const MESSAGE_GUTTER: &str = "│";
+    fn goto_definition(&self, toolbox: &ToolBox, params: TextDocumentPositionParams) {
+        match &self.view[params.position.line as usize] {
+            BranchView::LineBreak => (),
+            BranchView::Header => (),
+            BranchView::CommitHeader {
+                oid,
+                commiter,
+                email,
+                date,
+            } => {
+                toolbox.lsp_conn.send(Kind::Other(MaAction::OpenDiff {
+                    uri: params.text_document.uri,
+                    oid: self.commit[oid],
+                }));
+            }
+            BranchView::MessageLine { from_oid, length } => (),
+        }
+    }
+
+    fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
+        let lines = start_line..end_line;
+        let mut gutter_line = 1;
+        for line in lines {
+            match self.view[line as usize] {
+                BranchView::LineBreak => (),
+                BranchView::Header => (),
+                BranchView::CommitHeader { .. } => {
+                    let gutter = Self::HEADER_GUTTER[gutter_line % 2];
+                    gutter_line += 1;
+                    ret.push(create_inlay_hint(line, 0, format!("{gutter} ")));
+                    //commit_header_count +=
+                }
+                BranchView::MessageLine { from_oid, length } => {
+                    ret.push(create_inlay_hint(
+                        line,
+                        0,
+                        format!("{} ", Self::MESSAGE_GUTTER),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn semantic_token(&self, toolbox: &ToolBox, ret: &mut Vec<SemanticToken>) {
+        let mut current_line_token = 0u32;
+        let mut prev_line_token = 0u32;
+        for (line, bv) in self.view.inner().iter().enumerate() {
+            match bv {
+                BranchView::LineBreak => (),
+                BranchView::Header => (),
+                BranchView::CommitHeader {
+                    oid,
+                    commiter,
+                    email,
+                    date,
+                } => {
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        HASH_LENGTH as u32,
+                        SemanticTokenList::STRUCT,
+                    ));
+                    ret.push(create_semantic_token(
+                        0u32,
+                        (HASH_LENGTH + 1) as u32,
+                        *commiter as u32,
+                        SemanticTokenList::KEYWORD,
+                    ));
+                    ret.push(create_semantic_token(
+                        0u32,
+                        (commiter + 1) as u32,
+                        *email as u32,
+                        SemanticTokenList::COMMENT,
+                    ));
+                    //ret.push(create_semantic_token(0u32, (email + 1) as u32, *date as u32, SemanticTokenList::COMMENT));
+                    prev_line_token = current_line_token;
+                }
+                BranchView::MessageLine { from_oid, length } => {
+                    current_line_token = line as u32;
+                    let delta = current_line_token - prev_line_token;
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        *length as u32,
+                        SemanticTokenList::STRING,
+                    ));
+                    prev_line_token = current_line_token;
+                }
+            }
+        }
+    }
+}
+
+pub struct TodoList {
+    root: PathBuf,
+    pub todo: Container<Todo>,
+    pub view: Container<(usize, usize)>,
+}
+
+impl TodoList {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            todo: Container::new(),
+            view: Container::new(),
+        }
+    }
+
+    pub fn rebuild(&mut self) -> String {
+        self.todo.inner_mut().clear();
+        self.view.inner_mut().clear();
+        self.build()
+    }
+    pub fn build(&mut self) -> String {
+        let mut format = String::new();
+        let walker = ignore::WalkBuilder::new(&self.root).build();
+
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
+        let matcher = RegexMatcher::new(Todo::NEEDLE).unwrap(); 
+        for entry in walker {
+            entry.map(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    return;
+                }
+
+                if entry.file_name() == "ma.md"
+                    || entry.file_name() == "todo.md"
+                    || entry.file_name() == "issue.md"
+                {
+                    return;
+                }
+                let path = entry.path().strip_prefix(&self.root).unwrap();
+                let mut todo = Todo::new(path);
+                searcher.search_path(&matcher, entry.path(), &mut todo);
+                if !todo.is_empty() {
+                    self.todo.push(todo);
+                }
+            });
+        }
+        for (todo_idx, todo) in self.todo.inner().iter().enumerate() {
+            for (line_idx, line_kind) in todo.lines.inner().iter().enumerate() {
+                self.view.push((todo_idx, line_idx));
+                match line_kind {
+                    LineKind::List { content,.. } | LineKind::Title { content, .. } | LineKind::Desc { content, .. } => {
+                        format.push_str(&format!("{content}\n"));
+                    }
+                    LineKind::Anchor { location } => {
+                        format.push_str(&format!("{}\n", location.to_string_lossy()));
+                    },
+                }
+            }
+        }
+        format
+    }
+}
+
+impl TodoList {
+    fn goto_definition(&self, toolbox: ToolBox, id: RequestId, params: GotoDefinitionParams) {
+        let line = params.text_document_position_params.position.line;
+        let (from_todo, from_line) = self.view[line as usize];
+        let todo = &self.todo[from_todo];
+
+        match &todo.lines[from_line] {
+            LineKind::List { content, line }
+            | LineKind::Title { content, line }
+            | LineKind::Desc { content, line } => {
+                let response = GotoDefinitionResponse::Scalar(Location::new(
+                    name_to_url(&toolbox.office.repo.workdir().unwrap().join(&todo.path)).unwrap(),
+                    Range {
+                        start: Position::new(*line, 0),
+                        ..Default::default()
+                    },
+                ));
+                toolbox.lsp_conn.send(Kind::Main(
+                    Response {
+                        id,
+                        response_result: Ok(to_value(response).unwrap()),
+                    }
+                    .into(),
+                ));
+            }
+
+            LineKind::Anchor { location } => {
+                name_to_url(&toolbox.office.repo.workdir().unwrap().join(location)).map(|url| {
+                    let response = GotoDefinitionResponse::Scalar(Location::new(
+                        url,
+                        Range {
+                            start: Position::new(0, 0),
+                            ..Default::default()
+                        },
+                    ));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        Response {
+                            id,
+                            response_result: Ok(to_value(response).unwrap()),
+                        }
+                        .into(),
+                    ));
+                });
+            }
+        }
+    }
+
+    fn semantic_token(&self, ret: &mut Vec<SemanticToken>) {
+        let mut current_line_token = 0u32;
+        let mut prev_line_token = 0u32;
+        for (line, (todo, todo_line)) in self.view.inner().iter().enumerate() {
+            let todo = &self.todo[todo];
+            let todo_line = &todo.lines[todo_line];
+            current_line_token = line as u32;
+            let delta = current_line_token - prev_line_token;
+
+            match todo_line {
+                LineKind::Title { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::STRUCT,
+                    ));
+                }
+                LineKind::Desc { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::STRING,
+                    ));
+                }
+                LineKind::List { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::NUMBER,
+                    ));
+                }
+                LineKind::Anchor { location } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        location.to_string_lossy().len() as u32,
+                        SemanticTokenList::KEYWORD,
+                    ));
+                }
+            }
+            prev_line_token = current_line_token;
+        }
+    }
+
+    fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
+        let mut list_count = 0;
+        for line in start_line..end_line {
+            let (from_todo, from_line) = &self.view[line as usize];
+            let todo = &self.todo[from_todo];
+            let line_kind = &todo.lines[from_line]; 
+            let label = if *from_line == todo.lines.inner().len() - 1 {
+                "│└ "
+            } else {
+                "││ "
+            };
+            match line_kind {
+                LineKind::Title { content, .. } => {
+                    list_count = 0;
+                    ret.push(create_inlay_hint(line, 0, "[] "));
+                    ret.push(create_inlay_hint(
+                        line,
+                        content.len() as u32,
+                        format!(" * {}", todo.path.to_string_lossy()),
+                    ));
+                }
+                LineKind::Desc { .. } => {
+                    ret.push(create_inlay_hint(line, 0, label));
+                }
+                LineKind::List { .. } => {
+                    list_count += 1;
+                    ret.push(create_inlay_hint(line, 0, format!("{label}{list_count} ")));
+                }
+                LineKind::Anchor { location } => {
+                    ret.push(create_inlay_hint(line, 0, label));
+                }
+            }
+        }
+    }
+}
+
+pub struct Todo {
+    path: PathBuf,
+    lines: Container<LineKind>,
+}
+
+pub enum LineKind {
+    Title { content: String, line: u32 },
+    Desc { content: String, line: u32 },
+    List { content: String, line: u32 },
+    Anchor { location: PathBuf },
+}
+
+impl Todo {
+    //pub const NEEDLE: &str = r#"\[\]::|\[\] ::|""::|"" ::"#;
+    pub const NEEDLE: &str = r#"(\[\]|\|\|)\s*:"#;
+    const TITLE: &str = "[]";
+    const DESC: &str = "||";
+    const DELIMITER: &str = ":";
+    const TAG_LIST: &str = "li";
+    const TAG_ANCHOR: &str = "a";
+    pub fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            lines: Container::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.inner().is_empty()
+    }
+}
+
+impl Sink for Todo {
+    type Error = io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep::searcher::Searcher,
+        mat: &grep::searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line = String::from_utf8_lossy(mat.bytes());
+
+        let (prefix, content) = line.split_once(Self::DELIMITER).unwrap();
+        let kind = prefix.trim();
+        let line = mat.line_number().unwrap() as u32 - 1;
+        match kind {
+            _ if kind.contains(Self::TITLE) => {
+                self.lines.push(LineKind::Title {
+                    content: content.trim().to_string(),
+                    line,
+                });
+            }
+            _ if kind.contains(Self::DESC) => {
+                let clean = content.trim();
+                match clean.split_once(Self::DELIMITER) {
+                    Some((tag, payload)) => match tag {
+                        Self::TAG_ANCHOR => {
+                            self.lines.push(LineKind::Anchor {
+                                location: PathBuf::from(payload.trim()),
+                            });
+                        }
+                        Self::TAG_LIST => {
+                            self.lines.push(LineKind::List {
+                                content: payload.trim().to_string(),
+                                line,
+                            });
+                        }
+                        _ => {
+                            self.lines.push(LineKind::Desc {
+                                content: clean.to_string(),
+                                line,
+                            });
+                        }
+                    },
+                    None => {
+                        self.lines.push(LineKind::Desc {
+                            content: clean.to_string(),
+                            line,
+                        });
+                    }
+                }
+            }
+            _ => (),
+        }
+
+        Ok(true)
     }
 }

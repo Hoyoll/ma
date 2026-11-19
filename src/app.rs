@@ -2,13 +2,17 @@ use std::{collections::HashMap, fs, path::PathBuf};
 
 use crossbeam::channel::Sender;
 use git2::{Index, Oid, PackBuilderStage, Repository};
+use grep::{
+    regex::RegexMatcher,
+    searcher::{BinaryDetection, SearcherBuilder},
+};
 use lsp_server::{Message, RequestId};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
     DiagnosticServerCapabilities, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFilter, ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams, HoverParams,
-    HoverProviderCapability, InlayHintParams, OneOf, Range, SaveOptions, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+    HoverProviderCapability, InlayHintParams, OneOf, Position, Range, SaveOptions,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities,
     ShowDocumentParams, StaticRegistrationOptions, TextDocumentRegistrationOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
@@ -25,7 +29,7 @@ use serde_json::{Value, from_value, to_value};
 use crate::{
     lsp::Kind,
     util::{self, Container, name_to_url},
-    workgroup::{Diff, DiffView, Root, RootMode, ToolBox, WorkGroup},
+    workgroup::{Diff, DiffView, Root, RootMode, Todo, TodoList, ToolBox, WorkGroup},
 };
 #[repr(u32)]
 pub enum SemanticTokenList {
@@ -36,6 +40,8 @@ pub enum SemanticTokenList {
     STRUCT,
     TYPE,
     COMMENT,
+    STRING,
+    NUMBER,
 }
 
 impl SemanticTokenList {
@@ -48,6 +54,8 @@ impl SemanticTokenList {
             SemanticTokenType::STRUCT,
             SemanticTokenType::TYPE,
             SemanticTokenType::COMMENT,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
         ]
     }
 }
@@ -462,6 +470,29 @@ impl App {
                         self.work_group
                             .insert(anchor_path, (WorkGroup::Root(root), office_id));
                     }
+                    Some("todo.md") => {
+                        let root = path.parent().unwrap().strip_prefix("/").unwrap();
+                        let mut office = match Repository::open(root) {
+                            Ok(repo) => Office::new(repo),
+                            Err(_) => return,
+                        };
+                        let office_id = self.office.add(office);
+                        self.office[office_id].o_id = office_id;
+                        //let walker = ignore::WalkBuilder::new(root).build();
+                        let mut list = TodoList::new(root);
+                        let format = list.build();
+                        self.work_group
+                            .insert(anchor_path.clone(), (WorkGroup::TaskList(list), office_id));
+                        self.lsp_conn.send(Kind::Other(MaAction::FillContent {
+                            url: anchor_path,
+                            content: format,
+                            range: Range {
+                                start: Position::new(0, 0),
+                                end: Position::new(1000, 0),
+                            },
+                        }));
+                    }
+                    Some("issue.md") => {}
                     _ => (),
                 });
             }
