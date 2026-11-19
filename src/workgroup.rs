@@ -247,10 +247,8 @@ impl WorkGroup {
 
     pub fn inlay_hint(&mut self, toolbox: ToolBox, id: RequestId, params: InlayHintParams) {
         let mut ret = Vec::<InlayHint>::new();
-        //eprintln!("here!");
         match self {
             WorkGroup::Root(root) => {
-                //eprintln!("{:?}", params.range);
                 root.inlay_hint(
                     (params.range.start.line, params.range.end.line),
                     toolbox.office,
@@ -828,15 +826,12 @@ impl Root {
         office: &Office,
         ret: &mut Vec<InlayHint>,
     ) {
-        //eprintln!("hint!");
         match &self.mode {
             RootMode::CommitInput => {
-                //eprintln!("it's impossible to be here!");
                 ret.push(create_inlay_hint(0, 0, "Waiting for commit message"));
             }
             RootMode::Dashboard => {
                 for i in start_line..end_line {
-                    //eprintln!("{i}");
                     self.view.get(i as usize).map(|view| match view {
                         RootView::LineBreak => (),
                         RootView::HeadFile => {
@@ -1774,14 +1769,12 @@ impl Diff {
         view: &mut Container<DiffView>,
         format: &mut String,
     ) {
-        //diff.map(|diff| {
         let mut new_file_id = Oid::ZERO_SHA1;
         let mut old_file_id = Oid::ZERO_SHA1;
         let mut from_file = 0usize;
         let mut hunk_id = (0u32, 0u32);
         let mut hunk_line = 0u32;
         diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-            //eprintln!("{}", String::from_utf8_lossy(line.content()));
             let new_file = delta.new_file();
             let old_file = delta.old_file();
             let new_delta = new_file.id() != new_file_id || old_file.id() != old_file_id;
@@ -2512,14 +2505,11 @@ impl DiffIndex {
             IndexView::OldFile { from_file } => {
                 let path = &self.paths[from_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
-                    eprintln!("{content}");
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
 
                     let file_path = dir.join(path);
                     fs::create_dir_all(&file_path.parent().unwrap());
                     fs::write(&file_path, content);
-                    //eprintln!("{}", write.to_string());
-                    //eprintln!("{}", file_path.to_string_lossy());
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
                         Range {
@@ -2545,12 +2535,9 @@ impl DiffIndex {
                 let path = &self.paths[from_file];
                 Diff::build_old_file(toolbox.office, path, self.parent_oid).map(|content| {
                     let dir = Diff::build_commit_dir(toolbox.office, self.parent_oid);
-                    //fs::create_dir_all(&dir);
                     let file_path = dir.join(path);
 
                     fs::create_dir_all(&file_path.parent().unwrap());
-                    //eprintln!("path: {}", path.to_string_lossy());
-                    //eprintln!("line: {}", line);
                     fs::write(&file_path, content);
                     let response = GotoDefinitionResponse::Scalar(Location::new(
                         name_to_url(&file_path).unwrap(),
@@ -2584,28 +2571,20 @@ impl DiffIndex {
                     length,
                 } => {
                     let path = &self.paths[from_file];
-                    //eprintln!("first step");
-                    //eprintln!("{}", path.to_string_lossy());
                     match toolbox.office.hunk_filter.get(path) {
                         Some(hs) => match hs.get(hunk_id) {
                             Some(active) => {
-                                //eprintln!("last step");
-                                let sm = if *active {
-                                    SemanticTokenList::KEYWORD
-                                } else {
-                                    SemanticTokenList::COMMENT
-                                };
-                                current_line_token = line as u32;
-                                let delta = current_line_token - prev_line_token;
-                                ret.push(create_semantic_token(delta, 0u32, *length as u32, sm));
-                                prev_line_token = current_line_token;
+                                if !*active {
+                                    current_line_token = line as u32;
+                                    let delta = current_line_token - prev_line_token;
+                                    ret.push(create_semantic_token(delta, 0u32, *length as u32, SemanticTokenList::COMMENT));
+                                    prev_line_token = current_line_token;     
+                                } 
                             }
                             None => {
-                                //eprintln!("missed {:?}", hunk_id);
                             }
                         },
                         None => {
-                            //eprintln!("missed! {}", path.to_string_lossy());
                         }
                     }
                 }
@@ -2865,10 +2844,7 @@ impl TodoList {
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\x00'))
             .build();
-        let matcher = RegexMatcher::new(Todo::NEEDLE).unwrap();
-        // [] :: Hook it up!
-        // "" :: Lorem ipsum dorma
-        // "" :: Askdalskd
+        let matcher = RegexMatcher::new(Todo::NEEDLE).unwrap(); 
         for entry in walker {
             entry.map(|entry| {
                 if entry.file_type().unwrap().is_dir() {
@@ -2883,7 +2859,6 @@ impl TodoList {
                 }
                 let path = entry.path().strip_prefix(&self.root).unwrap();
                 let mut todo = Todo::new(path);
-                //eprintln!("{}", entry.path().to_string_lossy());
                 searcher.search_path(&matcher, entry.path(), &mut todo);
                 if !todo.is_empty() {
                     self.todo.push(todo);
@@ -2894,9 +2869,12 @@ impl TodoList {
             for (line_idx, line_kind) in todo.lines.inner().iter().enumerate() {
                 self.view.push((todo_idx, line_idx));
                 match line_kind {
-                    LineKind::Title { content, .. } | LineKind::Desc { content, .. } => {
+                    LineKind::List { content,.. } | LineKind::Title { content, .. } | LineKind::Desc { content, .. } => {
                         format.push_str(&format!("{content}\n"));
                     }
+                    LineKind::Anchor { location } => {
+                        format.push_str(&format!("{}\n", location.to_string_lossy()));
+                    },
                 }
             }
         }
@@ -2911,7 +2889,9 @@ impl TodoList {
         let todo = &self.todo[from_todo];
 
         match &todo.lines[from_line] {
-            LineKind::Title { content, line } | LineKind::Desc { content, line } => {
+            LineKind::List { content, line }
+            | LineKind::Title { content, line }
+            | LineKind::Desc { content, line } => {
                 let response = GotoDefinitionResponse::Scalar(Location::new(
                     name_to_url(&toolbox.office.repo.workdir().unwrap().join(&todo.path)).unwrap(),
                     Range {
@@ -2927,8 +2907,28 @@ impl TodoList {
                     .into(),
                 ));
             }
+
+            LineKind::Anchor { location } => {
+                name_to_url(&toolbox.office.repo.workdir().unwrap().join(location)).map(|url| {
+                    let response = GotoDefinitionResponse::Scalar(Location::new(
+                        url,
+                        Range {
+                            start: Position::new(0, 0),
+                            ..Default::default()
+                        },
+                    ));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        Response {
+                            id,
+                            response_result: Ok(to_value(response).unwrap()),
+                        }
+                        .into(),
+                    ));
+                });
+            }
         }
     }
+
     fn semantic_token(&self, ret: &mut Vec<SemanticToken>) {
         let mut current_line_token = 0u32;
         let mut prev_line_token = 0u32;
@@ -2955,18 +2955,41 @@ impl TodoList {
                         SemanticTokenList::STRING,
                     ));
                 }
+                LineKind::List { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::NUMBER,
+                    ));
+                }
+                LineKind::Anchor { location } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        location.to_string_lossy().len() as u32,
+                        SemanticTokenList::KEYWORD,
+                    ));
+                }
             }
             prev_line_token = current_line_token;
         }
     }
 
     fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
+        let mut list_count = 0;
         for line in start_line..end_line {
             let (from_todo, from_line) = &self.view[line as usize];
             let todo = &self.todo[from_todo];
-            let line_kind = &todo.lines[from_line];
+            let line_kind = &todo.lines[from_line]; 
+            let label = if *from_line == todo.lines.inner().len() - 1 {
+                "│└ "
+            } else {
+                "││ "
+            };
             match line_kind {
                 LineKind::Title { content, .. } => {
+                    list_count = 0;
                     ret.push(create_inlay_hint(line, 0, "[] "));
                     ret.push(create_inlay_hint(
                         line,
@@ -2974,12 +2997,14 @@ impl TodoList {
                         format!(" * {}", todo.path.to_string_lossy()),
                     ));
                 }
-                LineKind::Desc { content, .. } => {
-                    let label = if *from_line == todo.lines.inner().len() - 1 {
-                        "│└ "
-                    } else {
-                        "││ "
-                    };
+                LineKind::Desc { .. } => {
+                    ret.push(create_inlay_hint(line, 0, label));
+                }
+                LineKind::List { .. } => {
+                    list_count += 1;
+                    ret.push(create_inlay_hint(line, 0, format!("{label}{list_count} ")));
+                }
+                LineKind::Anchor { location } => {
                     ret.push(create_inlay_hint(line, 0, label));
                 }
             }
@@ -2995,14 +3020,18 @@ pub struct Todo {
 pub enum LineKind {
     Title { content: String, line: u32 },
     Desc { content: String, line: u32 },
+    List { content: String, line: u32 },
+    Anchor { location: PathBuf },
 }
 
 impl Todo {
     //pub const NEEDLE: &str = r#"\[\]::|\[\] ::|""::|"" ::"#;
-    pub const NEEDLE: &str = r#"(\[\]|"")\s*::"#;
+    pub const NEEDLE: &str = r#"(\[\]|\|\|)\s*:"#;
     const TITLE: &str = "[]";
-    const DESC: &str = r#""""#;
-
+    const DESC: &str = "||";
+    const DELIMITER: &str = ":";
+    const TAG_LIST: &str = "li";
+    const TAG_ANCHOR: &str = "a";
     pub fn new(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -3024,25 +3053,46 @@ impl Sink for Todo {
         mat: &grep::searcher::SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         let line = String::from_utf8_lossy(mat.bytes());
-        eprintln!("{line}");
-        let (prefix, content) = line.split_once("::").unwrap();
+
+        let (prefix, content) = line.split_once(Self::DELIMITER).unwrap();
         let kind = prefix.trim();
         let line = mat.line_number().unwrap() as u32 - 1;
-        //eprintln!("kind: {kind}");
         match kind {
             _ if kind.contains(Self::TITLE) => {
-                //eprintln!("title: {content}");
                 self.lines.push(LineKind::Title {
                     content: content.trim().to_string(),
                     line,
                 });
             }
             _ if kind.contains(Self::DESC) => {
-                //eprintln!("desc: {content}");
-                self.lines.push(LineKind::Desc {
-                    content: content.trim().to_string(),
-                    line,
-                });
+                let clean = content.trim();
+                match clean.split_once(Self::DELIMITER) {
+                    Some((tag, payload)) => match tag {
+                        Self::TAG_ANCHOR => {
+                            self.lines.push(LineKind::Anchor {
+                                location: PathBuf::from(payload.trim()),
+                            });
+                        }
+                        Self::TAG_LIST => {
+                            self.lines.push(LineKind::List {
+                                content: payload.trim().to_string(),
+                                line,
+                            });
+                        }
+                        _ => {
+                            self.lines.push(LineKind::Desc {
+                                content: clean.to_string(),
+                                line,
+                            });
+                        }
+                    },
+                    None => {
+                        self.lines.push(LineKind::Desc {
+                            content: clean.to_string(),
+                            line,
+                        });
+                    }
+                }
             }
             _ => (),
         }
