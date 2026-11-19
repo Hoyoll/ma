@@ -2820,7 +2820,13 @@ impl BranchList {
 pub struct TodoList {
     root: PathBuf,
     pub todo: Container<Todo>,
-    pub view: Container<(usize, usize)>,
+    pub view: Container<TodoView>,
+}
+
+pub enum TodoView {
+    LineBreak,
+    Header,
+    Item(usize, usize)
 }
 
 impl TodoList {
@@ -2837,8 +2843,16 @@ impl TodoList {
         self.view.inner_mut().clear();
         self.build()
     }
+
     pub fn build(&mut self) -> String {
         let mut format = String::new();
+
+        format.push_str(&self.root.to_string_lossy());
+        self.view.push(TodoView::Header);
+
+        format.push_str("\n\n");
+        self.view.push(TodoView::LineBreak);
+
         let walker = ignore::WalkBuilder::new(&self.root).build();
 
         let mut searcher = SearcherBuilder::new()
@@ -2867,7 +2881,7 @@ impl TodoList {
         }
         for (todo_idx, todo) in self.todo.inner().iter().enumerate() {
             for (line_idx, line_kind) in todo.lines.inner().iter().enumerate() {
-                self.view.push((todo_idx, line_idx));
+                self.view.push(TodoView::Item(todo_idx, line_idx));
                 match line_kind {
                     LineKind::List { content,.. } | LineKind::Title { content, .. } | LineKind::Desc { content, .. } => {
                         format.push_str(&format!("{content}\n"));
@@ -2885,7 +2899,11 @@ impl TodoList {
 impl TodoList {
     fn goto_definition(&self, toolbox: ToolBox, id: RequestId, params: GotoDefinitionParams) {
         let line = params.text_document_position_params.position.line;
-        let (from_todo, from_line) = self.view[line as usize];
+        let (from_todo, from_line) = match self.view[line as usize] {
+            TodoView::LineBreak => return,
+            TodoView::Header => return,
+            TodoView::Item(from, line) => (from, line),
+        };
         let todo = &self.todo[from_todo];
 
         match &todo.lines[from_line] {
@@ -2932,7 +2950,12 @@ impl TodoList {
     fn semantic_token(&self, ret: &mut Vec<SemanticToken>) {
         let mut current_line_token = 0u32;
         let mut prev_line_token = 0u32;
-        for (line, (todo, todo_line)) in self.view.inner().iter().enumerate() {
+        for (line, view) in self.view.inner().iter().enumerate() {
+            let (todo, todo_line) = match view {
+                TodoView::LineBreak => continue,
+                TodoView::Header => continue,
+                TodoView::Item(todo, todo_line) => (todo, todo_line),
+            };
             let todo = &self.todo[todo];
             let todo_line = &todo.lines[todo_line];
             current_line_token = line as u32;
@@ -2979,7 +3002,11 @@ impl TodoList {
     fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
         let mut list_count = 0;
         for line in start_line..end_line {
-            let (from_todo, from_line) = &self.view[line as usize];
+            let (from_todo, from_line) = match &self.view[line as usize]{
+                TodoView::LineBreak => continue,
+                TodoView::Header => continue,
+                TodoView::Item(from, line) => (from, line),
+            }; 
             let todo = &self.todo[from_todo];
             let line_kind = &todo.lines[from_line]; 
             let label = if *from_line == todo.lines.inner().len() - 1 {
