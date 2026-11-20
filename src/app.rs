@@ -9,15 +9,19 @@ use grep::{
 use lsp_server::{Message, RequestId};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeActionParams, CodeActionProviderCapability, DiagnosticOptions,
-    DiagnosticServerCapabilities, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentFilter, ExecuteCommandOptions, ExecuteCommandParams, GotoDefinitionParams, HoverParams,
-    HoverProviderCapability, InlayHintParams, OneOf, Position, Range, SaveOptions,
-    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities, ServerCapabilities,
-    ShowDocumentParams, StaticRegistrationOptions, TextDocumentRegistrationOptions,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions, WorkspaceEdit,
-    notification::{DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification},
+    DiagnosticServerCapabilities, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentFilter, ExecuteCommandOptions, ExecuteCommandParams,
+    GotoDefinitionParams, HoverParams, HoverProviderCapability, InlayHintParams, OneOf, Position,
+    Range, SaveOptions, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensRegistrationOptions, SemanticTokensServerCapabilities,
+    ServerCapabilities, ShowDocumentParams, StaticRegistrationOptions,
+    TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkDoneProgressOptions,
+    WorkspaceEdit,
+    notification::{
+        DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+        Notification,
+    },
     request::{
         ApplyWorkspaceEdit, CodeActionRequest, ExecuteCommand, GotoDefinition, HoverRequest,
         InlayHintRequest, Request, SemanticTokensFullRequest, ShowDocument,
@@ -170,6 +174,9 @@ pub enum MaAction {
         key: Uri,
         workgroup: WorkGroup,
         office_id: OfficeId,
+    },
+    DeleteWorkgroup {
+        key: Uri,
     },
     //Insert {url: Uri, content: String},
     OpenDiff {
@@ -446,6 +453,23 @@ impl App {
                     },
                 );
             }
+            DidCloseTextDocument::METHOD => {
+                serde_json::from_value(notification.params).map(
+                    |params: DidCloseTextDocumentParams| {
+                        if let Some((wg, office_id)) =
+                            self.work_group.get_mut(&params.text_document.uri)
+                        {
+                            wg.did_close(
+                                ToolBox {
+                                    office: &mut self.office[office_id],
+                                    lsp_conn: &self.lsp_conn,
+                                },
+                                params,
+                            );
+                        }
+                    },
+                );
+            }
             _ => (),
         }
     }
@@ -581,6 +605,9 @@ impl App {
                 office_id,
             } => {
                 self.work_group.insert(key, (workgroup, office_id));
+            }
+            MaAction::DeleteWorkgroup { key } => {
+                self.work_group.remove(&key);
             }
         }
     }

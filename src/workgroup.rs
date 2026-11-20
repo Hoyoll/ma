@@ -5,15 +5,15 @@ use git2::{
 };
 use grep::{
     regex::RegexMatcher,
-    searcher::{BinaryDetection, SearcherBuilder, Sink},
+    searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink},
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, Diagnostic,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, InlayHint, InlayHintParams, Location, Position, Range,
-    SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult, ShowDocumentParams,
-    TextDocumentPositionParams, Uri,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InlayHint, InlayHintParams,
+    Location, Position, Range, SemanticToken, SemanticTokens, SemanticTokensParams,
+    SemanticTokensResult, ShowDocumentParams, TextDocumentPositionParams, Uri,
     notification::PublishDiagnostics,
     request::{
         DocumentDiagnosticRequest, InlayHintRefreshRequest, Request, SemanticTokensRefresh,
@@ -188,6 +188,24 @@ impl WorkGroup {
     }
 
     pub fn did_open(&mut self, toolbox: ToolBox, params: DidOpenTextDocumentParams) {}
+
+    pub fn did_close(&mut self, toolbox: ToolBox, params: DidCloseTextDocumentParams) {
+        match self {
+            WorkGroup::Root(root) => (),
+            WorkGroup::Diff(diff) => (),
+            WorkGroup::MergeConflict(merge_conflict) => (),
+            WorkGroup::DiffIndex(diff_index) => {
+                toolbox.office.hunk_filter.clear();
+                toolbox
+                    .lsp_conn
+                    .send(Kind::Other(MaAction::DeleteWorkgroup {
+                        key: params.text_document.uri,
+                    }));
+            }
+            WorkGroup::TaskList(todo_list) => (),
+            WorkGroup::BranchList(branch_list) => (),
+        }
+    }
 }
 
 impl WorkGroup {
@@ -1150,7 +1168,7 @@ impl Root {
                     //return;
                 }
                 RootView::TagLabel => (),
-                
+
                 // []:: Tag Extravaganza
                 // li:: Remove
                 //  +:: Add a way to remove a tag!
@@ -1258,7 +1276,7 @@ impl Root {
                 }));
             }
             // []:: Tag Input Cancel Mechanism
-            //  +:: Add a way to cancel tagging a commit 
+            //  +:: Add a way to cancel tagging a commit
             RootMode::TagInput { oid } => (),
         }
     }
@@ -1785,7 +1803,7 @@ impl Diff {
     }
 
     // [] :: Diff bullshit,
-    //  + :: Find a way so you can use `-` section of the diff 
+    //  + :: Find a way so you can use `-` section of the diff
     //  + :: to go the the past file too
     pub fn fill_view(
         diff: &git2::Diff,
@@ -2601,15 +2619,18 @@ impl DiffIndex {
                                 if !*active {
                                     current_line_token = line as u32;
                                     let delta = current_line_token - prev_line_token;
-                                    ret.push(create_semantic_token(delta, 0u32, *length as u32, SemanticTokenList::COMMENT));
-                                    prev_line_token = current_line_token;     
-                                } 
+                                    ret.push(create_semantic_token(
+                                        delta,
+                                        0u32,
+                                        *length as u32,
+                                        SemanticTokenList::COMMENT,
+                                    ));
+                                    prev_line_token = current_line_token;
+                                }
                             }
-                            None => {
-                            }
+                            None => {}
                         },
-                        None => {
-                        }
+                        None => {}
                     }
                 }
                 IndexView::NewLine {
@@ -2843,6 +2864,7 @@ impl BranchList {
 
 pub struct TodoList {
     root: PathBuf,
+    //searcher: Searcher,
     pub todo: Container<Todo>,
     pub view: Container<TodoView>,
 }
@@ -2850,13 +2872,15 @@ pub struct TodoList {
 pub enum TodoView {
     LineBreak,
     Header,
-    Item(usize, usize)
+    Item(usize, usize),
 }
 
 impl TodoList {
     pub fn new(root: &Path) -> Self {
+        
         Self {
             root: root.to_path_buf(),
+            //searcher,
             todo: Container::new(),
             view: Container::new(),
         }
@@ -2874,15 +2898,14 @@ impl TodoList {
         format.push_str(&self.root.to_string_lossy());
         self.view.push(TodoView::Header);
 
-        format.push_str("\n\n");
-        self.view.push(TodoView::LineBreak);
+        format.push_str("\n");
+        //self.view.push(TodoView::LineBreak);
 
         let walker = ignore::WalkBuilder::new(&self.root).build();
-
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\x00'))
             .build();
-        let matcher = RegexMatcher::new(Todo::NEEDLE).unwrap(); 
+        let matcher = RegexMatcher::new(Todo::NEEDLE).unwrap();
         for entry in walker {
             entry.map(|entry| {
                 if entry.file_type().unwrap().is_dir() {
@@ -2903,16 +2926,31 @@ impl TodoList {
                 }
             });
         }
+
         for (todo_idx, todo) in self.todo.inner().iter().enumerate() {
             for (line_idx, line_kind) in todo.lines.inner().iter().enumerate() {
-                self.view.push(TodoView::Item(todo_idx, line_idx));
                 match line_kind {
-                    LineKind::List { content,.. } | LineKind::Title { content, .. } | LineKind::Desc { content, .. } => {
+                    LineKind::List { content, .. } | LineKind::Desc { content, .. } => {
+                        self.view.push(TodoView::Item(todo_idx, line_idx));
+
                         format.push_str(&format!("{content}\n"));
                     }
-                    LineKind::Anchor { location } => {
-                        format.push_str(&format!("{}\n", location.to_string_lossy()));
-                    },
+                    LineKind::Title { content, .. } => {
+                        format.push_str("\n");
+                        self.view.push(TodoView::LineBreak);
+
+                        self.view.push(TodoView::Item(todo_idx, line_idx));
+                        format.push_str(&format!("{content}\n"));
+                        //self.view.push(TodoView::Item((), ()));
+                    }
+                    LineKind::Anchor { location, needle } => {
+                        self.view.push(TodoView::Item(todo_idx, line_idx));
+                        if let Some(needle) = needle {
+                            format.push_str(&format!("{}:{needle}\n", location.to_string_lossy()));
+                        } else {
+                            format.push_str(&format!("{}\n", location.to_string_lossy()));
+                        }
+                    }
                 }
             }
         }
@@ -2921,7 +2959,7 @@ impl TodoList {
 }
 
 impl TodoList {
-    fn goto_definition(&self, toolbox: ToolBox, id: RequestId, params: GotoDefinitionParams) {
+    fn goto_definition(&mut self, toolbox: ToolBox, id: RequestId, params: GotoDefinitionParams) {
         let line = params.text_document_position_params.position.line;
         let (from_todo, from_line) = match self.view[line as usize] {
             TodoView::LineBreak => return,
@@ -2935,35 +2973,54 @@ impl TodoList {
             | LineKind::Title { content, line }
             | LineKind::Desc { content, line } => {
                 //eprintln!("{}", &toolbox.office.repo.workdir().unwrap().join(&todo.path).to_string_lossy());
-                
+
                 name_to_url(&toolbox.office.repo.workdir().unwrap().join(&todo.path)).map(|uri| {
                     let response = GotoDefinitionResponse::Scalar(Location::new(
-                    uri,
-                    Range {
-                        start: Position::new(*line, 0),
-                        ..Default::default()
-                    },
-                ));
-                toolbox.lsp_conn.send(Kind::Main(
-                    Response {
-                        id,
-                        response_result: Ok(to_value(response).unwrap()),
-                    }
-                    .into(),
-                ));
-                });
-                
-            }
-
-            LineKind::Anchor { location } => {
-                name_to_url(&toolbox.office.repo.workdir().unwrap().join(location)).map(|url| {
-                    let response = GotoDefinitionResponse::Scalar(Location::new(
-                        url,
+                        uri,
                         Range {
-                            start: Position::new(0, 0),
+                            start: Position::new(*line, 0),
                             ..Default::default()
                         },
                     ));
+                    toolbox.lsp_conn.send(Kind::Main(
+                        Response {
+                            id,
+                            response_result: Ok(to_value(response).unwrap()),
+                        }
+                        .into(),
+                    ));
+                });
+            }
+
+            LineKind::Anchor { location, needle } => {
+                let abs_path = toolbox.office.repo.workdir().unwrap().join(location);
+                let mut searcher = SearcherBuilder::new()
+                    .binary_detection(BinaryDetection::quit(b'\x00'))
+                    .build();
+                name_to_url(&abs_path).map(|url| {
+                    let response = match needle {
+                        Some(needle) => {
+                            let matcher = RegexMatcher::new(needle).unwrap();
+                            let mut anchor = Anchor {
+                                url,
+                                response: None,
+                            };
+                            searcher.search_path(
+                                &matcher,
+                                &self.root.join(location),
+                                &mut anchor,
+                            );
+                            anchor.response
+                        }
+                        None => Some(GotoDefinitionResponse::Scalar(Location::new(
+                            url,
+                            Range {
+                                start: Position::new(line, 0),
+                                ..Default::default()
+                            },
+                        ))),
+                    };
+
                     toolbox.lsp_conn.send(Kind::Main(
                         Response {
                             id,
@@ -3015,7 +3072,7 @@ impl TodoList {
                         SemanticTokenList::NUMBER,
                     ));
                 }
-                LineKind::Anchor { location } => {
+                LineKind::Anchor { location, .. } => {
                     ret.push(create_semantic_token(
                         delta,
                         0u32,
@@ -3031,13 +3088,19 @@ impl TodoList {
     fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
         let mut list_count = 0;
         for line in start_line..end_line {
-            let (from_todo, from_line) = match &self.view[line as usize]{
-                TodoView::LineBreak => continue,
-                TodoView::Header => continue,
+            let (from_todo, from_line) = match &self.view[line as usize] {
+                TodoView::LineBreak => {
+                    ret.push(create_inlay_hint(line, 0, "││"));
+                    continue;
+                }
+                TodoView::Header => {
+                    ret.push(create_inlay_hint(line, 0, "() "));
+                    continue;
+                }
                 TodoView::Item(from, line) => (from, line),
-            }; 
+            };
             let todo = &self.todo[from_todo];
-            let line_kind = &todo.lines[from_line]; 
+            let line_kind = &todo.lines[from_line];
             let label = if *from_line == todo.lines.inner().len() - 1 {
                 "│└ "
             } else {
@@ -3060,7 +3123,7 @@ impl TodoList {
                     list_count += 1;
                     ret.push(create_inlay_hint(line, 0, format!("{label}{list_count} ")));
                 }
-                LineKind::Anchor { location } => {
+                LineKind::Anchor { location, needle } => {
                     ret.push(create_inlay_hint(line, 0, label));
                 }
             }
@@ -3074,10 +3137,27 @@ pub struct Todo {
 }
 
 pub enum LineKind {
-    Title { content: String, line: u32 },
-    Desc { content: String, line: u32 },
-    List { content: String, line: u32 },
-    Anchor { location: PathBuf },
+    Title {
+        content: String,
+        line: u32,
+    },
+    Desc {
+        content: String,
+        line: u32,
+    },
+    List {
+        content: String,
+        line: u32,
+    },
+    Anchor {
+        location: PathBuf,
+        needle: Option<String>,
+    },
+}
+
+pub struct Anchor {
+    url: Uri,
+    response: Option<GotoDefinitionResponse>,
 }
 
 impl Todo {
@@ -3087,7 +3167,7 @@ impl Todo {
     const TAG_LIST: &str = "li";
     const TAG_ANCHOR: &str = "a";
     const DELIMITER: &str = "::";
-    
+
     pub fn new(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -3123,17 +3203,73 @@ impl Sink for Todo {
                 self.lines.push(LineKind::Desc {
                     content: content.trim().to_string(),
                     line,
-                }); 
+                });
             }
             _ if kind.contains(Self::TAG_LIST) => {
-                self.lines.push(LineKind::List { content: content.trim().to_string(), line });
+                self.lines.push(LineKind::List {
+                    content: content.trim().to_string(),
+                    line,
+                });
             }
             _ if kind.contains(Self::TAG_ANCHOR) => {
-                self.lines.push(LineKind::Anchor { location: PathBuf::from(content.trim()) });
+                //let needle = None;
+                let (location, needle) = match content.split_once(":") {
+                    Some((path, needle)) => (
+                        PathBuf::from(path.trim().to_string()),
+                        Some(needle.trim().to_string()),
+                    ),
+                    None => (PathBuf::from(content.trim()), None),
+                };
+                self.lines.push(LineKind::Anchor { location, needle });
             }
             _ => (),
         }
 
+        Ok(true)
+    }
+}
+
+impl Sink for Anchor {
+    type Error = io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        mat: &grep::searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line = (mat.line_number().unwrap() - 1) as u32;
+        match &mut self.response {
+            Some(GotoDefinitionResponse::Scalar(location)) => {
+                let mut array = vec![location.clone()];
+                array.push(Location {
+                    uri: self.url.clone(),
+                    range: Range {
+                        start: Position::new(line, 0),
+                        end: Position::default(),
+                    },
+                });
+                self.response = Some(GotoDefinitionResponse::Array(array));
+            }
+            Some(GotoDefinitionResponse::Array(array)) => {
+                array.push(Location {
+                    uri: self.url.clone(),
+                    range: Range {
+                        start: Position::new(line, 0),
+                        end: Position::default(),
+                    },
+                });
+            }
+            Some(GotoDefinitionResponse::Link(link)) => (),
+            None => {
+                self.response = Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: self.url.clone(),
+                    range: Range {
+                        start: Position::new(line, 0),
+                        end: Position::default(),
+                    },
+                }));
+            }
+        }
         Ok(true)
     }
 }
