@@ -16,6 +16,26 @@ pub struct Connection<Right> {
     pub receiver: Receiver<Kind<Message, Right>>,
 }
 
+impl<Right> Connection<Right> {
+    pub fn combo_req<const NUM: usize>(
+        req: [(impl Into<String>, impl Into<serde_json::Value>); NUM],
+        conn: &Sender<Kind<Message, Right>>,
+    ) {
+        let mut id = 1;
+        for (method, params) in req {
+            conn.send(Kind::Main(
+                lsp_server::Request {
+                    id: RequestId::from(id),
+                    method: method.into(),
+                    params: params.into(),
+                }
+                .into(),
+            ));
+            id += 1;
+        }
+    }
+}
+
 impl<Right: 'static + Send + Sync> Connection<Right> {
     pub fn stdio() -> (Self, IoThreads) {
         let (sender, receiver, io_threads) = stdio_transport::<Right>();

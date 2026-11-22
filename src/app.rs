@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_value, to_value};
 
 use crate::{
-    lsp::Kind,
+    lsp::{Connection, Kind},
     util::{self, Container, name_to_url},
     workgroup::{Diff, DiffView, Root, RootMode, Todo, TodoList, ToolBox, WorkGroup},
 };
@@ -476,9 +476,6 @@ impl App {
 
     pub fn ma_action(&mut self, action: MaAction) {
         match action {
-            // !!:: Too convoluted!
-            //  +:: Maybe simplify it?
-            //  +:: Like, give self.lsp_conn a it's own special impl? 
             MaAction::Init { anchor_path } => {
                 let path = PathBuf::from(anchor_path.path().as_str());
                 path.file_name().map(|file_name| match file_name.to_str() {
@@ -488,32 +485,61 @@ impl App {
                             Ok(repo) => Office::new(repo),
                             Err(e) => {
                                 eprintln!("repo not found! {}", e.to_string());
-                                return
-                            },
+                                return;
+                            }
                         };
                         let old_ma = office.repo.path().join(Self::NAME);
                         fs::remove_dir_all(&old_ma);
                         fs::create_dir_all(&old_ma);
-                        
+
                         let anchor_path = name_to_url(&old_ma.join("ma.md")).unwrap();
-                        
+
                         //fs::write(&new_ma, "");
                         let mut root = Root::new();
                         root.fill_root(&mut office);
                         root.build_view();
                         let office_id = self.office.add(office);
                         self.office[office_id].o_id = office_id;
-                        self.lsp_conn.send(Kind::Main(lsp_server::Request {
-                            id: RequestId::from(1),
-                            method: ShowDocument::METHOD.into(),
-                            params: to_value(ShowDocumentParams {
-                                uri: anchor_path.clone(),
-                                external: None,
-                                take_focus: Some(true),
-                                selection: None,
-                            }).unwrap_or_default(),
-                        }.into()));
-                        root.refresh(anchor_path.clone(), &self.lsp_conn);
+                        Connection::combo_req(
+                            [
+                                (
+                                    ShowDocument::METHOD,
+                                    to_value(ShowDocumentParams {
+                                        uri: anchor_path.clone(),
+                                        external: None,
+                                        take_focus: Some(true),
+                                        selection: None,
+                                    })
+                                    .unwrap_or_default(),
+                                ),
+                                (
+                                    ApplyWorkspaceEdit::METHOD,
+                                    to_value({
+                                        let mut wf = HashMap::new();
+                                        wf.insert(
+                                            anchor_path.clone(),
+                                            vec![TextEdit {
+                                                new_text: root.format(),
+                                                range: Range {
+                                                    start: Position::new(1000, 0),
+                                                    end: Position::default(),
+                                                },
+                                            }],
+                                        );
+                                        ApplyWorkspaceEditParams {
+                                            label: None,
+                                            edit: WorkspaceEdit {
+                                                changes: Some(wf),
+                                                ..Default::default()
+                                            },
+                                        }
+                                    })
+                                    .unwrap(),
+                                ),
+                            ],
+                            &self.lsp_conn,
+                        );
+                        //root.refresh(anchor_path.clone(), &self.lsp_conn);
                         self.work_group
                             .insert(anchor_path, (WorkGroup::Root(root), office_id));
                     }
@@ -527,35 +553,55 @@ impl App {
                         //eprintln!("")
                         fs::remove_dir_all(&old_ma);
                         fs::create_dir_all(&old_ma);
-                        
-                        let anchor_path = name_to_url(&old_ma.join("todo.md")).unwrap();                        
+
+                        let anchor_path = name_to_url(&old_ma.join("todo.md")).unwrap();
 
                         let office_id = self.office.add(office);
                         self.office[office_id].o_id = office_id;
                         //let walker = ignore::WalkBuilder::new(root).build();
                         let mut list = TodoList::new(root);
                         let format = list.build();
-                        self.lsp_conn.send(Kind::Main(lsp_server::Request {
-                            id: RequestId::from(1),
-                            method: ShowDocument::METHOD.into(),
-                            params: to_value(ShowDocumentParams {
-                                uri: anchor_path.clone(),
-                                external: None,
-                                take_focus: Some(true),
-                                selection: None,
-                            }).unwrap_or_default(),
-                        }.into()));
-                        self.lsp_conn.send(Kind::Other(MaAction::FillContent {
-                            url: anchor_path.clone(),
-                            content: format,
-                            range: Range {
-                                start: Position::new(0, 0),
-                                end: Position::new(1000, 0),
-                            },
-                        }));
+                        Connection::combo_req(
+                            [
+                                (
+                                    ShowDocument::METHOD,
+                                    to_value(ShowDocumentParams {
+                                        uri: anchor_path.clone(),
+                                        external: None,
+                                        take_focus: Some(true),
+                                        selection: None,
+                                    })
+                                    .unwrap_or_default(),
+                                ),
+                                (
+                                    ApplyWorkspaceEdit::METHOD,
+                                    to_value({
+                                        let mut wf = HashMap::new();
+                                        wf.insert(
+                                            anchor_path.clone(),
+                                            vec![TextEdit {
+                                                new_text: format,
+                                                range: Range {
+                                                    start: Position::new(1000, 0),
+                                                    end: Position::default(),
+                                                },
+                                            }],
+                                        );
+                                        ApplyWorkspaceEditParams {
+                                            label: None,
+                                            edit: WorkspaceEdit {
+                                                changes: Some(wf),
+                                                ..Default::default()
+                                            },
+                                        }
+                                    })
+                                    .unwrap(),
+                                ),
+                            ],
+                            &self.lsp_conn,
+                        );
                         self.work_group
                             .insert(anchor_path, (WorkGroup::TaskList(list), office_id));
-
                     }
                     Some("issue.md") => {}
                     _ => (),

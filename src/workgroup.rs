@@ -1,7 +1,7 @@
 use crossbeam::channel::Sender;
 use git2::{
-    ApplyOptions, BranchType, Commit, Index, IndexAddOption, MergeAnalysis, Oid,
-    PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Sort, Status, StatusOptions,
+    ApplyOptions, BranchType, Commit, Index, IndexAddOption, MergeAnalysis, Oid, PackBuilderStage,
+    PushOptions, RemoteCallbacks, Repository, Sort, Status, StatusOptions,
 };
 use grep::{
     regex::RegexMatcher,
@@ -9,14 +9,12 @@ use grep::{
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
-    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InlayHint, InlayHintParams,
-    Location, Position, Range, SemanticToken, SemanticTokens, SemanticTokensParams,
-    SemanticTokensResult, ShowDocumentParams, TextDocumentPositionParams, Uri,
-    request::{
-        InlayHintRefreshRequest, Request, SemanticTokensRefresh,
-        ShowDocument,
-    },
+    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, InlayHint, InlayHintParams, Location, Position, Range,
+    SemanticToken, SemanticTokens, SemanticTokensParams, SemanticTokensResult, ShowDocumentParams,
+    TextDocumentPositionParams, Uri,
+    request::{InlayHintRefreshRequest, Request, SemanticTokensRefresh, ShowDocument},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_value;
@@ -634,7 +632,7 @@ impl Root {
         });
     }
 
-    pub fn refresh(&self, url: Uri, lsp_conn: &Sender<Kind<Message, MaAction>>) { 
+    pub fn refresh(&self, url: Uri, lsp_conn: &Sender<Kind<Message, MaAction>>) {
         lsp_conn.send(Kind::Other(MaAction::FillContent {
             url,
             content: self.format(),
@@ -1272,9 +1270,17 @@ impl Root {
                     .into(),
                 }));
             }
-            // []:: Tag Input Cancel Mechanism
-            //  +:: Add a way to cancel tagging a commit
-            RootMode::TagInput { oid } => (),
+            RootMode::TagInput { .. } => { 
+                ret.push(CodeActionOrCommand::Command(Command {
+                    title: "Cancel tagging".into(),
+                    command: MaAction::COMMAND.into(),
+                    arguments: app::Command::ChangeRootMode {
+                        uri: params.text_document.uri,
+                        mode: RootMode::Dashboard,
+                    }
+                    .into(),
+                }));
+            },
         }
     }
 }
@@ -2874,7 +2880,6 @@ pub enum TodoView {
 
 impl TodoList {
     pub fn new(root: &Path) -> Self {
-        
         Self {
             root: root.to_path_buf(),
             //searcher,
@@ -2932,7 +2937,7 @@ impl TodoList {
 
                         format.push_str(&format!("{content}\n"));
                     }
-                    LineKind::Title { content, .. } | LineKind::Issue { content,.. } => {
+                    LineKind::Title { content, .. } | LineKind::Issue { content, .. } => {
                         format.push_str("\n");
                         self.view.push(TodoView::LineBreak);
 
@@ -3003,11 +3008,7 @@ impl TodoList {
                                 url,
                                 response: None,
                             };
-                            searcher.search_path(
-                                &matcher,
-                                &self.root.join(location),
-                                &mut anchor,
-                            );
+                            searcher.search_path(&matcher, &self.root.join(location), &mut anchor);
                             anchor.response
                         }
                         None => Some(GotoDefinitionResponse::Scalar(Location::new(
@@ -3085,7 +3086,7 @@ impl TodoList {
                         content.len() as u32,
                         SemanticTokenList::STRUCT,
                     ));
-                },
+                }
             }
             prev_line_token = current_line_token;
         }
@@ -3108,7 +3109,7 @@ impl TodoList {
                 TodoView::Item(from, line) => (from, line),
             };
             let todo = &self.todo[from_todo];
-            let line_kind = &todo.lines[from_line]; 
+            let line_kind = &todo.lines[from_line];
             match line_kind {
                 LineKind::Title { content, .. } => {
                     list_count = 0;
