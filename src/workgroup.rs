@@ -1,6 +1,6 @@
 use crossbeam::channel::Sender;
 use git2::{
-    ApplyOptions, BranchType, Commit, Delta, Index, IndexAddOption, MergeAnalysis, Oid,
+    ApplyOptions, BranchType, Commit, Index, IndexAddOption, MergeAnalysis, Oid,
     PackBuilderStage, PushOptions, RemoteCallbacks, Repository, Sort, Status, StatusOptions,
 };
 use grep::{
@@ -9,14 +9,12 @@ use grep::{
 };
 use lsp_server::{Message, RequestId, Response};
 use lsp_types::{
-    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, Diagnostic,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command, DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InlayHint, InlayHintParams,
     Location, Position, Range, SemanticToken, SemanticTokens, SemanticTokensParams,
     SemanticTokensResult, ShowDocumentParams, TextDocumentPositionParams, Uri,
-    notification::PublishDiagnostics,
     request::{
-        DocumentDiagnosticRequest, InlayHintRefreshRequest, Request, SemanticTokensRefresh,
+        InlayHintRefreshRequest, Request, SemanticTokensRefresh,
         ShowDocument,
     },
 };
@@ -26,15 +24,14 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fs,
-    io::{self, BufRead},
+    io::{self},
     path::{Path, PathBuf},
     process,
-    str::FromStr,
     thread::spawn,
 };
 
 use crate::{
-    app::{self, App, GitPush, HunkFilter, HunkId, MaAction, Office, Progress, SemanticTokenList},
+    app::{self, App, GitPush, HunkFilter, HunkId, MaAction, Office, SemanticTokenList},
     lsp::Kind,
     util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
@@ -637,7 +634,7 @@ impl Root {
         });
     }
 
-    pub fn refresh(&self, url: Uri, lsp_conn: &Sender<Kind<Message, MaAction>>) {
+    pub fn refresh(&self, url: Uri, lsp_conn: &Sender<Kind<Message, MaAction>>) { 
         lsp_conn.send(Kind::Other(MaAction::FillContent {
             url,
             content: self.format(),
@@ -2935,7 +2932,7 @@ impl TodoList {
 
                         format.push_str(&format!("{content}\n"));
                     }
-                    LineKind::Title { content, .. } => {
+                    LineKind::Title { content, .. } | LineKind::Issue { content,.. } => {
                         format.push_str("\n");
                         self.view.push(TodoView::LineBreak);
 
@@ -2971,6 +2968,7 @@ impl TodoList {
         match &todo.lines[from_line] {
             LineKind::List { content, line }
             | LineKind::Title { content, line }
+            | LineKind::Issue { content, line }
             | LineKind::Desc { content, line } => {
                 //eprintln!("{}", &toolbox.office.repo.workdir().unwrap().join(&todo.path).to_string_lossy());
 
@@ -3077,9 +3075,17 @@ impl TodoList {
                         delta,
                         0u32,
                         location.to_string_lossy().len() as u32,
-                        SemanticTokenList::KEYWORD,
+                        SemanticTokenList::NAMESPACE,
                     ));
                 }
+                LineKind::Issue { content, line } => {
+                    ret.push(create_semantic_token(
+                        delta,
+                        0u32,
+                        content.len() as u32,
+                        SemanticTokenList::STRUCT,
+                    ));
+                },
             }
             prev_line_token = current_line_token;
         }
@@ -3087,28 +3093,26 @@ impl TodoList {
 
     fn inlay_hint(&self, (start_line, end_line): (u32, u32), ret: &mut Vec<InlayHint>) {
         let mut list_count = 0;
+        let mut label_inside_list = 0;
+        const DESC_GUTTER: [&str; 2] = ["   ", "     "];
         for line in start_line..end_line {
             let (from_todo, from_line) = match &self.view[line as usize] {
                 TodoView::LineBreak => {
-                    ret.push(create_inlay_hint(line, 0, "││"));
+                    //ret.push(create_inlay_hint(line, 0, "││"));
                     continue;
                 }
                 TodoView::Header => {
-                    ret.push(create_inlay_hint(line, 0, "() "));
+                    ret.push(create_inlay_hint(line, 0, "[] "));
                     continue;
                 }
                 TodoView::Item(from, line) => (from, line),
             };
             let todo = &self.todo[from_todo];
-            let line_kind = &todo.lines[from_line];
-            let label = if *from_line == todo.lines.inner().len() - 1 {
-                "│└ "
-            } else {
-                "││ "
-            };
+            let line_kind = &todo.lines[from_line]; 
             match line_kind {
                 LineKind::Title { content, .. } => {
                     list_count = 0;
+                    label_inside_list = 0;
                     ret.push(create_inlay_hint(line, 0, "[] "));
                     ret.push(create_inlay_hint(
                         line,
@@ -3116,15 +3120,26 @@ impl TodoList {
                         format!(" * {}", todo.path.to_string_lossy()),
                     ));
                 }
+                LineKind::Issue { content, .. } => {
+                    list_count = 0;
+                    label_inside_list = 0;
+                    ret.push(create_inlay_hint(line, 0, "!! "));
+                    ret.push(create_inlay_hint(
+                        line,
+                        content.len() as u32,
+                        format!(" * {}", todo.path.to_string_lossy()),
+                    ));
+                }
                 LineKind::Desc { .. } => {
-                    ret.push(create_inlay_hint(line, 0, label));
+                    ret.push(create_inlay_hint(line, 0, DESC_GUTTER[label_inside_list]));
                 }
                 LineKind::List { .. } => {
                     list_count += 1;
-                    ret.push(create_inlay_hint(line, 0, format!("{label}{list_count} ")));
+                    label_inside_list = 1;
+                    ret.push(create_inlay_hint(line, 0, format!("   {list_count} ")));
                 }
                 LineKind::Anchor { location, needle } => {
-                    ret.push(create_inlay_hint(line, 0, label));
+                    ret.push(create_inlay_hint(line, 0, "   "));
                 }
             }
         }
@@ -3138,6 +3153,10 @@ pub struct Todo {
 
 pub enum LineKind {
     Title {
+        content: String,
+        line: u32,
+    },
+    Issue {
         content: String,
         line: u32,
     },
@@ -3161,8 +3180,9 @@ pub struct Anchor {
 }
 
 impl Todo {
-    pub const NEEDLE: &str = r#"(\[\]|\+|li|a)\s*::"#;
+    pub const NEEDLE: &str = r#"(\[\]|\+|li|a|!!)\s*::"#;
     const TAG_TITLE: &str = "[]";
+    const TAG_ISSUE: &str = "!!";
     const TAG_DESC: &str = "+";
     const TAG_LIST: &str = "li";
     const TAG_ANCHOR: &str = "a";
@@ -3195,6 +3215,12 @@ impl Sink for Todo {
         match kind {
             _ if kind.contains(Self::TAG_TITLE) => {
                 self.lines.push(LineKind::Title {
+                    content: content.trim().to_string(),
+                    line,
+                });
+            }
+            _ if kind.contains(Self::TAG_ISSUE) => {
+                self.lines.push(LineKind::Issue {
                     content: content.trim().to_string(),
                     line,
                 });
