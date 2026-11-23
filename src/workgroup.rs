@@ -30,7 +30,7 @@ use std::{
 
 use crate::{
     app::{self, App, GitPush, HunkFilter, HunkId, MaAction, Office, SemanticTokenList},
-    lsp::Kind,
+    lsp::{Connection, Kind},
     util::{self, Container, create_inlay_hint, create_semantic_token, name_to_url},
 };
 
@@ -40,8 +40,6 @@ impl WorkGroup {
             WorkGroup::Root(root) => match &mut root.mode {
                 RootMode::Dashboard => (),
                 RootMode::CommitInput => {
-                    //ApplyOptions::new()
-                    //toolbox.office.repo.apply_to_tree(tree, diff, options)
                     let author = toolbox.office.repo.author_from_env().unwrap();
                     let committer = toolbox.office.repo.committer_from_env().unwrap();
                     let mut index = toolbox.office.repo.index().unwrap();
@@ -166,6 +164,31 @@ impl WorkGroup {
                         }));
                     }
                 }
+                RootMode::RemoteInput => {
+                    let input = match params.text {
+                        Some(text) => text,
+                        None => return,
+                    };
+                    let mut line = input.lines();
+                    let name = match line.next() {
+                        Some(name) => name,
+                        None => return,
+                    };
+                    let url = match line.next() {
+                        Some(url) => url,
+                        None => return,
+                    };
+                    if let Err(e) = toolbox.office.repo.remote(name, url) {
+                        return eprintln!("{}", e.to_string());
+                    }
+                    toolbox.lsp_conn.send(Kind::Other(MaAction::Command {
+                        command: app::Command::ChangeRootMode {
+                            uri: params.text_document.uri,
+                            mode: RootMode::Dashboard,
+                        },
+                    }));
+                }
+                RootMode::BranchInput => todo!(),
             },
             WorkGroup::TaskList(tl) => {
                 let format = tl.rebuild();
@@ -404,6 +427,8 @@ pub enum RootMode {
     Dashboard,
     CommitInput,
     TagInput { oid: usize },
+    RemoteInput,
+    BranchInput,
 }
 
 enum RootView {
@@ -516,32 +541,8 @@ impl Root {
         });
     }
 
-    fn fill_status_new(&mut self, office: &Office) {
-        self.status.inner_mut().clear();
-        let root = office.repo.workdir().unwrap();
-        let walker = ignore::WalkBuilder::new(root).build();
-        for entry in walker {
-            entry.map(|entry| {
-                if entry.file_type().unwrap().is_dir() {
-                    return;
-                }
-
-                if entry.file_name() == "ma.md" {
-                    return;
-                }
-                let path = entry.path().strip_prefix(root).unwrap();
-                office.repo.status_file(path).map(|status| {
-                    self.status.push((path.to_path_buf(), status));
-                });
-            });
-        }
-    }
     pub fn fill_status(&mut self, office: &Office) {
-        //self.fill_status_new(office);
-        //return;
         self.status.inner_mut().clear();
-        //office.repo.status_file(path)
-
         office
             .repo
             .statuses(Some(
@@ -993,6 +994,13 @@ impl Root {
                 ret.push(create_inlay_hint(0, 0, "Tag name: "));
                 ret.push(create_inlay_hint(1, 0, "Tag message: "));
             }
+            RootMode::RemoteInput => {
+                ret.push(create_inlay_hint(0, 0, "Remote name: "));
+                ret.push(create_inlay_hint(1, 0, "Remote url: "));
+            }
+            RootMode::BranchInput => {
+                ret.push(create_inlay_hint(0, 0, "Insert branch name: "));
+            }
         }
     }
 
@@ -1140,6 +1148,15 @@ impl Root {
                         command: MaAction::COMMAND.into(),
                         arguments: Some(vec),
                     }));
+                    ret.push(CodeActionOrCommand::Command(Command {
+                        title: "Add new remote".into(),
+                        command: MaAction::COMMAND.into(),
+                        arguments: app::Command::ChangeRootMode {
+                            uri: params.text_document.uri,
+                            mode: RootMode::RemoteInput,
+                        }
+                        .into(),
+                    }));
                 }
                 // []:: Remote Extravaganza!
                 // li:: Register
@@ -1270,7 +1287,7 @@ impl Root {
                     .into(),
                 }));
             }
-            RootMode::TagInput { .. } => { 
+            RootMode::TagInput { .. } => {
                 ret.push(CodeActionOrCommand::Command(Command {
                     title: "Cancel tagging".into(),
                     command: MaAction::COMMAND.into(),
@@ -1280,7 +1297,9 @@ impl Root {
                     }
                     .into(),
                 }));
-            },
+            }
+            RootMode::RemoteInput => todo!(),
+            RootMode::BranchInput => todo!(),
         }
     }
 }
@@ -1505,20 +1524,19 @@ impl WorkGroup {
                 if index.has_conflicts() {
                     //index.conflicts();
                     let url = MergeConflict::build(index, (&ours, &theirs, &ancestor), &toolbox);
-                    toolbox.lsp_conn.send(Kind::Main(
-                        lsp_server::Request {
-                            id: RequestId::from(1),
-                            method: ShowDocument::METHOD.into(),
-                            params: to_value(ShowDocumentParams {
+                    Connection::combo_req(
+                        [(
+                            ShowDocument::METHOD,
+                            to_value(ShowDocumentParams {
                                 uri: url,
                                 external: None,
                                 take_focus: Some(true),
                                 selection: None,
                             })
                             .unwrap(),
-                        }
-                        .into(),
-                    ));
+                        )],
+                        toolbox.lsp_conn,
+                    );
                     //toolbox.lsp_conn.send(Kind::Main())
                     return;
                 }
@@ -1581,20 +1599,14 @@ impl WorkGroup {
                         }));
                         return;
                     }
-                    RootMode::CommitInput => {
+                    RootMode::CommitInput | RootMode::TagInput { .. } | RootMode::RemoteInput => {
                         toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
                             url: uri,
                             content: "\n\n".into(),
                             range: Range::new(Position::new(0, 0), Position::new(1000, 0)),
                         }));
                     }
-                    RootMode::TagInput { .. } => {
-                        toolbox.lsp_conn.send(Kind::Other(MaAction::FillContent {
-                            url: uri,
-                            content: "\n\n".into(),
-                            range: Range::new(Position::new(0, 0), Position::new(1000, 0)),
-                        }));
-                    }
+                    RootMode::BranchInput => (),
                 }
             }
             WorkGroup::Diff(diff) => (),

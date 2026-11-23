@@ -521,8 +521,8 @@ impl App {
                                             vec![TextEdit {
                                                 new_text: root.format(),
                                                 range: Range {
-                                                    start: Position::new(1000, 0),
-                                                    end: Position::default(),
+                                                    start: Position::default(),
+                                                    end: Position::new(1000, 0),
                                                 },
                                             }],
                                         );
@@ -582,8 +582,8 @@ impl App {
                                             vec![TextEdit {
                                                 new_text: format,
                                                 range: Range {
-                                                    start: Position::new(1000, 0),
-                                                    end: Position::default(),
+                                                    start: Position::default(),
+                                                    end: Position::new(1000, 0),
                                                 },
                                             }],
                                         );
