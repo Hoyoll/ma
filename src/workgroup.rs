@@ -1159,8 +1159,6 @@ impl Root {
                     }));
                 }
                 // []:: Remote Extravaganza!
-                // li:: Register
-                //  +:: Add a way to register new remote with name etc
                 // li:: Remove
                 //  +:: Add a way to remove a chosen remote
                 // li:: Mutate

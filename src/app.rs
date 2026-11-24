@@ -489,10 +489,10 @@ impl App {
                             }
                         };
                         let old_ma = office.repo.path().join(Self::NAME);
-                        fs::remove_dir_all(&old_ma);
+                        //fs::remove_dir_all(&old_ma);
                         fs::create_dir_all(&old_ma);
-
-                        let anchor_path = name_to_url(&old_ma.join("ma.md")).unwrap();
+                        let ma = old_ma.join("ma.md");
+                        let anchor_path = name_to_url(&ma).unwrap();
 
                         //fs::write(&new_ma, "");
                         let mut root = Root::new();
@@ -500,48 +500,26 @@ impl App {
                         root.build_view();
                         let office_id = self.office.add(office);
                         self.office[office_id].o_id = office_id;
+                        fs::write(&ma, root.format());
+                        self.work_group
+                            .insert(anchor_path.clone(), (WorkGroup::Root(root), office_id));
+                    
                         Connection::combo_req(
                             [
                                 (
                                     ShowDocument::METHOD,
                                     to_value(ShowDocumentParams {
-                                        uri: anchor_path.clone(),
+                                        uri: anchor_path,
                                         external: None,
                                         take_focus: Some(true),
                                         selection: None,
                                     })
                                     .unwrap_or_default(),
-                                ),
-                                (
-                                    ApplyWorkspaceEdit::METHOD,
-                                    to_value({
-                                        let mut wf = HashMap::new();
-                                        wf.insert(
-                                            anchor_path.clone(),
-                                            vec![TextEdit {
-                                                new_text: root.format(),
-                                                range: Range {
-                                                    start: Position::default(),
-                                                    end: Position::new(1000, 0),
-                                                },
-                                            }],
-                                        );
-                                        ApplyWorkspaceEditParams {
-                                            label: None,
-                                            edit: WorkspaceEdit {
-                                                changes: Some(wf),
-                                                ..Default::default()
-                                            },
-                                        }
-                                    })
-                                    .unwrap(),
-                                ),
+                                ), 
                             ],
                             &self.lsp_conn,
                         );
                         //root.refresh(anchor_path.clone(), &self.lsp_conn);
-                        self.work_group
-                            .insert(anchor_path, (WorkGroup::Root(root), office_id));
                     }
                     Some("todo.md") => {
                         let root = path.parent().unwrap().strip_prefix("/").unwrap();
@@ -551,57 +529,35 @@ impl App {
                         };
                         let old_ma = office.repo.path().join(Self::NAME);
                         //eprintln!("")
-                        fs::remove_dir_all(&old_ma);
+                        let todo = old_ma.join("todo.md");
+                        //fs::remove_file(&old_ma);
                         fs::create_dir_all(&old_ma);
-
-                        let anchor_path = name_to_url(&old_ma.join("todo.md")).unwrap();
+                        let anchor_path = name_to_url(&todo).unwrap();
 
                         let office_id = self.office.add(office);
                         self.office[office_id].o_id = office_id;
                         //let walker = ignore::WalkBuilder::new(root).build();
                         let mut list = TodoList::new(root);
                         let format = list.build();
+                        fs::write(&todo, format);
+                        self.work_group
+                            .insert(anchor_path.clone(), (WorkGroup::TaskList(list), office_id));
+                    
                         Connection::combo_req(
                             [
                                 (
                                     ShowDocument::METHOD,
                                     to_value(ShowDocumentParams {
-                                        uri: anchor_path.clone(),
+                                        uri: anchor_path,
                                         external: None,
                                         take_focus: Some(true),
                                         selection: None,
                                     })
                                     .unwrap_or_default(),
-                                ),
-                                (
-                                    ApplyWorkspaceEdit::METHOD,
-                                    to_value({
-                                        let mut wf = HashMap::new();
-                                        wf.insert(
-                                            anchor_path.clone(),
-                                            vec![TextEdit {
-                                                new_text: format,
-                                                range: Range {
-                                                    start: Position::default(),
-                                                    end: Position::new(1000, 0),
-                                                },
-                                            }],
-                                        );
-                                        ApplyWorkspaceEditParams {
-                                            label: None,
-                                            edit: WorkspaceEdit {
-                                                changes: Some(wf),
-                                                ..Default::default()
-                                            },
-                                        }
-                                    })
-                                    .unwrap(),
-                                ),
+                                )
                             ],
                             &self.lsp_conn,
                         );
-                        self.work_group
-                            .insert(anchor_path, (WorkGroup::TaskList(list), office_id));
                     }
                     Some("issue.md") => {}
                     _ => (),
